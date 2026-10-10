@@ -1,7 +1,13 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+  sync::atomic::{AtomicU64, Ordering},
+  time::Duration,
+};
 
 use bytes::Bytes;
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::{
+  sync::mpsc::{Sender, UnboundedSender},
+  time::Instant,
+};
 
 use crate::{
   kernel::{
@@ -26,6 +32,8 @@ pub const DEFAULT_SIZE: Size = Size {
   width: 80,
   height: 24,
 };
+
+const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Identifies one attachment to a screen. Allocated by the attacher, so
 /// an attach needs no handshake before input and resize can follow it.
@@ -57,6 +65,11 @@ pub struct TaskScreen {
   /// Content cell of the last left mouse-down, so a drag can anchor the
   /// selection there and copy mode is only entered once a drag begins.
   mouse_down: Option<(u16, u16)>,
+  /// Content cell of the latest left drag, held until the button is
+  /// released, so a scroll can keep the selection extent under the pointer.
+  drag: Option<(u16, u16)>,
+  /// When a drag resting on the top or bottom row next scrolls the view.
+  drag_scroll_at: Option<Instant>,
   /// Lines scrolled per mouse-wheel notch.
   wheel_lines: usize,
 }
@@ -175,7 +188,26 @@ impl TaskScreen {
       next_logger_id: 0,
       copy: None,
       mouse_down: None,
+      drag: None,
+      drag_scroll_at: None,
       wheel_lines: wheel_lines.max(1),
+    }
+  }
+
+  /// When the view should scroll again for a drag resting on the top or
+  /// bottom row. The owner sleeps until then and calls `drag_scroll_tick`.
+  pub fn drag_scroll_deadline(&self) -> Option<Instant> {
+    self.drag_scroll_at
+  }
+
+  /// Scrolls one more line for a drag still resting on the top or bottom
+  /// row, and schedules the next tick while there is more to scroll.
+  pub fn drag_scroll_tick(&mut self) {
+    self.drag_scroll_at = None;
+    if self.drag_edge_scroll() {
+      self.sync_drag_extent();
+      self.render_present();
+      self.broadcast(|_| ScreenNotify::Render);
     }
   }
 
@@ -434,8 +466,42 @@ impl TaskScreen {
   }
 
   fn leave_copy(&mut self) {
+    self.drag_scroll_at = None;
     if self.copy.take().is_some() {
       self.broadcast(|screen| ScreenNotify::CopyPresent { screen, vt: None });
+    }
+  }
+
+  /// Returns whether the view moved.
+  fn drag_edge_scroll(&mut self) -> bool {
+    let (Some((row, _)), Some(session)) = (self.drag, &mut self.copy) else {
+      self.drag_scroll_at = None;
+      return false;
+    };
+    let before = session.state.scrollback();
+    let more = if row == 0 {
+      session.state.scroll_up(1);
+      session.state.scrollback() < session.state.snapshot().scrollback_len()
+    } else if row + 1 >= self.size.y.max(1) {
+      session.state.scroll_down(1);
+      session.state.scrollback() > 0
+    } else {
+      false
+    };
+    // History reports its capacity, not its fill, so a view that did not
+    // move is the other sign that the edge has been reached.
+    let moved = session.state.scrollback() != before;
+    self.drag_scroll_at =
+      (moved && more).then(|| Instant::now() + DRAG_SCROLL_INTERVAL);
+    moved
+  }
+
+  /// Keeps the selection extent on the cell under the held pointer after
+  /// the view scrolled underneath it.
+  fn sync_drag_extent(&mut self) {
+    if let (Some((row, col)), Some(session)) = (self.drag, &mut self.copy) {
+      let pos = session.state.pos_at(row, col);
+      session.state.set_extent(pos);
     }
   }
 
@@ -474,6 +540,8 @@ impl TaskScreen {
     match event.kind {
       MouseEventKind::Down(MouseButton::Left) => {
         self.mouse_down = Some((row, col));
+        self.drag = None;
+        self.drag_scroll_at = None;
         // Reposition the anchor if already selecting; a bare click in the
         // terminal does not enter copy mode.
         if let Some(session) = &mut self.copy {
@@ -487,14 +555,15 @@ impl TaskScreen {
         let entered = self.enter_copy();
         // A fresh drag anchors at the press cell; later drags only extend.
         let anchor = self.mouse_down.unwrap_or((row, col));
-        if let Some(session) = &mut self.copy {
-          if entered.is_some() {
-            let apos = session.state.pos_at(anchor.0, anchor.1);
-            session.state.set_anchor(apos);
-          }
-          let epos = session.state.pos_at(row, col);
-          session.state.set_extent(epos);
+        if let (Some(session), true) = (&mut self.copy, entered.is_some()) {
+          let apos = session.state.pos_at(anchor.0, anchor.1);
+          session.state.set_anchor(apos);
         }
+        self.drag = Some((row, col));
+        // Resting on the top or bottom row scrolls the view under the
+        // pointer, so the selection can grow past what is visible.
+        self.drag_edge_scroll();
+        self.sync_drag_extent();
         self.render_present();
         match entered {
           Some(present) => self.broadcast(|screen| ScreenNotify::CopyPresent {
@@ -504,7 +573,11 @@ impl TaskScreen {
           None => self.broadcast(|_| ScreenNotify::Render),
         }
       }
-      MouseEventKind::Up(_) => self.mouse_down = None,
+      MouseEventKind::Up(_) => {
+        self.mouse_down = None;
+        self.drag = None;
+        self.drag_scroll_at = None;
+      }
       MouseEventKind::ScrollUp => {
         self.scroll(self.wheel_lines as i32, ScrollUnit::Line)
       }
@@ -535,6 +608,8 @@ impl TaskScreen {
       } else {
         session.state.scroll_down(delta.unsigned_abs() as usize);
       }
+      // A wheel turned mid-drag moves the content, not the pointer.
+      self.sync_drag_extent();
       self.render_present();
     } else if let Ok(mut screen) = self.vt.write() {
       if delta >= 0 {
@@ -880,5 +955,167 @@ mod tests {
     assert_eq!(take_notifies(&mut large_rx), ["render"]);
     assert_eq!(resize_of(&effects), Some((80, 24)));
     assert_eq!(vt_size(&screen), DEFAULT_SIZE);
+  }
+
+  fn mouse(kind: MouseEventKind, x: i32, y: i32) -> TermEvent {
+    TermEvent::Mouse(MouseEvent {
+      kind,
+      x,
+      y,
+      mods: KeyMods::NONE,
+    })
+  }
+
+  /// A screen with history: 60 lines fed into a 24-row view, so rows
+  /// `line37..line59` are visible and 37 rows sit above them.
+  async fn screen_with_history()
+  -> (TaskScreen, ObserverId, UnboundedReceiver<ScreenNotify>) {
+    let mut screen = TaskScreen::new(
+      TaskId(1),
+      SharedVt::new(Screen::new(DEFAULT_SIZE, 200)),
+      3,
+    );
+    let (observer, rx, mut effects) = attach(&mut screen, winsize(80, 24));
+    let mut out = String::new();
+    for i in 0..60 {
+      out.push_str(&format!("line{i}\r\n"));
+    }
+    screen.process(out.as_bytes(), &mut effects).await;
+    (screen, observer, rx)
+  }
+
+  fn input(screen: &mut TaskScreen, observer: ObserverId, event: TermEvent) {
+    let mut effects = Vec::new();
+    screen.handle_cmd(TaskScreenCmd::Input { observer, event }, &mut effects);
+  }
+
+  fn copy_offset(screen: &TaskScreen) -> usize {
+    screen.copy.as_ref().unwrap().state.scrollback()
+  }
+
+  fn copy_end(screen: &TaskScreen) -> Pos {
+    screen.copy.as_ref().unwrap().state.end().unwrap()
+  }
+
+  #[tokio::test]
+  async fn drag_on_top_row_scrolls_into_history_until_release() {
+    let (mut screen, observer, _rx) = screen_with_history().await;
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Down(MouseButton::Left), 0, 20),
+    );
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0),
+    );
+    assert_eq!(copy_offset(&screen), 1);
+    assert_eq!(copy_end(&screen), Pos { y: -1, x: 4 });
+    assert!(screen.drag_scroll_deadline().is_some());
+
+    // Every drag event on the edge row moves one more line.
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 0),
+    );
+    assert_eq!(copy_offset(&screen), 2);
+    assert_eq!(copy_end(&screen), Pos { y: -2, x: 4 });
+
+    // So does every timer tick while the pointer rests there.
+    screen.drag_scroll_tick();
+    assert_eq!(copy_offset(&screen), 3);
+    assert_eq!(copy_end(&screen), Pos { y: -3, x: 4 });
+    assert!(screen.drag_scroll_deadline().is_some());
+    let text = screen.copy.as_ref().unwrap().state.selected_text().unwrap();
+    assert!(text.starts_with("34\nline35\nline36\nline37\n"), "{text:?}");
+
+    // Release ends the drag and the timer; a stray tick does nothing.
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Up(MouseButton::Left), 4, 0),
+    );
+    assert!(screen.drag_scroll_deadline().is_none());
+    screen.drag_scroll_tick();
+    assert_eq!(copy_offset(&screen), 3);
+    assert_eq!(copy_end(&screen), Pos { y: -3, x: 4 });
+  }
+
+  #[tokio::test]
+  async fn drag_on_bottom_row_scrolls_back_and_stops_at_live_screen() {
+    let (mut screen, observer, _rx) = screen_with_history().await;
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Down(MouseButton::Left), 0, 10),
+    );
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 10),
+    );
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::ScrollUp, 4, 10),
+    );
+    assert_eq!(copy_offset(&screen), 3);
+
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 23),
+    );
+    assert_eq!(copy_offset(&screen), 2);
+    assert_eq!(copy_end(&screen), Pos { y: 21, x: 4 });
+    screen.drag_scroll_tick();
+    screen.drag_scroll_tick();
+    assert_eq!(copy_offset(&screen), 0);
+    assert_eq!(copy_end(&screen), Pos { y: 23, x: 4 });
+    // Nothing further to scroll: the timer is disarmed.
+    assert!(screen.drag_scroll_deadline().is_none());
+  }
+
+  #[tokio::test]
+  async fn drag_inside_view_does_not_scroll_or_arm_timer() {
+    let (mut screen, observer, _rx) = screen_with_history().await;
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Down(MouseButton::Left), 0, 20),
+    );
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 10),
+    );
+    assert_eq!(copy_offset(&screen), 0);
+    assert_eq!(copy_end(&screen), Pos { y: 10, x: 4 });
+    assert!(screen.drag_scroll_deadline().is_none());
+  }
+
+  #[tokio::test]
+  async fn wheel_mid_drag_keeps_extent_under_pointer() {
+    let (mut screen, observer, _rx) = screen_with_history().await;
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Down(MouseButton::Left), 0, 20),
+    );
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::Drag(MouseButton::Left), 4, 20),
+    );
+    assert_eq!(copy_end(&screen), Pos { y: 20, x: 4 });
+    input(
+      &mut screen,
+      observer,
+      mouse(MouseEventKind::ScrollUp, 4, 20),
+    );
+    assert_eq!(copy_offset(&screen), 3);
+    assert_eq!(copy_end(&screen), Pos { y: 17, x: 4 });
   }
 }

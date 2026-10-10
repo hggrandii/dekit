@@ -467,6 +467,29 @@ impl App {
     }
     let layout = self.layout();
     let (x, y) = (mouse.x as u16, mouse.y as u16);
+    let term_area = layout.term_area();
+    // A selection dragged out of the terminal keeps driving it from the
+    // nearest edge cell, so the kernel can scroll the view under it. The
+    // release has to reach the kernel too, or the drag never ends.
+    let drag_outside =
+      matches!(
+        mouse.kind,
+        MouseEventKind::Drag(MouseButton::Left)
+          | MouseEventKind::Up(MouseButton::Left)
+      ) && matches!(self.state.scope, Scope::Term | Scope::TermZoom)
+        && !term_area.contains(x, y)
+        && term_area.width > 0
+        && term_area.height > 0;
+    if drag_outside {
+      if let Some(task) = self.state.current_task() {
+        let mut event = mouse;
+        event.x = x.clamp(term_area.x, term_area.right() - 1) as i32;
+        event.y = y.clamp(term_area.y, term_area.bottom() - 1) as i32;
+        let event = event.translate(term_area);
+        self.input_current(Some(task.id), TermEvent::Mouse(event));
+      }
+      return;
+    }
     if layout.header.contains(x, y) {
       if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         let hits = self.state.header;

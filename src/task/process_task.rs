@@ -606,6 +606,7 @@ async fn process_main(
       Read(std::io::Result<usize>),
       Exited(Option<ExitInfo>),
       Ready,
+      DragScroll,
     }
     let read_fut = async {
       match process.as_mut() {
@@ -627,11 +628,21 @@ async fn process_main(
         None => pending().await,
       }
     };
+    // A selection dragged to the top or bottom row keeps scrolling while
+    // the pointer rests there.
+    let drag_scroll_at = task_screen.drag_scroll_deadline();
+    let drag_scroll_fut = async {
+      match drag_scroll_at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => pending().await,
+      }
+    };
     let next = tokio::select! {
       cmd = receiver.recv() => Next::Cmd(cmd),
       n = read_fut => Next::Read(n),
       info = exit_fut => Next::Exited(info),
       () = probe_fut => Next::Ready,
+      () = drag_scroll_fut => Next::DragScroll,
     };
 
     match next {
@@ -768,6 +779,7 @@ async fn process_main(
         instance.ready_sent = true;
         ctx.send(KernelCommand::TaskReady);
       }
+      Next::DragScroll => task_screen.drag_scroll_tick(),
       Next::Read(Ok(0)) => instance.stdout_eof = true,
       Next::Read(Ok(n)) => {
         if instance.log_ready(&config.ready, &read_buf[..n]) {
