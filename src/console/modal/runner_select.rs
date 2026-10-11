@@ -949,7 +949,7 @@ mod tests {
     assert!(page.picked);
     match page.open() {
       ModalResult::Run(Action::SwitchRunner { root, .. }) => {
-        assert!(root.ends_with("/alpine"), "{root}");
+        assert!(Path::new(&root).ends_with("alpine"), "{root}");
       }
       _ => panic!("expected a switch"),
     }
