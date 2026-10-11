@@ -12,13 +12,19 @@ dekit handles dependencies, crashes and restarts.
 cargo install dekit
 ```
 
-Building from source needs a C compiler. Prebuilt binaries are also
-available:
+Building from source needs a C compiler. The install script downloads a
+prebuilt binary instead:
+
+Linux/macOS
 
 ```sh
-curl -fsSL https://dekit.run/install.sh | sh     # macOS, Linux
-irm https://dekit.run/install.ps1 | iex    # Windows (PowerShell)
-npm install -g dekit
+curl -fsSL https://dekit.run/install.sh | sh
+```
+
+Windows:
+
+```sh
+irm https://dekit.run/install.ps1 | iex
 ```
 
 ## Quick start

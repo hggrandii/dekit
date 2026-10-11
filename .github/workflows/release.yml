@@ -54,6 +54,31 @@ jobs:
       retention-days: 7
 
   # The checks below run before anything is published and must pass.
+  check-crate:
+    needs: meta
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-crate
+
+      # crates.io has no read-only call that accepts a token scoped to
+      # publishing, so only its presence can be checked.
+      - name: Check the crates.io token is set
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+
+      - name: Package and build the crate
+        run: |
+          cp LICENSE src/LICENSE
+          cp packaging/crate/README.md src/README.md
+          cargo publish -p dekit --dry-run --locked --allow-dirty
+
   check-npm:
     needs: [meta, build]
     runs-on: ubuntu-latest
@@ -126,7 +151,7 @@ jobs:
           "$RUNNER_TEMP/venv/bin/dekit" --version
 
   github-release:
-    needs: [meta, build, check-npm, check-pypi]
+    needs: [meta, build, check-crate, check-npm, check-pypi]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,6 +191,39 @@ jobs:
           fi
           gh release upload "$tag" dist/release/* --clobber
           gh release edit "$tag" --draft=false
+
+  publish-crate:
+    needs: [meta, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          # A re-run skips a version that is already up, as npm does below.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "dekit release (https://github.com/pvolok/dekit)" \
+            "https://crates.io/api/v1/crates/dekit/$VERSION")
+          case "$status" in
+            200)
+              echo "dekit $VERSION is already on crates.io"
+              exit 0
+              ;;
+            404) ;;
+            *)
+              echo "crates.io answered $status for dekit $VERSION" >&2
+              exit 1
+              ;;
+          esac
+          cp LICENSE src/LICENSE
+          cp packaging/crate/README.md src/README.md
+          cargo publish -p dekit --locked --allow-dirty
 
   publish-npm:
     needs: [meta, github-release]
