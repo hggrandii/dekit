@@ -1,5 +1,7 @@
 ## Unreleased
 
+## 0.10.2 - 2026-10-11
+
 - Add TUI header with menu
 - Add screen sweep effect after upgrade
 - Drag-scroll in copy mode
