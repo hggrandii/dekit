@@ -18,6 +18,11 @@ FREEZE = os.environ["FREEZE"]
 COLS, ROWS = 110, 30
 CLI_COLS = 40
 
+# In pixels of the PNG. A cell is 0.6 of the font size wide.
+FONT_SIZE = 28
+LINE_HEIGHT = 1.2
+PADDING = 48
+
 # What `dekit up` leaves behind, as `dekit ls --json` reports it.
 SETTLED = {
     "db": "ready",
@@ -127,10 +132,11 @@ def plain_lines(screen):
 
 
 def task_rows(screen):
-    """(name, selected) for each row of the task list; the selected row is
-    the one whose background differs from its border's."""
+    """(name, selected) for each row of the task list, which starts under
+    the header and the list's top border; the selected row is the one
+    whose background differs from its border's."""
     rows = []
-    for cells in styled_lines(screen)[1:]:
+    for cells in styled_lines(screen)[2:]:
         text = "".join(ch for ch, _ in cells)
         bars = [i for i, ch in enumerate(text) if ch in "┃│"]
         if len(bars) < 2:
@@ -162,7 +168,8 @@ class Console:
 
     def __exit__(self, *exc):
         try:
-            os.write(self.fd, b"q")
+            # `q` opens the quit menu, where `d` detaches.
+            os.write(self.fd, b"qd")
         except OSError:
             pass
         end = time.monotonic() + 5
@@ -312,23 +319,28 @@ def for_freeze(text, width=0):
 
 def render(name, text, outdir, width=0):
     path = os.path.join(outdir, name + ".png")
-    # freeze writes PNG at 4 times these sizes: a 14px font at 2x. It leaves
-    # about two font sizes of space under the last line, so the bottom
-    # padding is small to even the margins out.
+    ansi = for_freeze(text, width)
+    lines = plain_lines(ansi)
+    # freeze draws at 4x when it sizes the image itself, and then puts the
+    # backgrounds a few pixels under their text. Given a size it draws at 1x
+    # and they line up, so everything here is in output pixels: a 14px font
+    # at 2x. The bottom padding is short of PADDING so that the clip at the
+    # image height less the padding keeps the whole last line.
     args = [
         "--config", "base",
         "--background", BACKGROUND,
-        "--font.size", "7",
+        "--font.size", str(FONT_SIZE),
         "--no-font.ligatures",
-        "--line-height", "1.2",
-        "--padding", "11,12,1,12",
-        "--border.radius", "4",
+        "--line-height", str(LINE_HEIGHT),
+        "--padding", f"{PADDING},{PADDING},{PADDING - 4},{PADDING}",
+        "--border.radius", "16",
+        "--width", str(round(2 * PADDING + max(map(len, lines)) * FONT_SIZE * 0.6)),
+        "--height", str(round(2 * PADDING + len(lines) * FONT_SIZE * LINE_HEIGHT)),
         "--output", path,
     ]
     # With rsvg-convert on PATH freeze uses it for PNG, and rsvg-convert
     # ignores the embedded font; freeze's own renderer keeps it.
     env = dict(os.environ, PATH="")
-    ansi = for_freeze(text, width)
     result = subprocess.run([FREEZE, *args], input=ansi.encode(), capture_output=True, env=env)
     if result.returncode != 0:
         fail(f"freeze failed on {path}:\n{result.stderr.decode().strip()}")
