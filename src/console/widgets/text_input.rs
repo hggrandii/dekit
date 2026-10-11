@@ -1,11 +1,31 @@
 use tui_input::{Input, InputRequest};
+use unicode_width::UnicodeWidthStr;
 
+use crate::console::theme::BlockStyle;
 use crate::term::{
   Grid,
   attrs::Attrs,
   grid::{Pos, Rect},
   key::{Key, KeyCode, KeyMods},
 };
+
+/// A prompt, the input, and a `selected/total` counter at the right;
+/// returns the cursor position.
+pub fn render_filter_row(
+  grid: &mut Grid,
+  mut row: Rect,
+  prompt: &str,
+  input: &Input,
+  counter: Option<(usize, usize)>,
+  style: &BlockStyle,
+) -> Pos {
+  grid.draw_text(row.take_left(prompt.width() as u16), prompt, style.key);
+  if let Some((selected, total)) = counter {
+    let counter = format!("{}/{}", selected + 1, total);
+    grid.draw_text(row.take_right(counter.width() as u16), &counter, style.dim);
+  }
+  render_text_input(input, row.inner((0, 1, 0, 0)), grid, style.text)
+}
 
 /// Draws the input and returns the cursor position.
 pub fn render_text_input(

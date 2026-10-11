@@ -11,7 +11,7 @@ use common::{DEKIT, TestRunner, stderr_of as stderr, task_line, wait_until};
 
 impl TestRunner {
   fn saved_files(&self) -> Vec<String> {
-    std::fs::read_dir(self.runtime.path.join("dekit").join("saved"))
+    std::fs::read_dir(self.data_dir().join("saved"))
       .into_iter()
       .flatten()
       .filter_map(|entry| entry.ok())
@@ -167,9 +167,9 @@ fn runner_stop_removes_the_save_of_a_stopped_runner() {
   let out = std::process::Command::new(DEKIT)
     .args(["down", runner.work.path.to_str().unwrap()])
     .current_dir(&runner.runtime.path)
-    .env("XDG_RUNTIME_DIR", &runner.runtime.path)
-    .env("XDG_CONFIG_HOME", &runner.runtime.path)
-    .env("XDG_DATA_HOME", &runner.runtime.path)
+    .env("XDG_RUNTIME_DIR", runner.runtime.path.join("run"))
+    .env("XDG_CONFIG_HOME", runner.runtime.path.join("config"))
+    .env("XDG_DATA_HOME", runner.runtime.path.join("data"))
     .output()
     .unwrap();
   assert!(out.status.success(), "down: {}", stderr(&out));

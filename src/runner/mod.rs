@@ -7,6 +7,7 @@ use crate::config::config::{Config, KernelConfig};
 
 pub mod kill;
 pub mod lockfile;
+pub mod recent;
 pub mod socket;
 pub mod spawn;
 
@@ -98,6 +99,21 @@ impl RunnerSpec {
     }
   }
 
+  /// The runner of exactly this directory: the host runner when it is
+  /// the host root, else a project runner there, whatever is above it.
+  pub fn at(path: &Path) -> anyhow::Result<Self> {
+    let root = dunce::canonicalize(path)
+      .with_context(|| format!("invalid runner root `{}`", path.display()))?;
+    validate_root(&root)?;
+    match Self::existing_host() {
+      Some(host) if host.root == root => Ok(host),
+      _ => Ok(Self {
+        kind: RunnerKind::Project,
+        root,
+      }),
+    }
+  }
+
   /// The host runner root, only if it already exists — no directories
   /// are created and a missing HOME is not an error. Used to classify a
   /// directory during discovery.
@@ -115,7 +131,7 @@ impl RunnerSpec {
   }
 }
 
-fn validate_root(root: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_root(root: &Path) -> anyhow::Result<()> {
   if root.to_str().is_none() {
     bail!("runner root is not valid UTF-8: {}", root.display());
   }
@@ -141,6 +157,27 @@ fn find_marker(from: &Path, pred: impl Fn(&Path) -> bool) -> Option<PathBuf> {
 fn is_git_root(dir: &Path) -> bool {
   let git = dir.join(".git");
   git.is_dir() || git.is_file()
+}
+
+/// What makes `dir` itself a project root, in the order `find_project_root`
+/// prefers them: `dekit.yaml`, `git`, or `package.json`.
+pub fn project_marker(dir: &Path) -> Option<&'static str> {
+  if dir.join("dekit.yaml").is_file() {
+    Some("dekit.yaml")
+  } else if is_git_root(dir) {
+    Some("git")
+  } else if dir.join("package.json").is_file() {
+    Some("package.json")
+  } else {
+    None
+  }
+}
+
+/// The user's home, if the environment names one.
+pub fn home_dir() -> Option<PathBuf> {
+  std::env::var_os("HOME")
+    .or_else(|| std::env::var_os("USERPROFILE"))
+    .map(PathBuf::from)
 }
 
 pub fn user_config_dir() -> anyhow::Result<PathBuf> {
@@ -259,7 +296,12 @@ pub(crate) fn atomic_write_with(
   path: &Path,
   write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-  let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+  // Unique per call, not just per process: two threads may write the
+  // same file at once (the recent projects, say).
+  static SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+  let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  let temp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
   let result = (|| {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&temp)?);
     write(&mut out)?;

@@ -40,6 +40,15 @@ pub struct RunnerRecord {
   pub warnings: Vec<String>,
 }
 
+impl RunnerRecord {
+  pub fn spec(&self) -> RunnerSpec {
+    RunnerSpec {
+      kind: self.kind.clone(),
+      root: self.root.clone().into(),
+    }
+  }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunnerPaths {
   pub lock: PathBuf,

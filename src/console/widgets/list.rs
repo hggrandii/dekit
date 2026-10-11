@@ -1,4 +1,8 @@
-use crate::term::grid::Rect;
+use crate::term::{
+  grid::Rect,
+  key::{Key, KeyCode, KeyMods},
+  mouse::{MouseButton, MouseEvent, MouseEventKind},
+};
 
 /// Cursor and scroll over `len` rows owned by the caller. The view follows
 /// the cursor, keeping `margin` rows around it, until `scroll_by`.
@@ -107,6 +111,49 @@ impl ListState {
         area,
         selected: index == selected,
       })
+  }
+
+  /// Moves the cursor for the usual keys: arrows, `C-n`/`C-p`, and
+  /// paging. Returns whether the key was one of them.
+  pub fn handle_key(&mut self, key: &Key) -> bool {
+    match (key.code, key.mods) {
+      (KeyCode::Up, KeyMods::NONE) | (KeyCode::Char('p'), KeyMods::CONTROL) => {
+        self.prev()
+      }
+      (KeyCode::Down, KeyMods::NONE)
+      | (KeyCode::Char('n'), KeyMods::CONTROL) => self.next(),
+      (KeyCode::PageUp, KeyMods::NONE) => self.move_by(-(self.page() as isize)),
+      (KeyCode::PageDown, KeyMods::NONE) => self.move_by(self.page() as isize),
+      _ => return false,
+    }
+    true
+  }
+
+  /// Menu-style mouse handling: the pointer moves the cursor, the wheel
+  /// scrolls, and a left click returns the row it landed on.
+  pub fn handle_mouse(&mut self, mouse: &MouseEvent) -> Option<usize> {
+    let (x, y) = (mouse.x as u16, mouse.y as u16);
+    match mouse.kind {
+      MouseEventKind::Moved => {
+        if let Some(row) = self.row_at(x, y) {
+          self.select(row.index);
+        }
+      }
+      MouseEventKind::Down(MouseButton::Left) => {
+        if let Some(row) = self.row_at(x, y) {
+          self.select(row.index);
+          return Some(row.index);
+        }
+      }
+      MouseEventKind::ScrollDown => self.scroll_by(3),
+      MouseEventKind::ScrollUp => self.scroll_by(-3),
+      MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+      | MouseEventKind::Up(_)
+      | MouseEventKind::Drag(_)
+      | MouseEventKind::ScrollLeft
+      | MouseEventKind::ScrollRight => (),
+    }
+    None
   }
 
   /// The row drawn at a point by the last `rows`.

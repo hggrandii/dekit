@@ -7,14 +7,11 @@ use std::path::Path;
 mod common;
 use common::{TestRunner, TmpDir, stderr_of};
 
-fn assert_dir_has_no_lock(runtime: &Path) {
-  let dekit_dir = runtime.join("dekit");
-  if let Ok(entries) = std::fs::read_dir(dekit_dir) {
-    // A quitting runner leaves its saved tasks there on purpose.
+fn assert_dir_has_no_lock(runtime_dir: &Path) {
+  if let Ok(entries) = std::fs::read_dir(runtime_dir) {
     let leftover: Vec<_> = entries
       .filter_map(|e| e.ok())
       .map(|e| e.file_name().to_string_lossy().into_owned())
-      .filter(|name| name != "saved")
       .collect();
     assert!(
       leftover.is_empty(),
@@ -49,7 +46,7 @@ fn spawn_race_has_exactly_one_winner() {
   );
 
   runner.stop();
-  assert_dir_has_no_lock(&runner.runtime.path);
+  assert_dir_has_no_lock(&runner.runtime_dir());
 }
 
 #[test]

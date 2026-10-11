@@ -19,4 +19,6 @@ pub mod target;
 mod task;
 pub mod term;
 mod term_driver;
+#[cfg(test)]
+mod test_util;
 mod upgrade;

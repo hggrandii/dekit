@@ -35,8 +35,12 @@ pub enum Action {
   ShowCommandsMenu,
   /// The menu under the `dekit` badge in the header.
   ShowMainMenu,
-  /// The list of runners on this machine, to attach to another one.
-  ShowRunnerSelect,
+  /// The runners on this machine: switch to a running one, go back to a
+  /// recent project, or open a directory.
+  ShowRunnerSelect {
+    #[serde(default)]
+    tab: RunnerTab,
+  },
   /// Send the attachment that asked to the console of another runner.
   SwitchRunner {
     kind: String,
@@ -129,7 +133,11 @@ impl Action {
       Action::Zoom => "Zoom".to_string(),
       Action::ShowCommandsMenu => "All commands".to_string(),
       Action::ShowMainMenu => "Main menu".to_string(),
-      Action::ShowRunnerSelect => "Switch runner".to_string(),
+      Action::ShowRunnerSelect { tab } => match tab {
+        RunnerTab::Switch => "Switch project".to_string(),
+        RunnerTab::Recent => "Recent projects".to_string(),
+        RunnerTab::Open => "Open project".to_string(),
+      },
       Action::SwitchRunner { root, .. } => format!("Switch to runner {root}"),
       Action::NextTask => "Next".to_string(),
       Action::PrevTask => "Prev".to_string(),
@@ -167,6 +175,37 @@ impl Action {
   }
 }
 
+/// A tab of the runners modal.
+#[derive(
+  Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunnerTab {
+  #[default]
+  Switch,
+  Recent,
+  Open,
+}
+
+impl RunnerTab {
+  pub const ALL: [RunnerTab; 3] =
+    [RunnerTab::Switch, RunnerTab::Recent, RunnerTab::Open];
+
+  pub fn label(self) -> &'static str {
+    match self {
+      RunnerTab::Switch => "switch",
+      RunnerTab::Recent => "recent",
+      RunnerTab::Open => "open",
+    }
+  }
+
+  /// The tab after this one, wrapping around.
+  pub fn next(self) -> Self {
+    let i = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+    Self::ALL[(i + 1) % Self::ALL.len()]
+  }
+}
+
 fn lines_str(n: usize) -> &'static str {
   if n == 1 { "line" } else { "lines" }
 }
@@ -198,6 +237,26 @@ pub enum ScrollUnit {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn runner_select_defaults_to_the_switch_tab() {
+    let a: Action =
+      serde_yaml::from_str("action: show-runner-select\n").unwrap();
+    assert_eq!(
+      a,
+      Action::ShowRunnerSelect {
+        tab: RunnerTab::Switch
+      }
+    );
+    let a: Action =
+      serde_yaml::from_str("action: show-runner-select\ntab: open\n").unwrap();
+    assert_eq!(
+      a,
+      Action::ShowRunnerSelect {
+        tab: RunnerTab::Open
+      }
+    );
+  }
 
   #[test]
   fn deserialize_scroll() {

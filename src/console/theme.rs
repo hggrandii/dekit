@@ -194,6 +194,16 @@ impl BlockTheme {
     self.style(self.modal_bg, true)
   }
 
+  /// A modal's list row: `style` on the selected background when it is
+  /// selected.
+  pub fn modal_row(&self, style: BlockStyle, selected: bool) -> BlockStyle {
+    if selected {
+      style.on_bg(self.selected_bg)
+    } else {
+      style
+    }
+  }
+
   fn style(&self, bg: Rgb, focused: bool) -> BlockStyle {
     let on_bg = |fg: Rgb| Attrs::default().bg(bg.into()).fg(fg.into());
     let (border, title) = if focused {
@@ -216,6 +226,22 @@ impl BlockTheme {
 }
 
 impl BlockStyle {
+  /// The same attrs on another background: a list row that is selected.
+  pub fn on_bg(self, bg: Rgb) -> BlockStyle {
+    let on_bg = |attrs: Attrs| Attrs {
+      bgcolor: bg.into(),
+      ..attrs
+    };
+    BlockStyle {
+      border: on_bg(self.border),
+      title: on_bg(self.title),
+      text: on_bg(self.text),
+      dim: on_bg(self.dim),
+      key: on_bg(self.key),
+      alert: self.alert,
+    }
+  }
+
   /// Draws the border and clears the inside.
   pub fn draw<'a>(&self, grid: &'a mut Grid, area: Rect) -> Block<'a> {
     grid.fill_area(area.inner(1), ' ', self.text);

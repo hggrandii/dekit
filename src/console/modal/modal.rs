@@ -1,6 +1,7 @@
 use crate::console::{action::Action, keymap::Keymap, theme::Theme};
 use crate::term::{Grid, grid::Rect, key::Key, mouse::MouseEvent};
 
+#[derive(Clone)]
 pub enum ModalResult {
   Keep,
   Close,
@@ -13,9 +14,10 @@ pub enum ModalResult {
 pub trait Modal: Send {
   fn handle_key(&mut self, key: &Key) -> ModalResult;
 
-  /// Mouse input while the modal is open; `frame` is what `area` is
-  /// centered in. Ignored unless the modal says otherwise.
-  fn handle_mouse(&mut self, _mouse: &MouseEvent, _frame: Rect) -> ModalResult {
+  /// Mouse input while the modal is open. A click outside the modal is
+  /// handled by the app, which closes it. Ignored unless the modal says
+  /// otherwise.
+  fn handle_mouse(&mut self, _mouse: &MouseEvent) -> ModalResult {
     ModalResult::Keep
   }
 

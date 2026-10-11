@@ -3,6 +3,8 @@
 - Add TUI header with menu
 - Add screen sweep effect after upgrade
 - Drag-scroll in copy mode
+- The quit menu: `x` quit, `s` save and quit, `d` detach, `r` switch
+  project
 
 ## 0.10.1 - 2026-10-08
 

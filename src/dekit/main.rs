@@ -540,19 +540,33 @@ fn run_exit_code(state: Option<&RpcState>) -> i32 {
 
 /// Attaches to `target` on `runner`, and follows the console from runner
 /// to runner for as long as it asks to switch. A switch always lands on
-/// the next runner's console, starting that runner when it is not up.
+/// the next runner's console, starting that runner when it is not up;
+/// when that fails, the console it came from gets the client back.
 async fn attach_loop(
   mut runner: RunnerSpec,
   mut target: Target,
   mut start: bool,
 ) -> anyhow::Result<()> {
+  // The runner a switch left, still running, until the next one is up.
+  let mut previous: Option<RunnerSpec> = None;
   loop {
-    let (sender, receiver) = connect_client_socket(&runner, start).await?;
+    let connected = connect_client_socket(&runner, start).await;
+    let (sender, receiver) = match (connected, previous.take()) {
+      (Ok(conn), _) => conn,
+      (Err(err), Some(back)) => {
+        eprintln!("Cannot switch to {}: {err:#}", runner.root.display());
+        eprintln!("Back to {}...", back.root.display());
+        runner = back;
+        start = false;
+        continue;
+      }
+      (Err(err), None) => return Err(err),
+    };
     match client_main(target, false, sender, receiver).await? {
       AttachEnd::Detached | AttachEnd::TaskExited(_) => return Ok(()),
       AttachEnd::Switch(next) => {
         eprintln!("Switching to {}...", next.root.display());
-        runner = next;
+        previous = Some(std::mem::replace(&mut runner, next));
         target = "@dekit/console".parse().expect("valid target");
         start = true;
       }
@@ -600,9 +614,9 @@ fn runner_from_ref(runner: &Runner) -> anyhow::Result<RunnerSpec> {
     },
     Runner::Path(path) => {
       let path = match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-          Some(home) => PathBuf::from(home).join(rest),
-          None => anyhow::bail!("HOME is not set"),
+        Some(rest) => match crate::runner::home_dir() {
+          Some(home) => home.join(rest),
+          None => anyhow::bail!("HOME (or USERPROFILE) is not set"),
         },
         None => PathBuf::from(path),
       };

@@ -290,6 +290,9 @@ async fn run_locked(
     }
     let socket = bind_server_socket(&socket_path).await?;
     lock_guard.publish(runner, &warnings)?;
+    // Best effort, off the path to the first accept.
+    let recent = runner.clone();
+    tokio::task::spawn_blocking(move || crate::runner::recent::touch(&recent));
     log::info!("Server is listening.");
     anyhow::Ok(socket)
   }

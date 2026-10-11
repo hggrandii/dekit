@@ -8,7 +8,7 @@ use crate::{
   command::{Command, issue},
   config::{config::Config, task::CmdConfig},
   console::{
-    action::{Action, CopyMove, ScrollUnit},
+    action::{Action, CopyMove, RunnerTab, ScrollUnit},
     app_layout::AppLayout,
     keymap::{Keymap, KeymapGroup},
     modal::{
@@ -417,7 +417,16 @@ impl App {
         self.state.hover = None;
         cmd
       }
-      cmd @ (TaskScreenCmd::Attach { .. } | TaskScreenCmd::Input { .. }) => cmd,
+      // A console attachment is what makes a project recent.
+      cmd @ TaskScreenCmd::Attach { .. } => {
+        if let Some(runner) = self.config.runner.clone() {
+          tokio::task::spawn_blocking(move || {
+            crate::runner::recent::touch(&runner)
+          });
+        }
+        cmd
+      }
+      cmd @ TaskScreenCmd::Input { .. } => cmd,
       // Copy mode and scrolling do not apply to a composed UI.
       TaskScreenCmd::CopyEnter
       | TaskScreenCmd::CopyLeave
@@ -451,7 +460,14 @@ impl App {
     let frame = self.frame();
     self.state.hover = Some((mouse.x as u16, mouse.y as u16));
     if let Some(modal) = &mut self.modal {
-      match modal.handle_mouse(&mouse, frame) {
+      // A click on the backdrop closes any modal.
+      if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && !modal.area(frame).contains(mouse.x as u16, mouse.y as u16)
+      {
+        self.modal = None;
+        return;
+      }
+      match modal.handle_mouse(&mouse) {
         ModalResult::Keep => (),
         ModalResult::Close => self.modal = None,
         ModalResult::Run(action) => {
@@ -496,7 +512,12 @@ impl App {
         if hits.logo.is_some_and(|hit| hit.contains(x, y)) {
           self.handle_action(Some(observer), Action::ShowMainMenu);
         } else if hits.runner.is_some_and(|hit| hit.contains(x, y)) {
-          self.handle_action(Some(observer), Action::ShowRunnerSelect);
+          self.handle_action(
+            Some(observer),
+            Action::ShowRunnerSelect {
+              tab: RunnerTab::Switch,
+            },
+          );
         }
       }
       return;
@@ -587,7 +608,7 @@ impl App {
         }
       }
 
-      Action::ShowQuit => self.modal = Some(Box::new(QuitModal)),
+      Action::ShowQuit => self.modal = Some(Box::new(QuitModal::default())),
       Action::Detach => {
         if let Some(observer) = observer {
           self.handle_screen_cmd(TaskScreenCmd::Detach { observer });
@@ -616,10 +637,11 @@ impl App {
         self.modal = Some(Box::new(MainMenuModal::new(anchor)));
       }
       // Only a console inside a runner has somewhere to switch from.
-      Action::ShowRunnerSelect => {
+      Action::ShowRunnerSelect { tab } => {
         if self.config.runner.is_some() {
           self.modal = Some(Box::new(RunnerSelectModal::new(
             self.config.runner.as_ref(),
+            tab,
           )));
         }
       }

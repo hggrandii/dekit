@@ -58,7 +58,7 @@ Default bindings in `tasks`:
 - cmd: <C-a>
   desc: toggle-focus, between the task list and the terminal (in every group)
 - cmd: <q>, <Q>
-  desc: show-quit, down without asking (|cli/attach|)
+  desc: show-quit
 - cmd: <j> <Down>, <k> <Up>
   desc: next-task, prev-task
 - cmd: <h> <Left>, <l> <Right>
@@ -97,7 +97,8 @@ the same scroll keys. Other actions: focus-tasks, focus-term, restart-all,
 force-restart-all, veto-task, close-current-modal, show-main-menu (the
 menu under the `dekit` badge, also by clicking it), detach, quit (stops
 the runner without saving, like |cli/runner/stop|),
-`{action: switch-runner, kind: project, root: /abs/path}` to move the
-attachment to another runner's console, and
+`{action: show-runner-select, tab: open}` to open a project from any
+directory, `{action: switch-runner, kind: project, root: /abs/path}` to
+move the attachment to another runner's console, and
 `{action: command, command: {...}}` to run any command from
 |config/hooks|.

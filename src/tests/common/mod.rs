@@ -61,10 +61,21 @@ impl TestRunner {
       .arg("-C")
       .arg(&self.work.path)
       .args(args)
-      .env("XDG_RUNTIME_DIR", &self.runtime.path)
-      .env("XDG_CONFIG_HOME", &self.runtime.path)
-      .env("XDG_DATA_HOME", &self.runtime.path);
+      .env("XDG_RUNTIME_DIR", self.runtime.path.join("run"))
+      .env("XDG_CONFIG_HOME", self.runtime.path.join("config"))
+      .env("XDG_DATA_HOME", self.runtime.path.join("data"));
     cmd
+  }
+
+  /// Where the runner's records and socket are.
+  pub fn runtime_dir(&self) -> PathBuf {
+    self.runtime.path.join("run/dekit")
+  }
+
+  /// Where the runner keeps what outlives it: saved tasks, recent
+  /// projects.
+  pub fn data_dir(&self) -> PathBuf {
+    self.runtime.path.join("data/dekit")
   }
 
   pub fn run(&self, args: &[&str]) -> Output {

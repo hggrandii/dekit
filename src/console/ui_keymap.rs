@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthStr;
 
-use crate::console::action::Action;
+use crate::console::action::{Action, RunnerTab};
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
   state::State,
@@ -34,7 +34,9 @@ pub fn render_keymap(
       Action::RestartTask,
       Action::Zoom,
       Action::ShowCommandsMenu,
-      Action::ShowRunnerSelect,
+      Action::ShowRunnerSelect {
+        tab: RunnerTab::Switch,
+      },
       Action::ToggleKeymapWindow,
     ],
     KeymapGroup::Term => &[Action::ToggleFocus],

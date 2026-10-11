@@ -8,7 +8,12 @@ use unicode_width::UnicodeWidthStr;
 
 use super::common::{CursorStyle, Size};
 
-use super::{Cell, attrs::Attrs, row::Row};
+use super::{
+  Cell,
+  attrs::Attrs,
+  line_symbols::{VERTICAL_LEFT, VERTICAL_RIGHT},
+  row::Row,
+};
 
 #[derive(Clone, Debug)]
 pub struct Grid {
@@ -827,6 +832,7 @@ impl Grid {
       grid: self,
       area,
       title: area.inner((0, 1)).take_top(1),
+      attrs,
     }
   }
 }
@@ -835,6 +841,7 @@ pub struct Block<'a> {
   grid: &'a mut Grid,
   area: Rect,
   title: Rect,
+  attrs: Attrs,
 }
 
 impl Block<'_> {
@@ -852,6 +859,24 @@ impl Block<'_> {
 
   pub fn inner(&self) -> Rect {
     self.area.inner(1)
+  }
+
+  /// A horizontal line across the block at row `y`, joined to the
+  /// border on both sides.
+  pub fn separator(&mut self, y: u16) -> &mut Self {
+    let mut row = Rect {
+      y,
+      height: 1,
+      ..self.area
+    };
+    self
+      .grid
+      .draw_text(row.take_left(1), VERTICAL_RIGHT, self.attrs);
+    self
+      .grid
+      .draw_text(row.take_right(1), VERTICAL_LEFT, self.attrs);
+    self.grid.fill_area(row, '─', self.attrs);
+    self
   }
 }
 

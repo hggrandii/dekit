@@ -2,7 +2,7 @@ use anyhow::Result;
 use indexmap::IndexMap;
 
 use crate::cfg::{CfgNode, CfgObj};
-use crate::console::action::{Action, CopyMove, ScrollUnit};
+use crate::console::action::{Action, CopyMove, RunnerTab, ScrollUnit};
 use crate::console::keymap::{Keymap, KeymapGroup};
 use crate::term::key::{Key, KeyCode, KeyMods, KeySpec};
 
@@ -74,7 +74,12 @@ impl KeymapConfig {
     s.keymap_add_p(KeyCode::Char('q').into(), Action::ShowQuit);
     s.keymap_add_p(KeyCode::Char('Q').into(), Action::Down);
     s.keymap_add_p(KeyCode::Char('p').into(), Action::ShowCommandsMenu);
-    s.keymap_add_p(KeyCode::Char('P').into(), Action::ShowRunnerSelect);
+    s.keymap_add_p(
+      KeyCode::Char('P').into(),
+      Action::ShowRunnerSelect {
+        tab: RunnerTab::Switch,
+      },
+    );
     s.keymap_add_p(Key::new(KeyCode::Down, KeyMods::NONE), Action::NextTask);
     s.keymap_add_p(
       Key::new(KeyCode::Char('j'), KeyMods::NONE),

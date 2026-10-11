@@ -12,9 +12,9 @@ fn run(dir: &TmpDir, src: &str) -> Output {
   Command::new(DEKIT)
     .arg(&script)
     .current_dir(&dir.path)
-    .env("XDG_RUNTIME_DIR", &dir.path)
-    .env("XDG_CONFIG_HOME", &dir.path)
-    .env("XDG_DATA_HOME", &dir.path)
+    .env("XDG_RUNTIME_DIR", dir.path.join("run"))
+    .env("XDG_CONFIG_HOME", dir.path.join("config"))
+    .env("XDG_DATA_HOME", dir.path.join("data"))
     .output()
     .unwrap()
 }

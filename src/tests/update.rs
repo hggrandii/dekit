@@ -42,7 +42,7 @@ impl Installed {
   }
 
   fn receipt(&self) -> PathBuf {
-    self.runner.runtime.path.join("dekit/install")
+    self.runner.data_dir().join("install")
   }
 
   fn run(&self, args: &[&str]) -> Output {
@@ -51,9 +51,9 @@ impl Installed {
       .arg("-C")
       .arg(&self.runner.work.path)
       .args(args)
-      .env("XDG_RUNTIME_DIR", &self.runner.runtime.path)
-      .env("XDG_CONFIG_HOME", &self.runner.runtime.path)
-      .env("XDG_DATA_HOME", &self.runner.runtime.path)
+      .env("XDG_RUNTIME_DIR", self.runner.runtime.path.join("run"))
+      .env("XDG_CONFIG_HOME", self.runner.runtime.path.join("config"))
+      .env("XDG_DATA_HOME", self.runner.runtime.path.join("data"))
       .env("DEKIT_INSTALL_URL", format!("file://{INSTALLER}"))
       .env(
         "DEKIT_RELEASES_URL",
@@ -107,8 +107,7 @@ impl Installed {
 
   /// Rewrites the published record to say the runner runs an old dekit.
   fn record_old_version(&self) {
-    let dir = self.runner.runtime.path.join("dekit");
-    let file = std::fs::read_dir(dir)
+    let file = std::fs::read_dir(self.runner.runtime_dir())
       .unwrap()
       .map(|entry| entry.unwrap().path())
       .find(|path| path.extension().is_some_and(|ext| ext == "json"))

@@ -1,13 +1,13 @@
 use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
-use crate::console::action::{Action, ScrollUnit};
+use crate::console::action::{Action, RunnerTab, ScrollUnit};
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
   theme::Theme,
   widgets::{
     list::ListState,
-    text_input::{render_text_input, to_input_request},
+    text_input::{render_filter_row, to_input_request},
   },
 };
 use crate::term::{
@@ -15,7 +15,6 @@ use crate::term::{
   attrs::Attrs,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
-  line_symbols::{HORIZONTAL, VERTICAL_LEFT, VERTICAL_RIGHT},
 };
 
 use super::modal::{Modal, ModalResult};
@@ -56,26 +55,10 @@ impl Modal for CommandsMenuModal {
         };
       }
       (KeyCode::Esc, KeyMods::NONE) => return ModalResult::Close,
-      (KeyCode::Up, KeyMods::NONE) | (KeyCode::Char('p'), KeyMods::CONTROL) => {
-        self.list.prev();
-        return ModalResult::Keep;
-      }
-      (KeyCode::Down, KeyMods::NONE)
-      | (KeyCode::Char('n'), KeyMods::CONTROL) => {
-        self.list.next();
-        return ModalResult::Keep;
-      }
-      (KeyCode::PageUp, KeyMods::NONE) => {
-        self.list.move_by(-(self.list.page() as isize));
-        return ModalResult::Keep;
-      }
-      (KeyCode::PageDown, KeyMods::NONE) => {
-        self.list.move_by(self.list.page() as isize);
-        return ModalResult::Keep;
-      }
       _ => (),
     }
-    if let Some(req) = to_input_request(key)
+    if !self.list.handle_key(key)
+      && let Some(req) = to_input_request(key)
       && self.input.handle(req).is_some_and(|change| change.value)
     {
       self.items = menu_items(&self.input.value().to_lowercase());
@@ -91,75 +74,44 @@ impl Modal for CommandsMenuModal {
   fn render(&mut self, grid: &mut Grid, keymap: &Keymap, theme: &Theme) {
     let area = self.area(grid.area());
     let style = theme.block.modal();
-    let mut inner = style
-      .draw(grid, area)
-      .title(" Commands ", style.title)
-      .inner();
-
-    let mut input_row = inner.take_top(1);
+    let mut block = style.draw(grid, area);
+    block.title(" Commands ", style.title);
+    let mut inner = block.inner();
+    let input_row = inner.take_top(1);
     let sep_row = inner.take_top(1);
     let list_area = inner;
+    block.separator(sep_row.y);
 
-    // Input row: "/ <input>   selected/total"
-    let counter = match self.list.selected() {
-      Some(i) => format!("{}/{}", i + 1, self.items.len()),
-      None => String::new(),
-    };
-    grid.draw_text(input_row.take_left(2), "/ ", style.key);
-    grid.draw_text(
-      input_row.take_right(counter.width() as u16),
-      &counter,
-      style.dim,
-    );
-    let input_area = input_row.inner((0, 1, 0, 0));
-    grid.cursor_pos =
-      Some(render_text_input(&self.input, input_area, grid, style.text));
+    let counter = self.list.selected().map(|i| (i, self.items.len()));
+    grid.cursor_pos = Some(render_filter_row(
+      grid,
+      input_row,
+      "/ ",
+      &self.input,
+      counter,
+      &style,
+    ));
     grid.cursor_style = CursorStyle::BlinkingBar;
 
-    // Separator, joined to the border on both sides
-    let mut sep = Rect {
-      x: area.x,
-      width: area.width,
-      ..sep_row
-    };
-    grid.draw_text(sep.take_left(1), VERTICAL_RIGHT, style.border);
-    grid.draw_text(sep.take_right(1), VERTICAL_LEFT, style.border);
-    grid.draw_text(sep, &HORIZONTAL.repeat(sep.width as usize), style.border);
-
-    // List
     let search = self.input.value().to_lowercase();
     for row in self.list.rows(list_area) {
       let item = &self.items[row.index];
-      let bg = if row.selected {
-        theme.block.selected_bg
-      } else {
-        theme.block.modal_bg
-      };
-      let on_bg = |attrs: Attrs| Attrs {
-        bgcolor: bg.into(),
-        ..attrs
-      };
-      let hl = on_bg(style.key);
+      let style = theme.block.modal_row(style, row.selected);
       if row.selected {
-        grid.fill_area(row.area, ' ', on_bg(style.text));
-        grid.draw_text(row.area, "\u{258e}", hl);
+        grid.fill_area(row.area, ' ', style.text);
+        grid.draw_text(row.area, "\u{258e}", style.key);
       }
 
-      // The description gets what the name and the key leave.
+      // The description gets what the key leaves. The action's name is
+      // not shown: actions with fields would share it. It still matches
+      // the search.
       let mut rest = row.area.inner((0, 1, 0, 2));
-      draw_highlighted(
-        grid,
-        rest.take_left(20),
-        &item.name,
-        &search,
-        on_bg(style.text).set_bold(true),
-        on_bg(style.key).set_bold(true),
-      );
       if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
         let key = key.to_string();
-        grid.draw_text(rest.take_right(key.width() as u16), &key, hl);
+        grid.draw_text(rest.take_right(key.width() as u16), &key, style.key);
+        rest.take_right(1);
       }
-      draw_highlighted(grid, rest, &item.desc, &search, on_bg(style.dim), hl);
+      draw_highlighted(grid, rest, &item.desc, &search, style.text, style.key);
     }
   }
 }
@@ -205,7 +157,12 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
     Action::Zoom,
     Action::ShowCommandsMenu,
     Action::ShowMainMenu,
-    Action::ShowRunnerSelect,
+    Action::ShowRunnerSelect {
+      tab: RunnerTab::Switch,
+    },
+    Action::ShowRunnerSelect {
+      tab: RunnerTab::Open,
+    },
     Action::NextTask,
     Action::PrevTask,
     Action::Expand,
@@ -247,4 +204,29 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
       item.name.contains(search) || item.desc.to_lowercase().contains(search)
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The description is all a row shows, so two actions must not share
+  /// one.
+  #[test]
+  fn descriptions_are_unique() {
+    let items = menu_items("");
+    let mut descs: Vec<&str> = items.iter().map(|i| i.desc.as_str()).collect();
+    descs.sort_unstable();
+    let before = descs.len();
+    descs.dedup();
+    assert_eq!(descs.len(), before, "{descs:?}");
+  }
+
+  #[test]
+  fn the_search_matches_the_name_too() {
+    let items = menu_items("show-runner");
+    assert_eq!(items.len(), 2, "both runner-select spellings");
+    assert!(items.iter().all(|i| i.name == "show-runner-select"));
+    assert!(menu_items("open project").len() == 1);
+  }
 }

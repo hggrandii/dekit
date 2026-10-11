@@ -48,7 +48,7 @@ impl TestRunner {
   }
 
   fn snapshot_files(&self) -> Vec<String> {
-    std::fs::read_dir(self.runtime.path.join("dekit"))
+    std::fs::read_dir(self.runtime_dir())
       .into_iter()
       .flatten()
       .filter_map(|entry| entry.ok())
