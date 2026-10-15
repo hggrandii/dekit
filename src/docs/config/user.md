@@ -42,6 +42,10 @@ keymap:
   type: boolean
   default: "true"
   desc: Show the hint line while a task is zoomed.
+- key: tui.theme
+  type: auto | dark | light
+  default: auto
+  desc: Console colors. `auto` follows the terminal's background (asked with OSC 11, else `COLORFGBG`), and is dark when neither says.
 :::
 
 ## Agent

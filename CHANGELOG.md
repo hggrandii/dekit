@@ -28,6 +28,8 @@
   `start`; the `changed` and `bad_config` error codes; terminal
   capabilities and the cell size on `attach`, and input as `key`,
   `mouse`, `paste`, `focus`, and `resize` events
+- The console follows the terminal's light or dark background;
+  `tui.theme: dark | light` in the user config pins it
 
 ## 0.10.2 - 2026-10-11
 

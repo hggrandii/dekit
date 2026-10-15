@@ -17,6 +17,7 @@ use crate::{
     copy_mode::{CopyMove, CopyState, Pos},
     task::TaskId,
   },
+  protocol::caps::Background,
   task::logger::LogMsg,
   term::{
     Color, Frame, Geometry, MouseProtocolMode, Screen, ScreenHandle, Size,
@@ -122,6 +123,8 @@ pub enum TaskScreenCmd {
     /// The attaching client's dekit version; `None` for an in-process
     /// observer like the console.
     client_version: Option<String>,
+    /// The attaching client's terminal background, when it knows it.
+    background: Option<Background>,
   },
   Detach {
     observer: ObserverId,
@@ -433,6 +436,7 @@ impl TaskScreen {
         geometry,
         sink,
         client_version,
+        background: _,
       } => {
         // Re-attaching replaces the previous registration.
         self.observers.retain(|o| o.id != observer);
@@ -1002,6 +1006,7 @@ mod tests {
         geometry,
         sink,
         client_version: None,
+        background: None,
       },
       &mut effects,
     );

@@ -159,6 +159,7 @@ async fn run_attached(
       geometry: attach.geometry,
       sink,
       client_version: Some(hello.version.clone()),
+      background: caps.background,
     },
   );
   let mut until = None;

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 pub use charset::CharSet;
 pub use keyboard::KittyStack;
 pub use modes::Modes;
+pub(crate) use osc::parse_color_spec;
 
 use super::{
   color::Rgb,

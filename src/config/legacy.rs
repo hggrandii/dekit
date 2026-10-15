@@ -6,7 +6,7 @@ use crate::config::keymap::KeymapConfig;
 use crate::config::log::LogConfig;
 use crate::config::stop_signal::StopConfig;
 use crate::config::task::{CmdConfig, TaskConfig};
-use crate::config::tui::{SidebarConfig, TipsConfig, TuiConfig};
+use crate::config::tui::{SidebarConfig, ThemeMode, TipsConfig, TuiConfig};
 use crate::kernel::task::{RestartMode, TaskKind};
 use crate::kernel::task_path::{path_name, unique};
 
@@ -47,6 +47,7 @@ impl From<crate::mprocs::config::Config> for Config {
           show: !legacy.hide_keymap_window,
         },
         zoom_tip: true,
+        theme: ThemeMode::Auto,
       },
       keymap: KeymapConfig::default(),
       on_init: legacy.on_init.map(Hook::LegacyAction),

@@ -45,6 +45,7 @@ use crate::{
     },
   },
   project::Project,
+  protocol::caps::Background,
   spec::TaskSpec,
   target::Target,
   term::{
@@ -115,6 +116,8 @@ pub struct App {
   project: Arc<Project>,
   keymap: Keymap,
   theme: Theme,
+  /// The terminal background the latest attached client reported.
+  background: Option<Background>,
   state: State,
   modal: Option<Box<dyn Modal>>,
   /// How many modals were opened: the number of the one open.
@@ -170,9 +173,10 @@ impl App {
         config: ConfigStatus::default(),
         drag: None,
       },
+      theme: Theme::resolve(project.config().tui.theme, None),
+      background: None,
       project,
       keymap,
-      theme: Theme::dark(),
       modal: None,
       modal_seq: 0,
       receiver,
@@ -188,6 +192,17 @@ impl App {
       status_running: false,
       disk_config: None,
       config_generation: 0,
+    }
+  }
+
+  /// Repaints in the theme `tui.theme` asks for, given what the latest
+  /// client said about its terminal's background.
+  fn apply_theme(&mut self) {
+    let theme =
+      Theme::resolve(self.project.config().tui.theme, self.background);
+    if theme.dark != self.theme.dark {
+      self.theme = theme;
+      self.dirty = true;
     }
   }
 
@@ -239,6 +254,7 @@ impl App {
           self.status_dirty = true;
           // As the user config says since a reload took it in.
           self.keymap = self.project.config().keymap.build();
+          self.apply_theme();
           self.dirty = true;
         }
         () = sleep_until(self.state.toast.as_ref().map(|toast| toast.until)) => {
@@ -376,6 +392,7 @@ impl App {
         geometry: self.task_geometry(),
         sink: self.sink.clone(),
         client_version: None,
+        background: None,
       },
     );
   }
@@ -482,7 +499,12 @@ impl App {
         cmd
       }
       // A console attachment is what makes a project recent.
-      cmd @ TaskScreenCmd::Attach { .. } => {
+      cmd @ TaskScreenCmd::Attach { background, .. } => {
+        if let Some(background) = background {
+          // The latest client to say decides for everyone attached.
+          self.background = Some(background);
+          self.apply_theme();
+        }
         if let Some(runner) = self.project.config().runner.clone() {
           tokio::task::spawn_blocking(move || {
             crate::runner::recent::touch(&runner)

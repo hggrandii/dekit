@@ -1,6 +1,7 @@
 use crate::term::{
   key::{Key, KeyCode, KeyEventKind, KeyEventState, KeyMods},
   mouse::{MouseButton, MouseEvent, MouseEventKind},
+  screen::parse_color_spec,
   vt::{Params, ScanMode, Scanner, Seq, keys},
 };
 
@@ -144,7 +145,14 @@ fn decode_seq<F: FnMut(E)>(seq: Seq, f: &mut F) {
       }
     }
     Seq::Dcs(data) => f(E::DcsReply(data.to_vec())),
-    Seq::Osc(_) => (),
+    Seq::Osc(data) => {
+      if let Some(spec) = data.strip_prefix(b"11;")
+        && let Some(rgb) =
+          std::str::from_utf8(spec).ok().and_then(parse_color_spec)
+      {
+        f(E::BackgroundColor(rgb));
+      }
+    }
   }
 }
 
@@ -456,6 +464,7 @@ fn mouse_cb(cb: u8) -> Result<(MouseEventKind, KeyMods), ()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::term::Rgb;
 
   fn decode(chunks: &[&[u8]]) -> Vec<E> {
     let mut decoder = EventDecoder::new();
@@ -619,6 +628,17 @@ mod tests {
     assert_eq!(decode(&[b"\x1b[5;10R"]), vec![E::CursorPos(9, 4)]);
     // Multi-digit kitty flags parse fully.
     assert_eq!(decode(&[b"\x1b[?31u"]), vec![E::ReplyKittyKeyboard(31)]);
+    // OSC 11 answers end with ST or BEL, in 16 or 8 bits a channel.
+    assert_eq!(
+      decode(&[b"\x1b]11;rgb:ffff/fefe/f0f0\x1b\\"]),
+      vec![E::BackgroundColor(Rgb(0xff, 0xfe, 0xf0))]
+    );
+    assert_eq!(
+      decode(&[b"\x1b]11;rgb:16/1b/22\x07"]),
+      vec![E::BackgroundColor(Rgb(0x16, 0x1b, 0x22))]
+    );
+    assert_eq!(decode(&[b"\x1b]11;garbage\x07"]), vec![]);
+    assert_eq!(decode(&[b"\x1b]10;rgb:ff/ff/ff\x07"]), vec![]);
   }
 
   #[test]

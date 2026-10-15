@@ -1,4 +1,4 @@
-use crate::term::{key::Key, mouse::MouseEvent};
+use crate::term::{Rgb, key::Key, mouse::MouseEvent};
 
 /// What the input decoder reads off the terminal: the events the driver
 /// passes on, and the replies to its own probes.
@@ -28,6 +28,8 @@ pub enum InternalTermEvent {
   GraphicsReply(Vec<u8>),
   /// A DCS reply (XTVERSION, XTGETTCAP), its body.
   DcsReply(Vec<u8>),
+  /// The answer to an OSC 11 query: the default background color.
+  BackgroundColor(Rgb),
 }
 
 #[derive(Debug)]

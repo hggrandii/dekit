@@ -71,6 +71,8 @@ enum State {
   MaybeApc,
   /// Input mode: `ESC P` seen; a DCS reply if its first byte fits.
   MaybeDcs,
+  /// Input mode: `ESC ]` seen; an OSC reply if a digit follows.
+  MaybeOsc,
 }
 
 /// Incremental scanner for terminal byte streams. State carries across
@@ -176,6 +178,7 @@ impl Scanner {
       }
       State::MaybeApc => out.extend_from_slice(b"\x1b_"),
       State::MaybeDcs => out.extend_from_slice(b"\x1bP"),
+      State::MaybeOsc => out.extend_from_slice(b"\x1b]"),
       State::Skip => {
         out.extend_from_slice(b"\x1bX");
         out.extend_from_slice(&self.body);
@@ -202,7 +205,7 @@ impl Scanner {
         self.state = State::Ground;
         f(Seq::Ctl(0x1B));
       }
-      // `ESC _` and `ESC P` that nothing followed: Alt chords.
+      // `ESC _`, `ESC P`, and `ESC ]` that nothing followed: Alt chords.
       State::MaybeApc => {
         self.state = State::Ground;
         f(Seq::EscChar('_'));
@@ -211,15 +214,22 @@ impl Scanner {
         self.state = State::Ground;
         f(Seq::EscChar('P'));
       }
+      State::MaybeOsc => {
+        self.state = State::Ground;
+        f(Seq::EscChar(']'));
+      }
       _ => (),
     }
   }
 
-  /// True while a lone ESC (or an `ESC _` / `ESC P` that may yet become a
-  /// reply) is waiting to see whether more bytes follow.
+  /// True while a lone ESC (or an `ESC _` / `ESC P` / `ESC ]` that may yet
+  /// become a reply) is waiting to see whether more bytes follow.
   #[cfg_attr(windows, allow(dead_code))]
   pub fn esc_pending(&self) -> bool {
-    matches!(self.state, State::Esc | State::MaybeApc | State::MaybeDcs)
+    matches!(
+      self.state,
+      State::Esc | State::MaybeApc | State::MaybeDcs | State::MaybeOsc
+    )
   }
 
   pub fn feed<F: for<'a> FnMut(Seq<'a>)>(&mut self, input: &[u8], mut f: F) {
@@ -394,6 +404,8 @@ impl Scanner {
                   self.state = State::MaybeApc;
                 } else if b == b'P' {
                   self.state = State::MaybeDcs;
+                } else if b == b']' {
+                  self.state = State::MaybeOsc;
                 } else if b < 0x80 {
                   self.state = State::Ground;
                   f(Seq::EscChar(b as char));
@@ -464,7 +476,7 @@ impl Scanner {
           } else if b == 0x1B {
             self.state = State::OscEsc;
           } else {
-            self.push_body(b, MAX_OSC_BYTES);
+            self.push_body(b, self.body_cap(MAX_OSC_BYTES));
           }
           i += 1;
         }
@@ -476,7 +488,7 @@ impl Scanner {
           } else {
             // The ESC was part of the body; reprocess this byte.
             self.state = State::Osc;
-            self.push_body(0x1B, MAX_OSC_BYTES);
+            self.push_body(0x1B, self.body_cap(MAX_OSC_BYTES));
           }
         }
         State::Dcs => {
@@ -556,6 +568,17 @@ impl Scanner {
           } else {
             self.state = State::Ground;
             f(Seq::EscChar('P'));
+          }
+        }
+        State::MaybeOsc => {
+          // Color queries' answers (`OSC 11 ; rgb:... ST`) start with the
+          // number.
+          if b.is_ascii_digit() {
+            self.body.clear();
+            self.state = State::Osc;
+          } else {
+            self.state = State::Ground;
+            f(Seq::EscChar(']'));
           }
         }
         State::Ss3 => {
@@ -844,6 +867,19 @@ mod tests {
       scan_input(&[b"\x1bP>|kitty 0.40\x1b\\"]),
       vec![Item::Dcs(b">|kitty 0.40".to_vec())]
     );
+    // ESC ] too: an OSC reply starts with its number.
+    assert_eq!(
+      scan_input(&[b"\x1b]x"]),
+      vec![Item::EscChar(']'), Item::Text("x".into())]
+    );
+    assert_eq!(
+      scan_input(&[b"\x1b]11;rgb:ffff/ffff/ffff\x07"]),
+      vec![Item::Osc(b"11;rgb:ffff/ffff/ffff".to_vec())]
+    );
+    assert_eq!(
+      scan_input(&[b"\x1b]11;rgb:0/0/0\x1b\\"]),
+      vec![Item::Osc(b"11;rgb:0/0/0".to_vec())]
+    );
     // A misread reply cannot swallow input for long.
     let mut scanner = Scanner::new(ScanMode::Input);
     let mut items = Vec::new();
@@ -944,6 +980,8 @@ mod tests {
       b"\x1b_x",
       b"\x1bP>|t 1\x1b\\",
       b"\x1bPq",
+      b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\",
+      b"\x1b]x",
     ] {
       resumes_anywhere(ScanMode::Input, input);
     }

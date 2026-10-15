@@ -12,13 +12,13 @@ pub(crate) mod internal;
 mod windows;
 
 use crate::protocol::caps::{
-  Feature, FeatureSet, Features, KittyCaps, KittyGraphics, TermCaps,
-  WidthPolicy,
+  Background, Feature, FeatureSet, Features, KittyCaps, KittyGraphics,
+  TermCaps, WidthPolicy,
 };
 use crate::term::modes::{KITTY_ALL_FLAGS, KITTY_TEXT};
 use crate::{
   error::ResultLogger,
-  term::{Geometry, Size, TermEvent, color::ColorDepth, vt::emit},
+  term::{Geometry, Rgb, Size, TermEvent, color::ColorDepth, vt::emit},
 };
 
 use self::{
@@ -87,6 +87,8 @@ struct Probe {
   da1: Option<Vec<u32>>,
   /// XTVERSION's answer: the terminal's name and version.
   terminal: Option<String>,
+  /// OSC 11's answer: the default background color.
+  background: Option<Rgb>,
 }
 
 impl TermDriver {
@@ -405,6 +407,9 @@ impl TermDriver {
             Some(String::from_utf8_lossy(name).into_owned());
         }
       }
+      InternalTermEvent::BackgroundColor(rgb) => {
+        self.probe.background = Some(*rgb);
+      }
       _ => return Ok(false),
     }
     Ok(true)
@@ -502,7 +507,8 @@ impl TermDriver {
       | InternalTermEvent::WindowReport(..)
       | InternalTermEvent::ModeReport { .. }
       | InternalTermEvent::GraphicsReply(_)
-      | InternalTermEvent::DcsReply(_) => (),
+      | InternalTermEvent::DcsReply(_)
+      | InternalTermEvent::BackgroundColor(_) => (),
     };
     Ok(None)
   }
@@ -655,6 +661,10 @@ fn write_probes(seq: &mut Vec<u8>) {
       seq.extend_from_slice(b"\x1b[6n");
     }
     seq.extend_from_slice(b"\x1b[1;1H\x1b[2K");
+    // The default background, for `tui.theme: auto`. tmux answers it
+    // itself when it knows the pane's color; otherwise nothing comes and
+    // `COLORFGBG` decides.
+    seq.extend_from_slice(b"\x1b]11;?\x07");
   }
   seq.extend_from_slice(emit::DA1_QUERY.as_bytes());
 }
@@ -664,6 +674,9 @@ struct Env {
   term: String,
   term_program: String,
   colorterm: String,
+  /// `fg;bg` (or `fg;default;bg`) in ANSI color numbers, set by rxvt,
+  /// Konsole, and a few others.
+  colorfgbg: String,
 }
 
 impl Env {
@@ -672,8 +685,39 @@ impl Env {
       term: std::env::var("TERM").unwrap_or_default(),
       term_program: std::env::var("TERM_PROGRAM").unwrap_or_default(),
       colorterm: std::env::var("COLORTERM").unwrap_or_default(),
+      colorfgbg: std::env::var("COLORFGBG").unwrap_or_default(),
     }
   }
+}
+
+/// Light when the color's relative luminance (WCAG) is over one half.
+fn background_of(rgb: Rgb) -> Background {
+  let linear = |c: u8| {
+    let c = c as f64 / 255.0;
+    if c <= 0.04045 {
+      c / 12.92
+    } else {
+      ((c + 0.055) / 1.055).powf(2.4)
+    }
+  };
+  let luminance =
+    0.2126 * linear(rgb.0) + 0.7152 * linear(rgb.1) + 0.0722 * linear(rgb.2);
+  if luminance > 0.5 {
+    Background::Light
+  } else {
+    Background::Dark
+  }
+}
+
+/// The background `COLORFGBG` names: white (7 or 15) is light, any other
+/// color dark, and anything else unknown.
+fn background_of_colorfgbg(value: &str) -> Option<Background> {
+  let bg: u8 = value.rsplit(';').next()?.trim().parse().ok()?;
+  Some(if matches!(bg, 7 | 15) {
+    Background::Light
+  } else {
+    Background::Dark
+  })
 }
 
 #[cfg(unix)]
@@ -773,6 +817,10 @@ fn caps_from_probe(probe: &Probe, env: &Env) -> TermCaps {
       graphics,
     },
     widths,
+    background: probe
+      .background
+      .map(background_of)
+      .or_else(|| background_of_colorfgbg(&env.colorfgbg)),
   }
 }
 
@@ -838,6 +886,7 @@ mod tests {
       term: term.to_string(),
       term_program: program.to_string(),
       colorterm: String::new(),
+      colorfgbg: String::new(),
     }
   }
 
@@ -853,6 +902,7 @@ mod tests {
       graphics: true,
       da1: Some(vec![62, 4, 22]),
       terminal: Some("kitty(0.40.0)".to_string()),
+      background: Some(Rgb(0xff, 0xff, 0xff)),
     };
     let caps = caps_from_probe(&probe, &env("xterm-kitty", ""));
     assert_eq!(
@@ -867,6 +917,7 @@ mod tests {
       TermCaps::full().features.with(Feature::Sixel)
     );
     assert_eq!(caps.widths, WidthPolicy::agreed());
+    assert_eq!(caps.background, Some(Background::Light));
 
     // A terminal that answered nothing: safe assumptions.
     let silent = Probe::default();
@@ -881,6 +932,7 @@ mod tests {
     );
     assert_eq!(caps.widths, WidthPolicy::default());
     assert_eq!(caps.colors, ColorDepth::TrueColor);
+    assert_eq!(caps.background, None);
 
     let caps = caps_from_probe(&silent, &env("linux", ""));
     assert_eq!(caps.colors, ColorDepth::Ansi16);
@@ -894,6 +946,36 @@ mod tests {
     assert!(!italic("screen-256color", "tmux"));
     assert!(!italic("screen", ""));
     assert!(italic("tmux-256color", "tmux"));
+  }
+
+  #[test]
+  fn background_from_osc_11_then_colorfgbg() {
+    let probe = |background| Probe {
+      background,
+      ..Probe::default()
+    };
+    let env = |colorfgbg: &str| Env {
+      colorfgbg: colorfgbg.to_string(),
+      ..env("xterm-256color", "")
+    };
+    let of = |p: &Probe, e: &Env| caps_from_probe(p, e).background;
+    // Solarized light and dark, GitHub's light and dark.
+    let light = Some(Background::Light);
+    let dark = Some(Background::Dark);
+    assert_eq!(of(&probe(Some(Rgb(0xfd, 0xf6, 0xe3))), &env("")), light);
+    assert_eq!(of(&probe(Some(Rgb(0x00, 0x2b, 0x36))), &env("")), dark);
+    assert_eq!(of(&probe(Some(Rgb(0xf6, 0xf8, 0xfa))), &env("")), light);
+    assert_eq!(of(&probe(Some(Rgb(0x16, 0x1b, 0x22))), &env("")), dark);
+    // Mid gray is dark: its luminance is 0.22.
+    assert_eq!(of(&probe(Some(Rgb(0x80, 0x80, 0x80))), &env("")), dark);
+    // The terminal's answer wins over the environment.
+    assert_eq!(of(&probe(Some(Rgb(0, 0, 0))), &env("0;15")), dark);
+    // Without an answer, COLORFGBG's last field is the background.
+    assert_eq!(of(&probe(None), &env("0;15")), light);
+    assert_eq!(of(&probe(None), &env("0;default;7")), light);
+    assert_eq!(of(&probe(None), &env("15;0")), dark);
+    assert_eq!(of(&probe(None), &env("default;default")), None);
+    assert_eq!(of(&probe(None), &env("")), None);
   }
 
   #[test]
