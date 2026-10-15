@@ -12,9 +12,9 @@ use crate::console::{
 };
 use crate::term::{
   CursorStyle, Grid,
-  attrs::Attrs,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
+  style::Style,
 };
 
 use super::modal::{Modal, ModalResult};
@@ -121,10 +121,10 @@ fn draw_highlighted(
   mut area: Rect,
   text: &str,
   search: &str,
-  base: Attrs,
-  hl: Attrs,
+  base: Style,
+  hl: Style,
 ) {
-  let mut draw = |area: &mut Rect, s: &str, attrs: Attrs| {
+  let mut draw = |area: &mut Rect, s: &str, attrs: Style| {
     grid.draw_text(area.take_left(s.width() as u16), s, attrs);
   };
   if search.is_empty() {

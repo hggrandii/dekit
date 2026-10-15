@@ -8,7 +8,9 @@ use tokio_util::codec::{Decoder, Encoder, FramedWrite};
 use crate::protocol::ctl::{
   Bye, CtlMsg, Hello, PROTOCOL_VERSION, codes, local_hello,
 };
-use crate::protocol::wire::{FrameCodec, KIND_CTL, KIND_OUT, RawFrame};
+use crate::protocol::wire::{
+  FrameCodec, KIND_CTL, KIND_OUT, OUT_FRAME_BYTES, RawFrame,
+};
 
 type DynWrite = dyn AsyncWrite + Unpin + Send + 'static;
 type DynRead = dyn AsyncRead + Unpin + Send + 'static;
@@ -54,7 +56,17 @@ impl ConnSender {
     })
   }
 
-  pub fn queue_out(&mut self, bytes: Bytes) -> anyhow::Result<()> {
+  /// Queues terminal output, in frames of at most `OUT_FRAME_BYTES`: a
+  /// large image paint must not exceed what a frame may carry. The
+  /// client writes the payloads back to back, so a sequence may span two.
+  pub fn queue_out(&mut self, mut bytes: Bytes) -> anyhow::Result<()> {
+    while bytes.len() > OUT_FRAME_BYTES {
+      let head = bytes.split_to(OUT_FRAME_BYTES);
+      self.queue(RawFrame {
+        kind: KIND_OUT,
+        payload: head,
+      })?;
+    }
     self.queue(RawFrame {
       kind: KIND_OUT,
       payload: bytes,
@@ -238,7 +250,10 @@ pub fn server_hello(client: &Hello) -> Result<Hello, Bye> {
       ),
     ));
   }
-  Ok(local_hello())
+  Ok(Hello {
+    features: vec![crate::protocol::ctl::FEATURE_ATCH2.to_string()],
+    ..local_hello()
+  })
 }
 
 fn bye_text(bye: &Bye) -> String {
@@ -525,5 +540,33 @@ mod tests {
     assert!(receiver.recv().now_or_never().is_none());
     // What another image would carry over: the frame from its start.
     assert_eq!(receiver.buffered(), &frame[..6]);
+  }
+
+  #[tokio::test]
+  async fn large_output_is_sent_in_bounded_frames() {
+    let (mut client_tx, _client_rx, _server_tx, mut server_rx) = pair();
+    let bytes = vec![b'x'; OUT_FRAME_BYTES * 2 + 5];
+    client_tx.queue_out(Bytes::from(bytes.clone())).unwrap();
+    let flush = async {
+      while !client_tx.pending().is_empty() {
+        client_tx.flush().await.unwrap();
+      }
+    };
+    let read = async {
+      let mut frames = Vec::new();
+      let mut total = 0;
+      while total < bytes.len() {
+        match server_rx.recv().await {
+          Some(Ok(Msg::Out(payload))) => {
+            total += payload.len();
+            frames.push(payload.len());
+          }
+          other => panic!("{other:?}"),
+        }
+      }
+      frames
+    };
+    let (_, frames) = tokio::join!(flush, read);
+    assert_eq!(frames, vec![OUT_FRAME_BYTES, OUT_FRAME_BYTES, 5]);
   }
 }

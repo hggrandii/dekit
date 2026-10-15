@@ -1,7 +1,9 @@
-use crate::term::Screen;
+use crate::term::Grid;
 
+/// A frozen copy of a screen's grid (cheap: rows and history are shared
+/// until written) with a selection over it.
 pub struct CopyState {
-  snapshot: Screen,
+  snapshot: Grid,
   start: Pos,
   end: Option<Pos>,
 }
@@ -21,18 +23,23 @@ pub enum CopyMove {
 }
 
 impl CopyState {
-  /// Freezes `screen` and starts copy mode with the cursor on the bottom row.
-  pub fn new(screen: Screen) -> Self {
-    let y = (screen.size().height as i32 - 1).max(0);
+  /// Freezes `grid` and starts copy mode with the cursor on the bottom row.
+  pub fn new(grid: Grid) -> Self {
+    let y = (grid.size().height as i32 - 1).max(0);
     CopyState {
-      snapshot: screen,
+      snapshot: grid,
       start: Pos { y, x: 0 },
       end: None,
     }
   }
 
-  pub fn snapshot(&self) -> &Screen {
+  pub fn snapshot(&self) -> &Grid {
     &self.snapshot
+  }
+
+  /// The frozen grid, to follow the observers' size.
+  pub fn snapshot_mut(&mut self) -> &mut Grid {
+    &mut self.snapshot
   }
 
   pub fn start(&self) -> Pos {
@@ -56,11 +63,11 @@ impl CopyState {
   pub fn move_cursor(&mut self, dir: CopyMove) {
     let width = self.snapshot.size().width as i32;
     let height = self.snapshot.size().height as i32;
-    let scrollback_len = self.snapshot.scrollback_len() as i32;
+    let history_rows = self.snapshot.max_scrollback() as i32;
     let pos = self.cursor_mut();
     match dir {
       CopyMove::Up => {
-        if pos.y > -scrollback_len {
+        if pos.y > -history_rows {
           pos.y -= 1;
         }
       }
@@ -110,11 +117,13 @@ impl CopyState {
   }
 
   pub fn scroll_up(&mut self, n: usize) {
-    self.snapshot.scroll_screen_up(n);
+    let offset = self.snapshot.scrollback().saturating_add(n);
+    self.snapshot.set_scrollback(offset);
   }
 
   pub fn scroll_down(&mut self, n: usize) {
-    self.snapshot.scroll_screen_down(n);
+    let offset = self.snapshot.scrollback().saturating_sub(n);
+    self.snapshot.set_scrollback(offset);
   }
 
   /// Current scroll offset (rows above the live bottom).
@@ -122,15 +131,24 @@ impl CopyState {
     self.snapshot.scrollback()
   }
 
+  /// How far back the view can go.
+  pub fn max_scrollback(&self) -> usize {
+    self.snapshot.max_scrollback()
+  }
+
   /// Extracts the selected text, or `None` if no selection has been started.
   pub fn selected_text(&self) -> Option<String> {
     let end = self.end?;
     let (low, high) = Pos::to_low_high(self.start, end);
-    Some(
-      self
-        .snapshot
-        .get_selected_text(low.x, low.y, high.x, high.y),
-    )
+    // Selection coordinates are relative to the live screen's top row;
+    // the snapshot reads in view coordinates.
+    let offset = self.snapshot.scrollback() as i32;
+    Some(self.snapshot.get_selected_text(
+      low.x,
+      low.y + offset,
+      high.x,
+      high.y + offset,
+    ))
   }
 }
 

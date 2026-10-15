@@ -20,10 +20,10 @@ use crate::runner::{
 };
 use crate::term::{
   CursorStyle, Grid,
-  attrs::Attrs,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
   mouse::{MouseButton, MouseEvent, MouseEventKind},
+  style::Style,
 };
 
 use super::modal::{Modal, ModalResult};
@@ -288,7 +288,7 @@ impl Picker {
 
     for row in self.list.rows(list_area) {
       let item = &self.items[self.shown[row.index]];
-      let mut style = theme.block.modal_row(style, row.selected);
+      let style = theme.block.modal_row(style, row.selected);
       if row.selected {
         grid.fill_area(row.area, ' ', style.text);
         grid.draw_text(row.area, "\u{258e}", style.key);
@@ -603,8 +603,8 @@ impl OpenPage {
     ));
 
     if let Some(error) = &self.error {
-      let failed = Attrs {
-        fgcolor: theme.tasks.failed.into(),
+      let failed = Style {
+        fg: theme.tasks.failed.into(),
         ..style.text
       };
       grid.draw_text(list_area.inner((0, 1)), error, failed);
@@ -621,7 +621,7 @@ impl OpenPage {
 
     for row in self.list.rows(list_area) {
       let entry = &self.entries[self.shown[row.index]];
-      let mut style = theme.block.modal_row(style, row.selected);
+      let style = theme.block.modal_row(style, row.selected);
       if row.selected {
         grid.fill_area(row.area, ' ', style.text);
         grid.draw_text(row.area, "\u{258e}", style.key);
@@ -660,8 +660,8 @@ fn split_path(value: &str) -> (&str, &str) {
 fn draw_on_border(
   grid: &mut Grid,
   row: &mut Rect,
-  pieces: &[(&str, Attrs)],
-  blank: Attrs,
+  pieces: &[(&str, Style)],
+  blank: Style,
 ) -> Vec<Rect> {
   let width = pieces.iter().map(|(text, _)| text.width()).sum::<usize>() + 2;
   let mut strip = row.take_right((width as u16).min(row.width));
@@ -730,11 +730,11 @@ impl Modal for RunnerSelectModal {
     // text, and light up a little under the pointer.
     let block_theme = &theme.block;
     let faint = block_theme.dim.blend(block_theme.modal_bg, FAINT);
-    let faint_attrs = Attrs {
-      fgcolor: faint.into(),
+    let faint_attrs = Style {
+      fg: faint.into(),
       ..style.dim
     };
-    let mut pieces: Vec<(&str, Attrs)> = Vec::new();
+    let mut pieces: Vec<(&str, Style)> = Vec::new();
     for (i, tab) in RunnerTab::ALL.iter().enumerate() {
       if i > 0 {
         pieces.push(("·", faint_attrs));
@@ -745,8 +745,8 @@ impl Modal for RunnerSelectModal {
         .hover
         .is_some_and(|(x, y)| self.tab_hits[i].contains(x, y))
       {
-        Attrs {
-          fgcolor: faint.blend(block_theme.text, HOVER).into(),
+        Style {
+          fg: faint.blend(block_theme.text, HOVER).into(),
           ..style.dim
         }
       } else {

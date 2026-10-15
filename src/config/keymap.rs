@@ -121,7 +121,7 @@ impl KeymapConfig {
       Action::ShowRenameTask,
     );
     let ctrlc = Key::new(KeyCode::Char('c'), KeyMods::CONTROL);
-    s.keymap_add_p(ctrlc, Action::SendKey { key: ctrlc });
+    s.keymap_add_p(ctrlc.clone(), Action::SendKey { key: ctrlc });
     s.keymap_add_p(
       Key::new(KeyCode::Char('a'), KeyMods::NONE),
       Action::ShowAddTask,
@@ -251,13 +251,13 @@ impl KeymapConfig {
   pub fn build(&self) -> Keymap {
     let mut keymap = Keymap::new();
     for (key, event) in &self.keymap_tasks {
-      keymap.bind(KeymapGroup::Tasks, *key, event.clone());
+      keymap.bind(KeymapGroup::Tasks, key.clone(), event.clone());
     }
     for (key, event) in &self.keymap_term {
-      keymap.bind(KeymapGroup::Term, *key, event.clone());
+      keymap.bind(KeymapGroup::Term, key.clone(), event.clone());
     }
     for (key, event) in &self.keymap_copy {
-      keymap.bind(KeymapGroup::Copy, *key, event.clone());
+      keymap.bind(KeymapGroup::Copy, key.clone(), event.clone());
     }
     keymap
   }

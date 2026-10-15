@@ -1,28 +1,34 @@
 pub mod ansi;
-pub mod attrs;
 pub mod cell;
 pub mod color;
 pub mod common;
+pub mod draw;
 pub mod event;
+pub mod frame;
 pub mod grid;
+pub mod history;
+pub mod image;
 pub mod key;
 pub mod line_symbols;
+pub mod modes;
 pub mod mouse;
 pub mod palette;
+pub mod render;
 pub mod reveal;
 pub mod row;
 pub mod screen;
-pub mod screen_differ;
-pub mod snapshot;
+pub mod style;
+pub mod unicode;
 pub mod vt;
 
 pub use cell::Cell;
-pub use color::{Color, Rgb};
-pub use common::{CursorStyle, Size, Winsize};
+pub use color::{Color, ColorDepth, Rgb};
+pub use common::{CursorStyle, Geometry, Size, Winsize};
 pub use event::TermEvent;
+pub use frame::{Frame, ScreenHandle};
 pub use grid::Grid;
+pub use modes::{MouseProtocolEncoding, MouseProtocolMode};
 pub use palette::Palette;
-pub use screen::{
-  MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, VtEvent,
-};
-pub use screen_differ::ScreenDiffer;
+pub use render::Painter;
+pub use screen::{Screen, VtEvent};
+pub use style::Style;

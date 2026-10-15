@@ -1,92 +1,151 @@
-use super::Cell;
+//! One row of the live screen.
 
-#[derive(Clone, Debug)]
+use super::{
+  cell::{Cell, GraphemeTable},
+  style::StyleId,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
-  pub cells: Vec<super::cell::Cell>,
-  size: u16,
+  pub cells: Vec<Cell>,
   wrapped: bool,
 }
 
 impl Row {
   pub fn new(cols: u16) -> Self {
-    Self {
-      cells: vec![super::cell::Cell::default(); usize::from(cols)],
-      size: 0,
+    Row {
+      cells: vec![Cell::EMPTY; usize::from(cols)],
       wrapped: false,
     }
   }
 
-  pub fn new_with_attrs(cols: u16, attrs: super::attrs::Attrs) -> Self {
-    let mut cell = super::cell::Cell::default();
-    cell.set_attrs(attrs);
-    Self {
-      cells: vec![cell; usize::from(cols)],
-      size: 0,
+  pub fn blank(cols: u16, style: StyleId) -> Self {
+    Row {
+      cells: vec![Cell::blank(style); usize::from(cols)],
       wrapped: false,
     }
   }
 
   pub fn cols(&self) -> u16 {
-    self
-      .cells
-      .len()
-      .try_into()
-      // we limit the number of cols to a u16 (see Size)
-      .unwrap()
+    self.cells.len() as u16
   }
 
-  pub fn clear(&mut self, attrs: super::attrs::Attrs) {
+  pub fn clear(&mut self, style: StyleId) {
     for cell in &mut self.cells {
-      cell.clear(attrs);
+      *cell = Cell::blank(style);
     }
-    self.size = 0;
     self.wrapped = false;
   }
 
-  fn cells(&self) -> impl Iterator<Item = &super::cell::Cell> {
-    self.cells.iter()
+  pub fn get(&self, col: u16) -> Option<Cell> {
+    self.cells.get(usize::from(col)).copied()
   }
 
-  pub fn get(&self, col: u16) -> Option<&super::cell::Cell> {
-    self.cells.get(usize::from(col))
-  }
-
-  pub fn get_mut(&mut self, col: u16) -> Option<&mut super::cell::Cell> {
-    self.size = self.size.max(col + 1);
+  pub fn get_mut(&mut self, col: u16) -> Option<&mut Cell> {
     self.cells.get_mut(usize::from(col))
   }
 
-  pub fn insert(&mut self, i: u16, cell: super::cell::Cell) {
-    self.cells.insert(usize::from(i), cell);
+  /// Puts `cell` at `col`, keeping wide cells whole: a wide cell it
+  /// overwrites loses its other half too.
+  pub fn set(&mut self, col: u16, cell: Cell) {
+    let i = usize::from(col);
+    if i >= self.cells.len() {
+      return;
+    }
+    self.clear_wide(col, self.cells[i].style);
+    self.cells[i] = cell;
+  }
+
+  pub fn insert(&mut self, col: u16, cell: Cell) {
+    let i = usize::from(col);
+    if i > self.cells.len() {
+      return;
+    }
+    self.cells.insert(i, cell);
     self.wrapped = false;
   }
 
-  pub fn remove(&mut self, i: u16) {
-    self.clear_wide(i);
-    self.cells.remove(usize::from(i));
+  pub fn remove(&mut self, col: u16) {
+    let i = usize::from(col);
+    if i >= self.cells.len() {
+      return;
+    }
+    self.clear_wide(col, self.cells[i].style);
+    self.cells.remove(i);
     self.wrapped = false;
   }
 
-  pub fn erase(&mut self, i: u16, attrs: super::attrs::Attrs) {
-    let wide = self.cells[usize::from(i)].is_wide();
-    self.clear_wide(i);
-    self.cells[usize::from(i)].clear(attrs);
-    if i == self.cols() - if wide { 2 } else { 1 } {
+  pub fn erase(&mut self, col: u16, style: StyleId) {
+    let i = usize::from(col);
+    if i >= self.cells.len() {
+      return;
+    }
+    let wide = self.cells[i].is_wide();
+    self.clear_wide(col, style);
+    self.cells[i] = Cell::blank(style);
+    if usize::from(col) + if wide { 2 } else { 1 } == self.cells.len() {
       self.wrapped = false;
     }
   }
 
-  pub fn truncate(&mut self, len: u16) {
-    self.cells.truncate(usize::from(len));
-    self.wrapped = false;
-    let last_cell = &mut self.cells[usize::from(len) - 1];
-    if last_cell.is_wide() {
-      last_cell.clear(*last_cell.attrs());
+  /// ICH within `col..=right`: `count` blanks enter at `col` and as many
+  /// cells leave at `right`.
+  pub fn insert_blanks(
+    &mut self,
+    col: u16,
+    count: u16,
+    right: u16,
+    style: StyleId,
+  ) {
+    let (col, right) = (usize::from(col), usize::from(right));
+    if col > right || right >= self.cells.len() {
+      return;
     }
+    let count = usize::from(count).min(right + 1 - col);
+    if count == 0 {
+      return;
+    }
+    // A wide cell split by the insertion point loses both halves.
+    if self.cells[col].is_continuation() {
+      self.clear_wide(col as u16, style);
+      self.cells[col] = Cell::blank(style);
+    }
+    self.cells[col..=right].rotate_right(count);
+    for cell in &mut self.cells[col..col + count] {
+      *cell = Cell::blank(style);
+    }
+    // A wide cell now cut at the right end loses its half too.
+    if self.cells[right].is_wide() {
+      self.cells[right] = Cell::blank(style);
+    }
+    self.wrapped = false;
   }
 
-  pub fn resize(&mut self, len: u16, cell: super::cell::Cell) {
-    self.cells.resize(usize::from(len), cell);
+  /// DCH within `col..=right`: `count` cells leave at `col` and as many
+  /// blanks enter at `right`.
+  pub fn delete_cells(
+    &mut self,
+    col: u16,
+    count: u16,
+    right: u16,
+    style: StyleId,
+  ) {
+    let (col, right) = (usize::from(col), usize::from(right));
+    if col > right || right >= self.cells.len() {
+      return;
+    }
+    let count = usize::from(count).min(right + 1 - col);
+    if count == 0 {
+      return;
+    }
+    // Wide cells cut at either end of the deleted range lose their other
+    // half.
+    self.clear_wide(col as u16, style);
+    self.clear_wide((col + count - 1) as u16, style);
+    self.cells[col..=right].rotate_left(count);
+    for cell in &mut self.cells[right + 1 - count..=right] {
+      *cell = Cell::blank(style);
+    }
     self.wrapped = false;
   }
 
@@ -98,188 +157,72 @@ impl Row {
     self.wrapped
   }
 
-  pub fn clear_wide(&mut self, col: u16) {
-    let cell = &self.cells[usize::from(col)];
+  /// Blanks the other half of the wide cell at `col`, if it is one half.
+  pub fn clear_wide(&mut self, col: u16, style: StyleId) {
+    let i = usize::from(col);
+    let Some(cell) = self.cells.get(i) else {
+      return;
+    };
     let other = if cell.is_wide() {
-      self.cells.get_mut(usize::from(col + 1))
-    } else if self.is_wide_continuation(col) {
-      self.cells.get_mut(usize::from(col - 1))
+      i + 1
+    } else if cell.is_continuation() && i > 0 {
+      i - 1
     } else {
       return;
     };
-    if let Some(other) = other {
-      other.clear(*other.attrs());
+    if let Some(other) = self.cells.get_mut(other) {
+      *other = Cell::blank(if style == StyleId::DEFAULT {
+        other.style
+      } else {
+        style
+      });
     }
   }
 
-  pub fn take_cells(&self, vec: &mut Vec<Cell>) {
-    vec.extend(self.cells.iter().take(self.size.into()).cloned());
+  /// Cells up to the last one that shows something: text, or a blank
+  /// with a visible style. Blanks past it are the row's padding.
+  pub fn used_len(&self, visible: impl Fn(StyleId) -> bool) -> u16 {
+    let mut len = self.cells.len();
+    while len > 0 {
+      let cell = self.cells[len - 1];
+      if cell.has_contents() || visible(cell.style) {
+        break;
+      }
+      len -= 1;
+    }
+    len as u16
   }
 
-  pub fn write_contents(
-    &self,
-    contents: &mut String,
-    start: u16,
-    width: u16,
-    wrapping: bool,
-  ) {
-    let mut prev_was_wide = false;
+  /// A row of `cols` blanks whose cells are the given ones, left-aligned.
+  /// A wide cell whose right half falls off the end stays: on a screen
+  /// too narrow for it nothing else can be done, and it must survive the
+  /// next reflow.
+  pub fn from_cells(mut cells: Vec<Cell>, cols: u16) -> Self {
+    cells.resize(usize::from(cols), Cell::EMPTY);
+    Row {
+      cells,
+      wrapped: false,
+    }
+  }
 
-    let mut prev_col = start;
-    for (col, cell) in self
-      .cells()
-      .enumerate()
-      .skip(usize::from(start))
-      .take(usize::from(width))
-    {
-      if prev_was_wide {
-        prev_was_wide = false;
+  /// Appends the text of columns `cols` to `out`: blanks as spaces, the
+  /// right halves of wide cells and wrap fillers skipped.
+  pub fn push_text(
+    &self,
+    cols: std::ops::Range<u16>,
+    graphemes: &GraphemeTable,
+    out: &mut String,
+  ) {
+    let mut buf = [0u8; 4];
+    for col in cols {
+      let Some(cell) = self.get(col) else {
+        break;
+      };
+      if cell.is_continuation() || cell.text.is_filler() {
         continue;
       }
-      prev_was_wide = cell.is_wide();
-
-      // we limit the number of cols to a u16 (see Size)
-      let col: u16 = col.try_into().unwrap();
-      if cell.has_contents() {
-        for _ in 0..(col - prev_col) {
-          contents.push(' ');
-        }
-        prev_col += col - prev_col;
-
-        contents.push_str(cell.contents());
-        prev_col += if cell.is_wide() { 2 } else { 1 };
-      }
+      let text = cell.text.as_str(&mut buf, graphemes);
+      out.push_str(if text.is_empty() { " " } else { text });
     }
-    if prev_col == start && wrapping {
-      contents.push('\n');
-    }
-  }
-
-  pub(crate) fn is_wide_continuation(&self, col: u16) -> bool {
-    if col == 0 {
-      return false;
-    }
-
-    self
-      .cells
-      .get(Into::<usize>::into(col) - 1)
-      .is_some_and(super::cell::Cell::is_wide)
-  }
-}
-
-impl Row {
-  pub fn snapshot(
-    &self,
-    table: &mut super::snapshot::AttrsTable,
-  ) -> crate::upgrade::snapshot::Row {
-    let mut text = String::with_capacity(self.cells.len());
-    let mut cells: Vec<(u32, u16)> = Vec::new();
-    let mut attrs: Vec<(usize, u16)> = Vec::new();
-    for cell in &self.cells {
-      text.push_str(cell.contents());
-      push_run(&mut cells, cell.contents().chars().count() as u32);
-      push_run(&mut attrs, table.index(cell.attrs()));
-    }
-    crate::upgrade::snapshot::Row {
-      text,
-      cells,
-      attrs,
-      wrapped: self.wrapped,
-      size: self.size,
-    }
-  }
-
-  pub fn from_snapshot(
-    row: &crate::upgrade::snapshot::Row,
-    table: &[super::attrs::Attrs],
-  ) -> anyhow::Result<Self> {
-    let mut cells = Vec::new();
-    let mut rest = row.text.as_str();
-    for &(chars, len) in &row.cells {
-      for _ in 0..len {
-        let (text, tail) =
-          split_chars(rest, chars as usize).ok_or_else(|| {
-            anyhow::anyhow!("row text is shorter than its cells")
-          })?;
-        rest = tail;
-        let mut cell = super::cell::Cell::default();
-        cell.set_str(text);
-        cells.push(cell);
-      }
-    }
-    if !rest.is_empty() {
-      anyhow::bail!("row text is longer than its cells");
-    }
-    let mut runs = row
-      .attrs
-      .iter()
-      .flat_map(|(index, len)| std::iter::repeat_n(*index, usize::from(*len)));
-    for cell in &mut cells {
-      let index = runs
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("row attrs cover fewer cells"))?;
-      let attrs = table
-        .get(index)
-        .ok_or_else(|| anyhow::anyhow!("row attrs index out of range"))?;
-      cell.set_attrs(*attrs);
-    }
-    if runs.next().is_some() {
-      anyhow::bail!("row attrs cover more cells");
-    }
-    if cells.is_empty() {
-      anyhow::bail!("row has no cells");
-    }
-    Ok(Row {
-      cells,
-      size: row.size,
-      wrapped: row.wrapped,
-    })
-  }
-}
-
-fn push_run<T: PartialEq>(runs: &mut Vec<(T, u16)>, value: T) {
-  match runs.last_mut() {
-    Some((last, len)) if *last == value => *len += 1,
-    _ => runs.push((value, 1)),
-  }
-}
-
-/// The first `n` chars of `s` and the rest, or None if `s` is shorter.
-fn split_chars(s: &str, n: usize) -> Option<(&str, &str)> {
-  let mut chars = s.chars();
-  let mut end = 0;
-  for _ in 0..n {
-    end += chars.next()?.len_utf8();
-  }
-  Some(s.split_at(end))
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::upgrade::snapshot as snap;
-
-  fn row(text: &str, cells: Vec<(u32, u16)>) -> snap::Row {
-    snap::Row {
-      text: text.to_string(),
-      cells,
-      attrs: vec![(0, 3)],
-      wrapped: false,
-      size: 3,
-    }
-  }
-
-  #[test]
-  fn text_and_cells_must_agree() {
-    let table = [super::super::attrs::Attrs::default()];
-    assert!(Row::from_snapshot(&row("abc", vec![(1, 3)]), &table).is_ok());
-    assert!(Row::from_snapshot(&row("ab", vec![(1, 3)]), &table).is_err());
-    assert!(Row::from_snapshot(&row("abcd", vec![(1, 3)]), &table).is_err());
-    // Attrs must cover exactly the cells.
-    let short = snap::Row {
-      attrs: vec![(0, 2)],
-      ..row("abc", vec![(1, 3)])
-    };
-    assert!(Row::from_snapshot(&short, &table).is_err());
   }
 }

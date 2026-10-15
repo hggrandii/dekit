@@ -3,7 +3,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::action::Action;
 use crate::console::keymap::{Keymap, KeymapGroup};
 use crate::console::theme::Theme;
-use crate::term::{Grid, attrs::Attrs, grid::Rect};
+use crate::term::{Grid, grid::Rect, style::Style};
 
 pub fn render_zoom_tip(
   area: Rect,
@@ -20,14 +20,14 @@ pub fn render_zoom_tip(
     .find_map(|action| keymap.key(KeymapGroup::Term, action));
 
   let bg = theme.block.selected_bg.into();
-  let text = Attrs::default().bg(bg).fg(theme.block.text.into());
+  let text = Style::default().bg(bg).fg(theme.block.text.into());
   grid.fill_area(area, ' ', text);
   let mut line = area;
   match key {
     Some(key) => {
       let prompt = " To exit zoom mode press ";
       grid.draw_text(line.take_left(prompt.width() as u16), prompt, text);
-      let key_attrs = Attrs::default().bg(bg).fg(theme.block.key.into());
+      let key_attrs = Style::default().bg(bg).fg(theme.block.key.into());
       grid.draw_text(line, &key.spec().to_string(), key_attrs);
     }
     None => {

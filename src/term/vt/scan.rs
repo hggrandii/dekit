@@ -1,7 +1,15 @@
 use super::params::Params;
 
-/// A body of an unterminated OSC/DCS longer than this aborts the sequence.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+/// A body longer than this aborts the sequence. Images ride in DCS
+/// (sixel) and APC (kitty graphics) bodies, so those may be large; an
+/// OSC carries at most a clipboard.
+const MAX_OSC_BYTES: usize = 1024 * 1024;
+const MAX_DCS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_APC_BYTES: usize = 1024 * 1024;
+const MAX_SKIP_BYTES: usize = 64 * 1024;
+/// A terminal's replies are short; on input a longer body is a chord
+/// misread as a reply, and must not swallow what the user types.
+const MAX_INPUT_REPLY_BYTES: usize = 8 * 1024;
 
 /// One scanned item. Borrowed slices point into the fed chunk or the
 /// scanner's internal buffers.
@@ -19,7 +27,10 @@ pub enum Seq<'a> {
   },
   Csi(&'a Params),
   Osc(&'a [u8]),
+  /// A DCS body: parameters, intermediates and final byte, then data.
   Dcs(&'a [u8]),
+  /// An APC body (`ESC _ ... ST`): kitty graphics commands and replies.
+  Apc(&'a [u8]),
   /// Input mode: ESC followed by a plain character (Alt chord).
   EscChar(char),
   /// Input mode: `ESC O final`.
@@ -50,10 +61,16 @@ enum State {
   OscEsc,
   Dcs,
   DcsEsc,
+  Apc,
+  ApcEsc,
   Skip,
   SkipEsc,
   Ss3,
   X10Mouse,
+  /// Input mode: `ESC _` seen; an APC if `G` follows, else an Alt chord.
+  MaybeApc,
+  /// Input mode: `ESC P` seen; a DCS reply if its first byte fits.
+  MaybeDcs,
 }
 
 /// Incremental scanner for terminal byte streams. State carries across
@@ -148,6 +165,17 @@ impl Scanner {
         out.extend_from_slice(&self.body);
         out.push(0x1B);
       }
+      State::Apc => {
+        out.extend_from_slice(b"\x1b_");
+        out.extend_from_slice(&self.body);
+      }
+      State::ApcEsc => {
+        out.extend_from_slice(b"\x1b_");
+        out.extend_from_slice(&self.body);
+        out.push(0x1B);
+      }
+      State::MaybeApc => out.extend_from_slice(b"\x1b_"),
+      State::MaybeDcs => out.extend_from_slice(b"\x1bP"),
       State::Skip => {
         out.extend_from_slice(b"\x1bX");
         out.extend_from_slice(&self.body);
@@ -169,16 +197,29 @@ impl Scanner {
   /// Input mode: resolve a trailing lone ESC into an Esc key press. Called
   /// when a read chunk ends and no more input is immediately available.
   pub fn flush<F: for<'a> FnMut(Seq<'a>)>(&mut self, mut f: F) {
-    if self.state == State::Esc {
-      self.state = State::Ground;
-      f(Seq::Ctl(0x1B));
+    match self.state {
+      State::Esc => {
+        self.state = State::Ground;
+        f(Seq::Ctl(0x1B));
+      }
+      // `ESC _` and `ESC P` that nothing followed: Alt chords.
+      State::MaybeApc => {
+        self.state = State::Ground;
+        f(Seq::EscChar('_'));
+      }
+      State::MaybeDcs => {
+        self.state = State::Ground;
+        f(Seq::EscChar('P'));
+      }
+      _ => (),
     }
   }
 
-  /// True while a lone ESC is waiting to see whether more bytes follow.
+  /// True while a lone ESC (or an `ESC _` / `ESC P` that may yet become a
+  /// reply) is waiting to see whether more bytes follow.
   #[cfg_attr(windows, allow(dead_code))]
   pub fn esc_pending(&self) -> bool {
-    self.state == State::Esc
+    matches!(self.state, State::Esc | State::MaybeApc | State::MaybeDcs)
   }
 
   pub fn feed<F: for<'a> FnMut(Seq<'a>)>(&mut self, input: &[u8], mut f: F) {
@@ -326,7 +367,11 @@ impl Scanner {
                   self.body.clear();
                   self.state = State::Dcs;
                 }
-                b'X' | b'^' | b'_' => {
+                b'_' => {
+                  self.body.clear();
+                  self.state = State::Apc;
+                }
+                b'X' | b'^' => {
                   self.body.clear();
                   self.state = State::Skip;
                 }
@@ -345,7 +390,11 @@ impl Scanner {
                 }
               },
               ScanMode::Input => {
-                if b < 0x80 {
+                if b == b'_' {
+                  self.state = State::MaybeApc;
+                } else if b == b'P' {
+                  self.state = State::MaybeDcs;
+                } else if b < 0x80 {
                   self.state = State::Ground;
                   f(Seq::EscChar(b as char));
                 } else {
@@ -415,7 +464,7 @@ impl Scanner {
           } else if b == 0x1B {
             self.state = State::OscEsc;
           } else {
-            self.push_body(b);
+            self.push_body(b, MAX_OSC_BYTES);
           }
           i += 1;
         }
@@ -427,14 +476,14 @@ impl Scanner {
           } else {
             // The ESC was part of the body; reprocess this byte.
             self.state = State::Osc;
-            self.push_body(0x1B);
+            self.push_body(0x1B, MAX_OSC_BYTES);
           }
         }
         State::Dcs => {
           if b == 0x1B {
             self.state = State::DcsEsc;
           } else {
-            self.push_body(b);
+            self.push_body(b, self.body_cap(MAX_DCS_BYTES));
           }
           i += 1;
         }
@@ -445,14 +494,34 @@ impl Scanner {
             i += 1;
           } else {
             self.state = State::Dcs;
-            self.push_body(0x1B);
+            let cap = self.body_cap(MAX_DCS_BYTES);
+            self.push_body(0x1B, cap);
+          }
+        }
+        State::Apc => {
+          if b == 0x1B {
+            self.state = State::ApcEsc;
+          } else {
+            self.push_body(b, self.body_cap(MAX_APC_BYTES));
+          }
+          i += 1;
+        }
+        State::ApcEsc => {
+          if b == b'\\' {
+            self.state = State::Ground;
+            f(Seq::Apc(&self.body));
+            i += 1;
+          } else {
+            self.state = State::Apc;
+            let cap = self.body_cap(MAX_APC_BYTES);
+            self.push_body(0x1B, cap);
           }
         }
         State::Skip => {
           if b == 0x1B {
             self.state = State::SkipEsc;
           } else {
-            self.push_body(b);
+            self.push_body(b, MAX_SKIP_BYTES);
           }
           i += 1;
         }
@@ -463,7 +532,30 @@ impl Scanner {
             i += 1;
           } else {
             self.state = State::Skip;
-            self.push_body(0x1B);
+            self.push_body(0x1B, MAX_SKIP_BYTES);
+          }
+        }
+        State::MaybeApc => {
+          if b == b'G' {
+            self.body.clear();
+            self.body.push(b);
+            self.state = State::Apc;
+            i += 1;
+          } else {
+            // An Alt chord after all; the byte is reprocessed.
+            self.state = State::Ground;
+            f(Seq::EscChar('_'));
+          }
+        }
+        State::MaybeDcs => {
+          // The only DCS a terminal sends unasked-for here is XTVERSION's
+          // `DCS > | name ST`.
+          if b == b'>' {
+            self.body.clear();
+            self.state = State::Dcs;
+          } else {
+            self.state = State::Ground;
+            f(Seq::EscChar('P'));
           }
         }
         State::Ss3 => {
@@ -491,8 +583,17 @@ impl Scanner {
     }
   }
 
-  fn push_body(&mut self, b: u8) {
-    if self.body.len() >= MAX_BODY_BYTES {
+  /// How long a DCS or APC body may grow: `output` for programs, a
+  /// reply's worth on input.
+  fn body_cap(&self, output: usize) -> usize {
+    match self.mode {
+      ScanMode::Output => output,
+      ScanMode::Input => MAX_INPUT_REPLY_BYTES,
+    }
+  }
+
+  fn push_body(&mut self, b: u8, max: usize) {
+    if self.body.len() >= max {
       self.body.clear();
       self.state = State::Ground;
     } else {
@@ -513,6 +614,7 @@ mod tests {
     Csi(String),
     Osc(Vec<u8>),
     Dcs(Vec<u8>),
+    Apc(Vec<u8>),
     EscChar(char),
     Ss3(u8),
     X10(u8, u8, u8),
@@ -530,9 +632,8 @@ mod tests {
       if i > 0 {
         s.push(if p.is_sub(i) { ':' } else { ';' });
       }
-      match p.get_opt(i) {
-        Some(v) => s.push_str(&v.to_string()),
-        None => (),
+      if let Some(v) = p.get_opt(i) {
+        s.push_str(&v.to_string());
       }
     }
     if p.inter != 0 {
@@ -553,6 +654,7 @@ mod tests {
           Seq::Csi(p) => Item::Csi(csi_repr(p)),
           Seq::Osc(d) => Item::Osc(d.to_vec()),
           Seq::Dcs(d) => Item::Dcs(d.to_vec()),
+          Seq::Apc(d) => Item::Apc(d.to_vec()),
           Seq::EscChar(c) => Item::EscChar(c),
           Seq::Ss3(b) => Item::Ss3(b),
           Seq::X10Mouse(a, b, c) => Item::X10(a, b, c),
@@ -692,10 +794,14 @@ mod tests {
       scan_output(&[b"\x1bPdata\x1b\\x"]),
       vec![Item::Dcs(b"data".to_vec()), Item::Text("x".into())]
     );
-    // SOS/PM/APC bodies are discarded.
+    // SOS/PM bodies are discarded; APC is delivered.
     assert_eq!(
-      scan_output(&[b"\x1b_hidden\x1b\\x"]),
+      scan_output(&[b"\x1b^hidden\x1b\\x"]),
       vec![Item::Text("x".into())]
+    );
+    assert_eq!(
+      scan_output(&[b"\x1b_Ga=q,i=1;AAAA\x1b\\x"]),
+      vec![Item::Apc(b"Ga=q,i=1;AAAA".to_vec()), Item::Text("x".into())]
     );
   }
 
@@ -704,7 +810,7 @@ mod tests {
     let mut scanner = Scanner::new(ScanMode::Output);
     let mut items = Vec::new();
     scanner.feed(b"\x1b]0;", |_| panic!("no items yet"));
-    let flood = vec![b'x'; MAX_BODY_BYTES + 10];
+    let flood = vec![b'x'; MAX_OSC_BYTES + 10];
     scanner.feed(&flood, |seq| items.push(matches!(seq, Seq::Text(_))));
     // After the cap the scanner returns to ground; the tail renders as text.
     assert!(!items.is_empty());
@@ -715,6 +821,37 @@ mod tests {
   fn input_mode() {
     assert_eq!(scan_input(&[b"\x1bOA"]), vec![Item::Ss3(b'A')]);
     assert_eq!(scan_input(&[b"\x1bx"]), vec![Item::EscChar('x')]);
+    // ESC _ is an Alt chord unless a graphics reply follows.
+    assert_eq!(
+      scan_input(&[b"\x1b_x"]),
+      vec![Item::EscChar('_'), Item::Text("x".into())]
+    );
+    assert_eq!(
+      scan_input(&[b"\x1b_Gi=31;OK\x1b\\"]),
+      vec![Item::Apc(b"Gi=31;OK".to_vec())]
+    );
+    // ESC P likewise: only XTVERSION's reply (`DCS > | ...`) is a DCS;
+    // Alt+P followed by anything else is a chord.
+    assert_eq!(
+      scan_input(&[b"\x1bPx"]),
+      vec![Item::EscChar('P'), Item::Text("x".into())]
+    );
+    assert_eq!(
+      scan_input(&[b"\x1bP1"]),
+      vec![Item::EscChar('P'), Item::Text("1".into())]
+    );
+    assert_eq!(
+      scan_input(&[b"\x1bP>|kitty 0.40\x1b\\"]),
+      vec![Item::Dcs(b">|kitty 0.40".to_vec())]
+    );
+    // A misread reply cannot swallow input for long.
+    let mut scanner = Scanner::new(ScanMode::Input);
+    let mut items = Vec::new();
+    scanner.feed(b"\x1b_G", |_| ());
+    scanner.feed(&vec![b'x'; MAX_INPUT_REPLY_BYTES + 10], |seq| {
+      items.push(matches!(seq, Seq::Text(_)));
+    });
+    assert!(!items.is_empty() && items.iter().all(|t| *t));
     assert_eq!(scan_input(&[b"\x1b\r"]), vec![Item::EscChar('\r')]);
     assert_eq!(scan_input(&["\x1bé".as_bytes()]), vec![Item::EscChar('é')]);
     assert_eq!(scan_input(&[b"\x1b\x1b"]), vec![Item::Ctl(0x1B)]);
@@ -793,6 +930,7 @@ mod tests {
       b"\x1b]0;title\x1b\\",
       b"\x1bPdata\x1bx\x1b\\",
       b"\x1b_hid\x1bden\x1b\\x",
+      b"\x1b^hid\x1bden\x1b\\x",
       "a测b\x1b[1m".as_bytes(),
     ] {
       resumes_anywhere(ScanMode::Output, input);
@@ -802,6 +940,10 @@ mod tests {
       b"\x1b[M !\"",
       "\x1bé".as_bytes(),
       b"\x1b[<0;5;10M",
+      b"\x1b_Gi=1;OK\x1b\\",
+      b"\x1b_x",
+      b"\x1bP>|t 1\x1b\\",
+      b"\x1bPq",
     ] {
       resumes_anywhere(ScanMode::Input, input);
     }
@@ -815,5 +957,19 @@ mod tests {
       scanner.feed(b"12345\n", |_| ());
     }
     assert!(scanner.pending().len() < 16, "{:?}", scanner.pending());
+  }
+
+  #[test]
+  fn ambiguous_alt_chords_resolve_on_flush() {
+    for (bytes, c) in [(&b"\x1b_"[..], '_'), (&b"\x1bP"[..], 'P')] {
+      let mut scanner = Scanner::new(ScanMode::Input);
+      let mut got = Vec::new();
+      scanner.feed(bytes, |seq| got.push(format!("{seq:?}")));
+      assert!(got.is_empty(), "{c}: nothing until it is resolved");
+      assert!(scanner.esc_pending());
+      scanner.flush(|seq| got.push(format!("{seq:?}")));
+      assert_eq!(got, vec![format!("EscChar({c:?})")]);
+      assert!(!scanner.esc_pending());
+    }
   }
 }

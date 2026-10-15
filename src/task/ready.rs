@@ -7,7 +7,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::process::process_spec::ProcessSpec;
-use crate::term::vt::scan::{Scanner, Seq};
 
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -125,77 +124,9 @@ pub fn parse_http_url(url: &str) -> Result<HttpUrl, String> {
   })
 }
 
-/// The visible text of the current output line: escape sequences are
-/// dropped (by the terminal's own scanner), so colored output matches
-/// like plain text.
-#[derive(Default)]
-pub struct VisibleLine {
-  text: Vec<u8>,
-  /// `text` up to here was searched without a match.
-  searched: usize,
-  scanner: Scanner,
-}
-
-const MAX_LINE: usize = 4096;
-
-impl VisibleLine {
-  /// The visible text and the unfinished escape sequence after it: fed
-  /// to a new line, it reads back to this one. Older binaries saved the
-  /// raw output since the last `\n` instead, which feeds the same way.
-  #[cfg(unix)]
-  pub fn saved(&self) -> Vec<u8> {
-    let mut saved = self.text.clone();
-    saved.extend(self.scanner.pending());
-    saved
-  }
-
-  /// Feeds output; true once a line, or the line so far, contains
-  /// `needle`. `\n` and `\r` end a line.
-  pub fn feed(&mut self, needle: &[u8], bytes: &[u8]) -> bool {
-    let VisibleLine {
-      text,
-      searched,
-      scanner,
-    } = self;
-    let mut found = false;
-    scanner.feed(bytes, |seq| match seq {
-      _ if found => (),
-      Seq::Text(chunk) => {
-        let room = MAX_LINE.saturating_sub(text.len());
-        text.extend_from_slice(&chunk.as_bytes()[..chunk.len().min(room)]);
-      }
-      Seq::Ctl(b'\t') => {
-        if text.len() < MAX_LINE {
-          text.push(b'\t');
-        }
-      }
-      Seq::Ctl(b'\n' | b'\r') => {
-        found = search(text, searched, needle);
-        text.clear();
-        *searched = 0;
-      }
-      Seq::Ctl(_)
-      | Seq::Esc { .. }
-      | Seq::Csi(_)
-      | Seq::Osc(_)
-      | Seq::Dcs(_)
-      | Seq::EscChar(_)
-      | Seq::Ss3(_)
-      | Seq::X10Mouse(..) => (),
-    });
-    found || search(text, searched, needle)
-  }
-}
-
-/// Searches only what came since the last search, plus enough before it
-/// for a match that spans both.
-fn search(text: &[u8], searched: &mut usize, needle: &[u8]) -> bool {
-  let from = searched.saturating_sub(needle.len().saturating_sub(1));
-  *searched = text.len();
-  !needle.is_empty()
-    && text[from..]
-      .windows(needle.len())
-      .any(|window| window == needle)
+/// Whether a finished line, or the line so far, says the task is ready.
+pub fn line_ready(needle: &str, line: &str) -> bool {
+  !needle.is_empty() && line.contains(needle)
 }
 
 /// Tries `probe` until it succeeds: the first attempt at once, then
@@ -393,49 +324,12 @@ pub fn command(
 mod tests {
   use super::*;
 
-  fn feed(chunks: &[&[u8]], needle: &str) -> bool {
-    let mut line = VisibleLine::default();
-    chunks
-      .iter()
-      .any(|chunk| line.feed(needle.as_bytes(), chunk))
-  }
-
   #[test]
-  fn log_matches_visible_text() {
-    assert!(feed(
-      &[b"\x1b[32mlistening\x1b[0m on \x1b[1m:3000\x1b[0m\n"],
-      "listening on :3000"
-    ));
-    // An OSC title and a hyperlink around the text.
-    assert!(feed(
-      &[b"\x1b]0;title\x07\x1b]8;;http://x\x1b\\ready\x1b]8;;\x1b\\ now\n"],
-      "ready now"
-    ));
-    // Split across reads, in the middle of an escape sequence.
-    assert!(feed(&[b"serv\x1b[3", b"1mer up\n"], "server up"));
-    // Charset designation (ESC ( B) is dropped too.
-    assert!(feed(&[b"\x1b(Bok\n"], "ok"));
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn log_line_survives_a_restore() {
-    // Cut inside an escape sequence, saved, and restored.
-    let mut line = VisibleLine::default();
-    assert!(!line.feed(b"server up", b"serv\x1b[3"));
-    let saved = line.saved();
-    let mut line = VisibleLine::default();
-    assert!(!line.feed(b"server up", &saved));
-    assert!(line.feed(b"server up", b"1mer up\n"));
-  }
-
-  #[test]
-  fn log_lines_end_at_cr_and_lf() {
-    assert!(!feed(&[b"read", b"\nready\x1b[0K"], "readready"));
-    assert!(feed(&[b"50%\rdone\r\n"], "done"));
-    assert!(!feed(&[b"do\rne\n"], "done"));
-    // A prompt without a newline.
-    assert!(feed(&[b"> "], ">"));
+  fn log_lines_match_plain_text() {
+    assert!(line_ready("listening on :3000", "listening on :3000"));
+    assert!(line_ready("ready", "server ready now"));
+    assert!(!line_ready("", "anything"));
+    assert!(!line_ready("ready", "read"));
   }
 
   #[test]

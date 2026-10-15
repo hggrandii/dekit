@@ -73,12 +73,24 @@ static SPECIAL_CHARS: phf::Map<char, &str> = phf::phf_map! {
   '-' => "Minus",
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct Key {
   pub code: KeyCode,
   pub mods: KeyMods,
   pub kind: KeyEventKind,
   pub state: KeyEventState,
+  /// When `code` is the character Shift made of a key (kitty "report
+  /// alternate keys"), the key without Shift: `a` for `A`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub unshifted: Option<char>,
+  /// The same key on a US layout, when the terminal said and it differs
+  /// from `code`: `a` for a Cyrillic `ф`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub base: Option<char>,
+  /// The text the key produced, when the terminal said (kitty "report
+  /// associated text") and it is not simply `code`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub text: Option<String>,
 }
 
 impl Key {
@@ -88,6 +100,9 @@ impl Key {
       mods,
       kind: KeyEventKind::Press,
       state: KeyEventState::empty(),
+      unshifted: None,
+      base: None,
+      text: None,
     }
   }
 
@@ -101,15 +116,24 @@ impl Key {
       mods,
       kind,
       state: KeyEventState::empty(),
+      unshifted: None,
+      base: None,
+      text: None,
     }
+  }
+
+  /// The same key as a plain press without layout details: what keymaps
+  /// match on.
+  pub fn plain(&self) -> Key {
+    Key::new(self.code, self.mods)
   }
 
   pub fn parse(text: &str) -> anyhow::Result<Key> {
     KeySpec::parse(text).map(Into::into)
   }
 
-  pub fn spec(self) -> KeySpec {
-    KeySpec(self)
+  pub fn spec(&self) -> KeySpec {
+    KeySpec(self.clone())
   }
 
   pub fn code(&self) -> KeyCode {
@@ -127,7 +151,7 @@ impl From<KeyCode> for Key {
   }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct KeySpec(pub Key);
 
 impl KeySpec {
@@ -281,7 +305,7 @@ pub mod key_spec {
     key: &Key,
     serializer: S,
   ) -> Result<S::Ok, S::Error> {
-    KeySpec::from(*key).serialize(serializer)
+    KeySpec::from(key.clone()).serialize(serializer)
   }
 
   pub fn deserialize<'de, D: serde::Deserializer<'de>>(
@@ -608,10 +632,13 @@ mod tests {
       Key::new(KeyCode::F(13), KeyMods::CONTROL),
       Key::new(KeyCode::Char('我'), KeyMods::NONE),
       Key {
-        code: KeyCode::Char('a'),
-        mods: KeyMods::SHIFT,
+        code: KeyCode::Char('A'),
+        mods: KeyMods::NONE,
         kind: KeyEventKind::Repeat,
         state: KeyEventState::CAPS_LOCK | KeyEventState::NUM_LOCK,
+        unshifted: Some('a'),
+        base: None,
+        text: Some("A".to_string()),
       },
     ];
     for key in keys {

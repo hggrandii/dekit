@@ -1,18 +1,35 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::term::{Geometry, Size, TermEvent, key::Key, mouse::MouseEvent};
 
 /// Bumped only if the framing or envelope breaks; additive changes
 /// (new methods, events, fields, error codes) keep it at 1.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Feature `atch2`: attach sessions in their second dialect. A server
+/// that says it takes the named input events (`key`, `mouse`, `paste`,
+/// `focus`, `resize`) in place of `input`, and the cell size on `attach`
+/// and `resize`. PROTOCOL.md "Attach sessions".
+pub const FEATURE_ATCH2: &str = "atch2";
+
+/// What this binary says of itself as a client; `server_hello` adds what
+/// it does as a server.
 pub fn local_hello() -> Hello {
   Hello {
     protocol: PROTOCOL_VERSION,
     version: env!("CARGO_PKG_VERSION").to_string(),
     app: format!("dekit {}", env!("CARGO_PKG_VERSION")),
     features: Vec::new(),
+  }
+}
+
+impl Hello {
+  /// Whether the peer advertised `feature`.
+  pub fn has(&self, feature: &str) -> bool {
+    self.features.iter().any(|f| f == feature)
   }
 }
 
@@ -173,8 +190,18 @@ pub mod codes {
   pub const BUSY: &str = "busy";
 }
 
-/// Client-to-server event carrying a terminal input event.
+/// Client-to-server event carrying a terminal input event in the first
+/// dialect: one event, the kind of input inside (`LegacyInput`). A
+/// server takes it from any client; a client sends it to a server
+/// without `atch2`.
 pub const EVENT_INPUT: &str = "input";
+/// Client-to-server input events of `atch2`: one name per kind, each
+/// an object that grows by fields.
+pub const EVENT_KEY: &str = "key";
+pub const EVENT_MOUSE: &str = "mouse";
+pub const EVENT_PASTE: &str = "paste";
+pub const EVENT_FOCUS: &str = "focus";
+pub const EVENT_RESIZE: &str = "resize";
 /// Client-to-server event carrying a `ScreenCommand`.
 pub const EVENT_SCREEN: &str = "screen";
 /// Server-to-client event in an attach session: text copied from the
@@ -187,6 +214,185 @@ pub struct CopyEvent {
   pub text: String,
 }
 
+/// Geometry on the wire: columns and rows, and the size of a cell in
+/// pixels when the terminal said. Flattened into `attach` and the
+/// `resize` event. Zero pixels mean unknown, as in a winsize.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct GeometryParams {
+  pub width: u16,
+  pub height: u16,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cell_width: Option<u16>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cell_height: Option<u16>,
+}
+
+impl GeometryParams {
+  pub fn of(geometry: Geometry) -> Self {
+    GeometryParams {
+      width: geometry.size.width,
+      height: geometry.size.height,
+      cell_width: geometry.cell_pixels.map(|(w, _)| w),
+      cell_height: geometry.cell_pixels.map(|(_, h)| h),
+    }
+  }
+
+  pub fn geometry(&self) -> Geometry {
+    Geometry {
+      size: Size {
+        width: self.width,
+        height: self.height,
+      },
+      cell_pixels: self
+        .cell_width
+        .zip(self.cell_height)
+        .filter(|(w, h)| *w > 0 && *h > 0),
+    }
+  }
+}
+
+/// Whether `name` is an input event of either dialect.
+pub fn is_input_event(name: &str) -> bool {
+  matches!(
+    name,
+    EVENT_INPUT
+      | EVENT_KEY
+      | EVENT_MOUSE
+      | EVENT_PASTE
+      | EVENT_FOCUS
+      | EVENT_RESIZE
+  )
+}
+
+/// How a server takes terminal input (PROTOCOL.md "Attach sessions").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputDialect {
+  /// The first dialect: one `input` event with the kind of input
+  /// inside, which has no room for a cell size. For a server without
+  /// `atch2`.
+  Input,
+  /// `atch2`: one event per kind of input, each an object.
+  Named,
+}
+
+impl InputDialect {
+  /// The dialect a server takes, from its hello.
+  pub fn of(server: &Hello) -> Self {
+    if server.has(FEATURE_ATCH2) {
+      InputDialect::Named
+    } else {
+      InputDialect::Input
+    }
+  }
+
+  /// `event` as the server takes it.
+  pub fn input_event(self, event: &TermEvent) -> Event {
+    fn named<T: Serialize>(name: &str, params: T) -> Event {
+      Event {
+        name: name.to_string(),
+        params: serde_json::to_value(params).expect("input serializes"),
+      }
+    }
+    if self == InputDialect::Input {
+      return named(EVENT_INPUT, LegacyInput::of(event));
+    }
+    match event {
+      TermEvent::Key(key) => named(EVENT_KEY, key),
+      TermEvent::Mouse(mouse) => named(EVENT_MOUSE, mouse),
+      TermEvent::Paste(text) => named(
+        EVENT_PASTE,
+        PasteParams {
+          text: Cow::Borrowed(text),
+        },
+      ),
+      TermEvent::FocusGained => {
+        named(EVENT_FOCUS, FocusParams { gained: true })
+      }
+      TermEvent::FocusLost => named(EVENT_FOCUS, FocusParams { gained: false }),
+      TermEvent::Resize(geometry) => {
+        named(EVENT_RESIZE, GeometryParams::of(*geometry))
+      }
+    }
+  }
+}
+
+/// The terminal input an event of either dialect carries. The caller
+/// checked `is_input_event`; an error is a peer bug, and the event is
+/// dropped.
+pub fn input_of(event: Event) -> Result<TermEvent, serde_json::Error> {
+  let Event { name, params } = event;
+  Ok(match name.as_str() {
+    EVENT_KEY => TermEvent::Key(serde_json::from_value(params)?),
+    EVENT_MOUSE => TermEvent::Mouse(serde_json::from_value(params)?),
+    EVENT_PASTE => {
+      let PasteParams { text } = serde_json::from_value(params)?;
+      TermEvent::Paste(text.into_owned())
+    }
+    EVENT_FOCUS => {
+      let FocusParams { gained } = serde_json::from_value(params)?;
+      if gained {
+        TermEvent::FocusGained
+      } else {
+        TermEvent::FocusLost
+      }
+    }
+    EVENT_RESIZE => TermEvent::Resize(
+      serde_json::from_value::<GeometryParams>(params)?.geometry(),
+    ),
+    _ => serde_json::from_value::<LegacyInput>(params)?.into(),
+  })
+}
+
+#[derive(Deserialize, Serialize)]
+struct PasteParams<'a> {
+  text: Cow<'a, str>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct FocusParams {
+  gained: bool,
+}
+
+/// The `input` event's params: the first dialect's one enum, as it
+/// shipped. Its tuple variant is why the second dialect exists.
+#[derive(Deserialize, Serialize)]
+enum LegacyInput<'a> {
+  FocusGained,
+  FocusLost,
+  Key(Cow<'a, Key>),
+  Mouse(Cow<'a, MouseEvent>),
+  Paste(Cow<'a, str>),
+  Resize(u16, u16),
+}
+
+impl<'a> LegacyInput<'a> {
+  fn of(event: &'a TermEvent) -> LegacyInput<'a> {
+    match event {
+      TermEvent::FocusGained => LegacyInput::FocusGained,
+      TermEvent::FocusLost => LegacyInput::FocusLost,
+      TermEvent::Key(key) => LegacyInput::Key(Cow::Borrowed(key)),
+      TermEvent::Mouse(mouse) => LegacyInput::Mouse(Cow::Borrowed(mouse)),
+      TermEvent::Paste(text) => LegacyInput::Paste(Cow::Borrowed(text)),
+      TermEvent::Resize(geometry) => {
+        LegacyInput::Resize(geometry.size.width, geometry.size.height)
+      }
+    }
+  }
+}
+
+impl From<LegacyInput<'_>> for TermEvent {
+  fn from(input: LegacyInput<'_>) -> TermEvent {
+    match input {
+      LegacyInput::FocusGained => TermEvent::FocusGained,
+      LegacyInput::FocusLost => TermEvent::FocusLost,
+      LegacyInput::Key(key) => TermEvent::Key(key.into_owned()),
+      LegacyInput::Mouse(mouse) => TermEvent::Mouse(mouse.into_owned()),
+      LegacyInput::Paste(text) => TermEvent::Paste(text.into_owned()),
+      LegacyInput::Resize(width, height) => TermEvent::resize(width, height),
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -194,10 +400,34 @@ mod tests {
   use crate::term::key::{Key, KeyCode, KeyMods};
   use crate::term::mouse::{MouseButton, MouseEvent, MouseEventKind};
 
-  fn input_event(event: &TermEvent) -> CtlMsg {
-    CtlMsg::Event(Event {
-      name: EVENT_INPUT.to_string(),
-      params: serde_json::to_value(event).unwrap(),
+  fn legacy_input(event: &TermEvent) -> CtlMsg {
+    CtlMsg::Event(InputDialect::Input.input_event(event))
+  }
+
+  fn named_input(event: &TermEvent) -> CtlMsg {
+    CtlMsg::Event(InputDialect::Named.input_event(event))
+  }
+
+  fn with_cells(width: u16, height: u16, cell: (u16, u16)) -> TermEvent {
+    TermEvent::Resize(Geometry {
+      size: Size { width, height },
+      cell_pixels: Some(cell),
+    })
+  }
+
+  fn ctrl_alt_c() -> TermEvent {
+    TermEvent::Key(Key::new(
+      KeyCode::Char('c'),
+      KeyMods::CONTROL | KeyMods::ALT,
+    ))
+  }
+
+  fn left_down() -> TermEvent {
+    TermEvent::Mouse(MouseEvent {
+      kind: MouseEventKind::Down(MouseButton::Left),
+      x: 3,
+      y: 7,
+      mods: KeyMods::NONE,
     })
   }
 
@@ -231,18 +461,18 @@ mod tests {
         r#"{"type":"response","id":1,"error":{"code":"no_match","message":"no tasks match '/x'"}}"#,
       ),
       (
-        input_event(&TermEvent::Key(Key::new(
+        legacy_input(&TermEvent::Key(Key::new(
           KeyCode::Char('c'),
           KeyMods::CONTROL | KeyMods::ALT,
         ))),
         r#"{"type":"event","name":"input","params":{"Key":{"code":{"Char":"c"},"kind":"Press","mods":"CONTROL | ALT","state":""}}}"#,
       ),
       (
-        input_event(&TermEvent::Key(Key::new(KeyCode::Esc, KeyMods::NONE))),
+        legacy_input(&TermEvent::Key(Key::new(KeyCode::Esc, KeyMods::NONE))),
         r#"{"type":"event","name":"input","params":{"Key":{"code":"Esc","kind":"Press","mods":"","state":""}}}"#,
       ),
       (
-        input_event(&TermEvent::Mouse(MouseEvent {
+        legacy_input(&TermEvent::Mouse(MouseEvent {
           kind: MouseEventKind::Down(MouseButton::Left),
           x: 3,
           y: 7,
@@ -251,11 +481,11 @@ mod tests {
         r#"{"type":"event","name":"input","params":{"Mouse":{"kind":{"Down":"Left"},"mods":"","x":3,"y":7}}}"#,
       ),
       (
-        input_event(&TermEvent::Resize(120, 40)),
+        legacy_input(&TermEvent::resize(120, 40)),
         r#"{"type":"event","name":"input","params":{"Resize":[120,40]}}"#,
       ),
       (
-        input_event(&TermEvent::Paste("hi".to_string())),
+        legacy_input(&TermEvent::Paste("hi".to_string())),
         r#"{"type":"event","name":"input","params":{"Paste":"hi"}}"#,
       ),
       (
@@ -313,7 +543,116 @@ mod tests {
         }),
         r#"{"type":"event","name":"copy","params":{"text":"hi"}}"#,
       ),
+      (
+        legacy_input(&TermEvent::FocusGained),
+        r#"{"type":"event","name":"input","params":"FocusGained"}"#,
+      ),
+      // `atch2`: the server says so, and input comes as named events.
+      (
+        CtlMsg::Hello(Hello {
+          protocol: 1,
+          version: "0.11.0".to_string(),
+          app: "dekit 0.11.0".to_string(),
+          features: vec![FEATURE_ATCH2.to_string()],
+        }),
+        r#"{"type":"hello","protocol":1,"version":"0.11.0","app":"dekit 0.11.0","features":["atch2"]}"#,
+      ),
+      (
+        named_input(&ctrl_alt_c()),
+        r#"{"type":"event","name":"key","params":{"code":{"Char":"c"},"kind":"Press","mods":"CONTROL | ALT","state":""}}"#,
+      ),
+      (
+        named_input(&left_down()),
+        r#"{"type":"event","name":"mouse","params":{"kind":{"Down":"Left"},"mods":"","x":3,"y":7}}"#,
+      ),
+      (
+        named_input(&TermEvent::Paste("hi".to_string())),
+        r#"{"type":"event","name":"paste","params":{"text":"hi"}}"#,
+      ),
+      (
+        named_input(&TermEvent::FocusGained),
+        r#"{"type":"event","name":"focus","params":{"gained":true}}"#,
+      ),
+      (
+        named_input(&TermEvent::FocusLost),
+        r#"{"type":"event","name":"focus","params":{"gained":false}}"#,
+      ),
+      (
+        named_input(&TermEvent::resize(120, 40)),
+        r#"{"type":"event","name":"resize","params":{"height":40,"width":120}}"#,
+      ),
+      (
+        named_input(&with_cells(120, 40, (10, 20))),
+        r#"{"type":"event","name":"resize","params":{"cell_height":20,"cell_width":10,"height":40,"width":120}}"#,
+      ),
     ]
+  }
+
+  #[test]
+  fn input_decodes_in_either_dialect() {
+    let events = [
+      ctrl_alt_c(),
+      left_down(),
+      TermEvent::Paste("hi".to_string()),
+      TermEvent::FocusGained,
+      TermEvent::FocusLost,
+      TermEvent::resize(120, 40),
+      with_cells(120, 40, (10, 20)),
+    ];
+    for event in events {
+      for dialect in [InputDialect::Input, InputDialect::Named] {
+        let wire = dialect.input_event(&event);
+        assert!(is_input_event(&wire.name), "{}", wire.name);
+        let back = input_of(wire).unwrap();
+        // The first dialect has no room for a cell size.
+        let expected = match (&event, dialect) {
+          (TermEvent::Resize(geometry), InputDialect::Input) => {
+            TermEvent::Resize(Geometry {
+              cell_pixels: None,
+              ..*geometry
+            })
+          }
+          _ => event.clone(),
+        };
+        assert_eq!(back, expected);
+      }
+    }
+    for name in [EVENT_SCREEN, EVENT_COPY, "frobnicate"] {
+      assert!(!is_input_event(name), "{name}");
+    }
+    // A zero cell size is a terminal that does not know, as in a winsize.
+    let zero = Event {
+      name: EVENT_RESIZE.to_string(),
+      params: serde_json::json!({"width":1,"height":2,"cell_width":0,"cell_height":0}),
+    };
+    assert_eq!(input_of(zero).unwrap(), TermEvent::resize(1, 2));
+    // Fields a later dialect adds are ignored, as everywhere.
+    let more = Event {
+      name: EVENT_PASTE.to_string(),
+      params: serde_json::json!({"text":"hi","more":true}),
+    };
+    assert_eq!(input_of(more).unwrap(), TermEvent::Paste("hi".to_string()));
+    // The first dialect's shapes are fixed: more in the tuple is a bug.
+    let grown = Event {
+      name: EVENT_INPUT.to_string(),
+      params: serde_json::json!({"Resize":[1,2,3,4]}),
+    };
+    assert!(input_of(grown).is_err());
+  }
+
+  #[test]
+  fn hello_says_whether_the_peer_speaks_atch2() {
+    // A client advertises nothing; a server says `atch2`.
+    assert_eq!(InputDialect::of(&local_hello()), InputDialect::Input);
+    let server = crate::protocol::server_hello(&local_hello()).unwrap();
+    assert!(server.has(FEATURE_ATCH2));
+    assert_eq!(InputDialect::of(&server), InputDialect::Named);
+    let old: CtlMsg = serde_json::from_str(
+      r#"{"type":"hello","protocol":1,"version":"0.10.2","app":"dekit 0.10.2","features":[]}"#,
+    )
+    .unwrap();
+    let CtlMsg::Hello(old) = old else { panic!() };
+    assert_eq!(InputDialect::of(&old), InputDialect::Input);
   }
 
   #[test]

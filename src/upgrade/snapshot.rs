@@ -6,8 +6,11 @@
 //! old code cannot reproduce is in use; every type refuses unknown
 //! fields, so an older binary accepts a newer snapshot exactly when none
 //! of that state is in use. A new variant is added freely; an older
-//! binary refuses it by name. Removing, renaming, retyping, or changing
-//! the meaning of a field is a new version: `v2` next to `v1` plus a pure
+//! binary refuses it by name. An integer field widens freely: a value
+//! that does not fit an older reader's type is refused like an unknown
+//! field, so bits for state it does not know go above its range.
+//! Removing, renaming, narrowing, or changing the meaning of a field is
+//! a new version: `v2` next to `v1` plus a pure
 //! `v1 -> v2` conversion, and `decode` walks the chain to the current
 //! version. The header fields checked in `decode` never change meaning.
 
@@ -243,21 +246,138 @@ pub mod v1 {
     pub alt_grid: Grid,
     pub attrs: Attrs,
     pub saved_attrs: Attrs,
-    pub modes: u8,
+    /// The modes as bits: keypad 1, cursor keys 2, hidden cursor 4,
+    /// alternate screen 8, bracketed paste 16, and from bit 8 the rest
+    /// (`term::screen::Modes`), each set when it differs from power-on.
+    /// Bits 5..8 are zero: an older binary read a byte, so a value that
+    /// fits one is exactly a snapshot it can read.
+    pub modes: u32,
     pub mouse_mode: String,
     pub mouse_encoding: String,
     pub g0: String,
     pub g1: String,
+    #[serde(default = "ascii", skip_serializing_if = "is_ascii")]
+    pub g2: String,
+    #[serde(default = "ascii", skip_serializing_if = "is_ascii")]
+    pub g3: String,
+    /// G1 is in GL. Written as `gl == 1`.
     pub shift_out: bool,
+    /// Which of G0..G3 is in GL.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub gl: u8,
     pub insert: bool,
     pub kitty_flags: Vec<u8>,
     pub alt_kitty_flags: Vec<u8>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub title_stack: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The hyperlink new cells belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkSnapshot>,
+    /// Cell size in pixels, as a client reported it; left out at the
+    /// assumed default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_pixels: Option<(u16, u16)>,
+    /// OSC 10/11/12: the default foreground, background, and cursor
+    /// colors a program set, as RGB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_colors: Option<[Option<(u8, u8, u8)>; 3]>,
+    /// Images programs transmitted (kitty graphics, sixel).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageSnapshot>,
     /// Base64: an escape sequence the parser had started but not finished.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pending_input: String,
     /// Cell attributes referenced by index from every row.
     pub attrs_table: Vec<Attrs>,
+  }
+
+  fn ascii() -> String {
+    "ascii".to_string()
+  }
+
+  fn is_ascii(s: &String) -> bool {
+    s == "ascii"
+  }
+
+  /// For `skip_serializing_if`: a value at its default is left out.
+  fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct ImageSnapshot {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub number: u32,
+    /// 24 RGB, 32 RGBA, 100 PNG.
+    pub format: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zlib: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Base64, as transmitted.
+    pub data: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<ImageFrameSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<String>,
+    /// When interleaved, the kind of each command in arrival order.
+    /// Absent means all frames, then all controls (the legacy replay).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<ImageCommandKind>,
+  }
+
+  #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(rename_all = "snake_case")]
+  pub enum ImageCommandKind {
+    Frame,
+    Control,
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct ImageFrameSnapshot {
+    pub control: String,
+    pub format: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zlib: bool,
+    pub width: u32,
+    pub height: u32,
+    pub data: String,
+  }
+
+  #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct PlacementSnapshot {
+    /// The image's id in `Screen::images`.
+    pub image: u32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub id: u32,
+    pub row: u64,
+    pub col: u16,
+    pub cols: u16,
+    pub rows: u16,
+    pub src: (u32, u32, u32, u32),
+    pub offset: (u16, u16),
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub z: i32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub virtual_: bool,
+    /// Drawn into its cells (sixel): erased by writing over them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cells: bool,
+  }
+
+  #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+  #[serde(deny_unknown_fields)]
+  pub struct LinkSnapshot {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -269,6 +389,9 @@ pub mod v1 {
     pub saved_pos: (u16, u16),
     pub scroll_top: u16,
     pub scroll_bottom: u16,
+    /// The scrollback rows (wrapped at `width`, oldest first) followed by
+    /// the screen's rows: a reader takes the last `height` as the screen
+    /// and the rest as history.
     pub rows: Vec<Row>,
     pub used_rows: u16,
     pub origin_mode: bool,
@@ -278,6 +401,26 @@ pub mod v1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_pos: Option<(u16, u16)>,
     pub cursor_style: u8,
+    /// Tab stops, when not the default every 8 columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<u16>>,
+    /// Left and right margins, when not the full width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margins: Option<(u16, u16)>,
+    /// Rows ever scrolled off the top (the absolute row of row 0), kept
+    /// while placements are anchored to it.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub row_base: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placements: Vec<PlacementSnapshot>,
+    /// `(image id, placement id)` pairs placeholder cells refer to, by
+    /// slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeholder_slots: Vec<(u32, u32)>,
+    /// Placeholder cells of the screen rows: `(row, col, slot, image
+    /// row, image column)`. Their text is the placeholder character.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_cells: Vec<(u16, u16, u32, u16, u16)>,
   }
 
   /// One allocation per row, not per cell: scrollback is most of a
@@ -295,16 +438,27 @@ pub mod v1 {
     pub attrs: Vec<(usize, u16)>,
     pub wrapped: bool,
     pub size: u16,
+    /// Columns that are padding before a wide character that wrapped,
+    /// not text: an older binary read them as blanks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fillers: Vec<u16>,
   }
 
   #[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
+    Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
   )]
   #[serde(deny_unknown_fields)]
   pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
-    pub mode: u8,
+    /// The style bits: bold 1, italic 2, underline 4, inverse 8, dim 16,
+    /// blink 32, hidden 64, strikethrough 128, overline 256, then the
+    /// underline shape in bits 9..12. An older binary read a byte.
+    pub mode: u16,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ul: Color,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkSnapshot>,
   }
 
   #[derive(
@@ -361,6 +515,12 @@ pub mod v1 {
       width: u16,
       height: u16,
       until_exit: bool,
+      /// The client terminal's capabilities, as sent with `attach`.
+      #[serde(default, skip_serializing_if = "Option::is_none")]
+      caps: Option<crate::protocol::TermCaps>,
+      /// The size of a cell on the client's terminal, as it last said.
+      #[serde(default, skip_serializing_if = "Option::is_none")]
+      cell_pixels: Option<(u16, u16)>,
     },
   }
 }
@@ -697,6 +857,39 @@ mod tests {
     };
     assert_eq!(process.ready_log.as_deref(), Some("listening"));
     assert_eq!(process.ready_probe, None);
+  }
+
+  /// `atch2`: the carried attach connection keeps what the client said
+  /// of its terminal, and says nothing new when it said nothing.
+  #[test]
+  fn attach_connection_carries_caps_and_cell_size() {
+    let kind = super::v1::ConnectionKind::Attach {
+      task: 3,
+      width: 80,
+      height: 24,
+      until_exit: false,
+      caps: Some(crate::protocol::TermCaps::full()),
+      cell_pixels: Some((10, 20)),
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    assert!(json.contains(r#""cell_pixels":[10,20]"#), "{json}");
+    assert!(json.contains(r#""caps":{"colors":"true-color""#), "{json}");
+    assert_eq!(
+      serde_json::from_str::<super::v1::ConnectionKind>(&json).unwrap(),
+      kind
+    );
+    let plain = super::v1::ConnectionKind::Attach {
+      task: 3,
+      width: 80,
+      height: 24,
+      until_exit: false,
+      caps: None,
+      cell_pixels: None,
+    };
+    assert_eq!(
+      serde_json::to_string(&plain).unwrap(),
+      r#"{"kind":"attach","task":3,"width":80,"height":24,"until_exit":false}"#
+    );
   }
 
   #[test]

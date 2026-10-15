@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 
 use crate::command::Command;
 use crate::kernel::task::TaskId;
-use crate::protocol::ctl::{RpcError, codes};
+use crate::protocol::caps::TermCaps;
+use crate::protocol::ctl::{GeometryParams, RpcError, codes};
 use crate::target::Target;
 
 /// Mutations travel as one `command` method whose params are a `Command`
@@ -28,12 +29,19 @@ pub enum RpcRequest {
   /// Attach to one task's screen for the rest of the connection.
   Attach {
     target: Target,
-    width: u16,
-    height: u16,
+    /// The client's size in cells and, with `atch2`, the size of a cell
+    /// in pixels when it measured one; later values come with `resize`.
+    #[serde(flatten)]
+    geometry: GeometryParams,
     /// End the session (`task_exited` bye) when the task's execution
     /// finishes; the foreground `run` verb sets this.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     until_exit: bool,
+    /// What the client's terminal can show, as the client measured it.
+    /// Absent from an older client: the painter assumes a plain
+    /// true-color terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caps: Option<TermCaps>,
   },
   /// Replace the runner live with the given binary.
   /// The reply comes from the new binary after activation, as
@@ -175,6 +183,7 @@ pub struct RpcWhyDep {
 #[cfg(test)]
 mod tests {
   use crate::config::task::CmdConfig;
+  use crate::term::{Geometry, Size};
 
   use super::*;
 
@@ -208,15 +217,27 @@ mod tests {
       },
       RpcRequest::Attach {
         target: "@dekit/console".parse().unwrap(),
-        width: 80,
-        height: 24,
+        geometry: GeometryParams::of(Geometry::cells(80, 24)),
         until_exit: false,
+        caps: None,
       },
       RpcRequest::Attach {
         target: Target::glob("web/dev"),
-        width: 80,
-        height: 24,
+        geometry: GeometryParams::of(Geometry::cells(80, 24)),
         until_exit: true,
+        caps: None,
+      },
+      RpcRequest::Attach {
+        target: Target::glob("web/dev"),
+        geometry: GeometryParams::of(Geometry {
+          size: Size {
+            width: 80,
+            height: 24,
+          },
+          cell_pixels: Some((10, 20)),
+        }),
+        until_exit: false,
+        caps: Some(TermCaps::full()),
       },
       RpcRequest::Upgrade {
         binary: "/opt/dekit/bin/dekit".to_string(),
@@ -248,6 +269,11 @@ mod tests {
         "attach",
         r#"{"height":24,"target":"web/dev","until_exit":true,"width":80}"#,
       ),
+      // `atch2`: the terminal's capabilities and cell size.
+      (
+        "attach",
+        r#"{"caps":{"colors":"true-color","focus_events":true,"hyperlinks":true,"kitty_graphics":{"animation":true,"placeholders":true},"kitty_keyboard":31,"sixel":false,"strikethrough":true,"sync_output":true,"underline_styles":true,"widths":{"flags_wide":true,"vs16_wide":true,"zwj_joins":true}},"cell_height":20,"cell_width":10,"height":24,"target":"web/dev","width":80}"#,
+      ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
       ("command", r#"{"command":"up"}"#),
     ];
@@ -258,6 +284,84 @@ mod tests {
       assert_eq!(m, method);
       assert_eq!(serde_json::to_string(&p).unwrap(), params);
     }
+  }
+
+  /// Append-only: result shapes are wire API too.
+  #[test]
+  fn golden_results_encode_exactly() {
+    let ready = RpcState {
+      state: "ready".to_string(),
+      exit_code: None,
+      signal: None,
+      reason: None,
+    };
+    let exited = RpcState {
+      state: "exited".to_string(),
+      exit_code: Some(1),
+      signal: None,
+      reason: Some("ready_timeout".to_string()),
+    };
+    let list = TaskListResult {
+      tasks: vec![
+        RpcTaskInfo {
+          id: TaskId(3),
+          path: "db".to_string(),
+          label: None,
+          state: ready.clone(),
+        },
+        RpcTaskInfo {
+          id: TaskId(7),
+          path: "web/dev".to_string(),
+          label: Some("Web".to_string()),
+          state: exited.clone(),
+        },
+      ],
+    };
+    assert_eq!(
+      serde_json::to_string(&list).unwrap(),
+      r#"{"tasks":[{"id":3,"path":"db","state":"ready"},{"id":7,"path":"web/dev","label":"Web","state":"exited","exit_code":1,"reason":"ready_timeout"}]}"#
+    );
+    let why = RpcWhy {
+      id: TaskId(7),
+      path: "web/dev".to_string(),
+      state: exited,
+      wanted: true,
+      supported: true,
+      vetoed: false,
+      pinned: false,
+      saved_pin: false,
+      required_by: vec!["@dekit/console".to_string()],
+      deps: vec![RpcWhyDep {
+        path: "db".to_string(),
+        state: ready,
+        wanted: true,
+        satisfied: true,
+      }],
+      attempts: 2,
+    };
+    assert_eq!(
+      serde_json::to_string(&why).unwrap(),
+      r#"{"id":7,"path":"web/dev","state":"exited","exit_code":1,"reason":"ready_timeout","wanted":true,"supported":true,"vetoed":false,"pinned":false,"required_by":["@dekit/console"],"deps":[{"path":"db","state":"ready","wanted":true,"satisfied":true}],"attempts":2}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&ActResult { matched: 2 }).unwrap(),
+      r#"{"matched":2}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&QuitResult {
+        stop_within_ms: 1500
+      })
+      .unwrap(),
+      r#"{"stop_within_ms":1500}"#
+    );
+    assert_eq!(
+      serde_json::to_string(&ScreenResult {
+        screen: "ok".to_string()
+      })
+      .unwrap(),
+      r#"{"screen":"ok"}"#
+    );
+    assert_eq!(ok_result().to_string(), "{}");
   }
 
   #[test]

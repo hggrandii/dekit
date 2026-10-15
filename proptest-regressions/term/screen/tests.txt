@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 513a03e09668815e9725b6bdcb473266a291c0e0e4fdf993c2b0e2ae12bdf15f # shrinks to atoms = [[226, 128, 141], [65]], splits = [22226]
+cc 0c62ce721c8fc728c00001f107c4070c336ba341ce83a7ef2cfe877885a0c515 # shrinks to atoms = [[32, 97, 97, 32, 32, 65], [27, 91, 51, 56, 58, 50, 58, 57, 58, 56, 58, 55, 109], [224, 160, 128], [226, 186, 128, 226, 186, 128, 226, 186, 128], [32, 97], [226, 186, 128], [0], [14, 0], [65, 48, 32, 65, 48], [48, 32, 32, 32, 97], [0], [224, 160, 128, 224, 160, 128, 224, 160, 128], [65, 97, 32, 32, 32], [0], [224, 160, 128], [27, 91, 65], [65, 48, 97, 32], [27, 91, 49, 59, 51, 49, 109], [27, 91, 63, 54, 57, 104, 27, 91, 50, 59, 53, 115], [65], [32, 48, 48, 65, 97, 32], [97, 48, 32, 65]], splits = [22998]

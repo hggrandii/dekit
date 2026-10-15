@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Size {
   pub height: u16,
   pub width: u16,
@@ -41,6 +41,37 @@ pub struct Winsize {
   pub y: u16,
   pub x_px: u16,
   pub y_px: u16,
+}
+
+/// A terminal's geometry: its size in cells, and the size of one cell
+/// in pixels when the terminal said. What an observer asks of a screen,
+/// what a resize carries, and what the pty is told.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Geometry {
+  pub size: Size,
+  pub cell_pixels: Option<(u16, u16)>,
+}
+
+impl Geometry {
+  /// A size whose cell size is unknown.
+  pub fn cells(width: u16, height: u16) -> Geometry {
+    Geometry {
+      size: Size { width, height },
+      cell_pixels: None,
+    }
+  }
+
+  /// What the pty is told: cells and pixels, with 0 pixels while the
+  /// cell size is unknown, as a terminal without one reports.
+  pub fn winsize(&self) -> Winsize {
+    let (cell_w, cell_h) = self.cell_pixels.unwrap_or((0, 0));
+    Winsize {
+      x: self.size.width,
+      y: self.size.height,
+      x_px: self.size.width.saturating_mul(cell_w),
+      y_px: self.size.height.saturating_mul(cell_h),
+    }
+  }
 }
 
 #[cfg(unix)]

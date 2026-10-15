@@ -1,11 +1,12 @@
-use super::{Color, attrs::Attrs, screen::Screen, vt::emit};
+use super::{frame::Frame, style::Style, vt::emit};
 
-/// Render the screen contents as ANSI-styled text, one line per row,
-/// trailing blanks trimmed; a blank with a background stays.
-pub fn render_screen_ansi(screen: &Screen) -> String {
-  let size = screen.size();
+/// Render the frame as ANSI-styled text, one line per row, trailing
+/// blanks trimmed; a blank with a visible style stays.
+pub fn render_frame_ansi(frame: &Frame) -> String {
+  let size = frame.size;
   let mut out: Vec<u8> = Vec::new();
-  let mut brush = Attrs::default();
+  let mut brush = Style::DEFAULT;
+  let mut buf = [0u8; 4];
 
   for row in 0..size.height {
     if row > 0 {
@@ -14,38 +15,32 @@ pub fn render_screen_ansi(screen: &Screen) -> String {
     let end = (0..size.width)
       .rev()
       .find(|&col| {
-        screen.cell(row, col).is_some_and(|cell| {
-          let attrs = cell.attrs();
-          !cell.contents().trim().is_empty()
-            || attrs.bgcolor != Color::Default
-            || attrs.inverse()
-            || attrs.underline()
+        frame.cell(row, col).is_some_and(|cell| {
+          cell.has_contents() || frame.style(cell).is_visible_blank()
         })
       })
       .map_or(0, |col| col + 1);
-    let mut line_brush = brush;
 
     for col in 0..end {
-      let cell = match screen.cell(row, col) {
-        Some(c) => c,
-        None => continue,
+      let Some(cell) = frame.cell(row, col) else {
+        continue;
       };
-      let attrs = *cell.attrs();
-      emit::sgr(&mut out, line_brush, attrs);
-      line_brush = attrs;
-
-      let c = if cell.width() > 0 {
-        cell.contents()
+      if cell.is_continuation() {
+        continue;
+      }
+      let style = frame.style(cell).with_link(Default::default());
+      emit::sgr(&mut out, brush, style);
+      brush = style;
+      let text = frame.text(cell, &mut buf);
+      if text.is_empty() {
+        out.push(b' ');
       } else {
-        " "
-      };
-      out.extend_from_slice(c.as_bytes());
+        out.extend_from_slice(text.as_bytes());
+      }
     }
-    brush = line_brush;
   }
 
-  // Reset attributes at the end
-  if brush != Attrs::default() {
+  if brush != Style::DEFAULT {
     out.extend_from_slice(emit::SGR_RESET.as_bytes());
   }
 

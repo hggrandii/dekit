@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::kernel_message::{SharedVt, TaskSelector};
+use super::kernel_message::{ScreenHandle, TaskSelector};
 use super::task_key::TaskSpaceId;
 use super::task_path::TaskPath;
 
@@ -228,7 +228,7 @@ pub enum TaskNotify {
     after: Option<TaskId>,
     kind: TaskKind,
     state: TaskState,
-    vt: Option<SharedVt>,
+    vt: Option<ScreenHandle>,
   },
   StateChanged(TaskState),
   Removed,
@@ -336,7 +336,7 @@ pub struct TaskHandle {
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
-  pub vt: Option<SharedVt>,
+  pub vt: Option<ScreenHandle>,
   pub tags: Vec<String>,
 }
 
@@ -397,7 +397,7 @@ pub struct TaskDef {
   /// Listed right after this task when their paths have the same parent
   /// in one space; otherwise last under its parent.
   pub after: Option<TaskId>,
-  pub vt: Option<SharedVt>,
+  pub vt: Option<ScreenHandle>,
   pub tags: Vec<String>,
 }
 

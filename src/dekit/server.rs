@@ -23,12 +23,12 @@ use crate::{
     hook::{Hook, watch_idle},
   },
   console::app::console_task_registration,
-  dekit::attach::attach_session,
+  dekit::attach::{Attachment, attach_session},
   kernel::{
     kernel::{Kernel, SaveFn},
     kernel_message::{
       KernelCommand, KernelQuery, KernelQueryResponse, KernelSnapshot,
-      RegisterError, SharedVt, TaskContext, TaskInfo, TaskSelector,
+      RegisterError, ScreenHandle, TaskContext, TaskInfo, TaskSelector,
     },
     task::{TaskDef, TaskState},
     task_key::TaskSpaceId,
@@ -46,7 +46,6 @@ use crate::{
   },
   target::Target,
   task::config_tasks::{register_idle_config_tasks, register_saved_tasks},
-  term::Size,
   upgrade::snapshot as snap,
 };
 
@@ -575,9 +574,9 @@ pub async fn dispatch_connection(
         match RpcRequest::from_wire(&request.method, request.params) {
           Ok(RpcRequest::Attach {
             target,
-            width,
-            height,
+            geometry,
             until_exit,
+            caps,
           }) => {
             // Earlier requests are answered before the screen stream
             // starts; handlers never wait on the client.
@@ -596,8 +595,11 @@ pub async fn dispatch_connection(
               &client,
               request.id,
               target,
-              Size { width, height },
-              until_exit,
+              Attachment {
+                geometry: geometry.geometry(),
+                until_exit,
+                caps,
+              },
               sender,
               receiver,
             )
@@ -775,7 +777,7 @@ fn one<T>(matches: Vec<T>, target: &Target) -> Result<T, RpcError> {
 pub async fn resolve_screen(
   pc: &TaskContext,
   target: &Target,
-) -> Result<(TaskInfo, SharedVt), RpcError> {
+) -> Result<(TaskInfo, ScreenHandle), RpcError> {
   let task = one(list(pc, target).await?, target)?;
   match task.vt.clone() {
     Some(vt) => Ok((task, vt)),
@@ -879,10 +881,7 @@ async fn handle_rpc(
 
     RpcRequest::Screen { target } => {
       let (_, vt) = resolve_screen(pc, &target).await?;
-      let screen = vt
-        .read()
-        .map(|screen| crate::term::ansi::render_screen_ansi(&screen))
-        .map_err(|_| RpcError::internal("screen lock poisoned"))?;
+      let screen = crate::term::ansi::render_frame_ansi(&vt.load());
       serde_json::to_value(ScreenResult { screen }).map_err(RpcError::internal)
     }
   }

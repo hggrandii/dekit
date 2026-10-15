@@ -1,5 +1,8 @@
 use std::{
-  sync::atomic::{AtomicU64, Ordering},
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
   time::Duration,
 };
 
@@ -12,17 +15,20 @@ use tokio::{
 use crate::{
   kernel::{
     copy_mode::{CopyMove, CopyState, Pos},
-    kernel_message::SharedVt,
     task::TaskId,
   },
   task::logger::LogMsg,
   term::{
-    Color, MouseProtocolEncoding, MouseProtocolMode, Reply, Screen, Size,
+    Color, Frame, Geometry, MouseProtocolMode, Screen, ScreenHandle, Size,
     TermEvent, VtEvent, Winsize,
-    attrs::Attrs,
+    cell::{Cell, CellText},
+    common::CursorStyle,
+    frame::FrameColors,
     grid::Pos as GridPos,
-    key::{Key, KeyCode, KeyMods},
+    image::ImageStore,
+    key::{Key, KeyCode, KeyEventKind, KeyMods},
     mouse::{MouseButton, MouseEvent, MouseEventKind},
+    style::{Style, StyleId},
     vt::emit,
   },
 };
@@ -34,6 +40,10 @@ pub const DEFAULT_SIZE: Size = Size {
 };
 
 const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A synchronized update a program leaves open is painted anyway after
+/// this long, as terminals do.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Identifies one attachment to a screen. Allocated by the attacher, so
 /// an attach needs no handshake before input and resize can follow it.
@@ -47,11 +57,14 @@ impl ObserverId {
   }
 }
 
+/// A task's screen: the terminal its program draws on, the observers
+/// watching it, and the copy mode they share. The screen itself is owned
+/// here; observers read the frames it publishes.
 pub struct TaskScreen {
   task_id: TaskId,
   size: Winsize,
-  vt: SharedVt,
-  // Per-read events buffer; drained at the end of each process().
+  screen: Screen,
+  handle: ScreenHandle,
   events_buf: Vec<VtEvent>,
 
   observers: Vec<Observer>,
@@ -72,16 +85,29 @@ pub struct TaskScreen {
   drag_scroll_at: Option<Instant>,
   /// Lines scrolled per mouse-wheel notch.
   wheel_lines: usize,
+  /// A synchronized update began then; paints wait for its end.
+  sync_since: Option<Instant>,
 }
 
 struct CopySession {
   state: CopyState,
-  present: SharedVt,
+  /// The images the frozen grid's placements refer to.
+  images: ImageStore,
+  /// The screen colors the live screen had.
+  colors: FrameColors,
+  /// Styles interned into the frozen grid for the selection and the
+  /// badge.
+  highlight: StyleId,
+  badge: StyleId,
+  /// What observers draw while in copy mode: the frozen screen with the
+  /// selection and the badge over it.
+  present_handle: ScreenHandle,
 }
 
 struct Observer {
   id: ObserverId,
-  size: Winsize,
+  /// The size this observer shows, and its cell size when it said.
+  geometry: Geometry,
   sink: UnboundedSender<ScreenNotify>,
   /// The dekit version of the client behind this observer, when it is
   /// an attach session rather than another screen.
@@ -91,7 +117,7 @@ struct Observer {
 pub enum TaskScreenCmd {
   Attach {
     observer: ObserverId,
-    size: Winsize,
+    geometry: Geometry,
     sink: UnboundedSender<ScreenNotify>,
     /// The attaching client's dekit version; `None` for an in-process
     /// observer like the console.
@@ -134,12 +160,15 @@ pub enum ScrollUnit {
 pub enum ScreenNotify {
   /// The attach took effect; paint the screen.
   Attached,
-  Render,
+  /// The screen changed; paint it.
+  Render {
+    screen: TaskId,
+  },
   Bell,
   /// Copy mode began (`Some`, draw this surface instead) or ended.
   CopyPresent {
     screen: TaskId,
-    vt: Option<SharedVt>,
+    handle: Option<ScreenHandle>,
   },
   Yank {
     text: String,
@@ -160,27 +189,24 @@ pub enum TaskScreenEffect {
 }
 
 impl TaskScreen {
-  pub fn vt(&self) -> &SharedVt {
-    &self.vt
-  }
-
-  pub fn new(task_id: TaskId, vt: SharedVt, wheel_lines: usize) -> Self {
-    let size = match vt.read() {
-      Ok(screen) => screen.size(),
-      Err(_) => Size {
-        width: 80,
-        height: 24,
-      },
-    };
+  pub fn new(
+    task_id: TaskId,
+    screen: Screen,
+    handle: ScreenHandle,
+    wheel_lines: usize,
+  ) -> Self {
+    let size = screen.size();
     TaskScreen {
       task_id,
-      size: Winsize {
-        x: size.width,
-        y: size.height,
-        x_px: 0,
-        y_px: 0,
-      },
-      vt,
+      // Pixels are reported once a client measures its cells; until then
+      // 0 says unknown, as a terminal without a pixel size does.
+      size: Geometry {
+        size,
+        cell_pixels: None,
+      }
+      .winsize(),
+      screen,
+      handle,
       events_buf: Vec::new(),
       observers: Vec::new(),
       lost_observers: false,
@@ -191,7 +217,65 @@ impl TaskScreen {
       drag: None,
       drag_scroll_at: None,
       wheel_lines: wheel_lines.max(1),
+      sync_since: None,
     }
+  }
+
+  /// Where observers read this screen.
+  #[cfg(test)]
+  pub fn handle(&self) -> &ScreenHandle {
+    &self.handle
+  }
+
+  pub fn screen(&self) -> &Screen {
+    &self.screen
+  }
+
+  /// For a task that draws its screen itself (a UI). Call `rendered`
+  /// after drawing so observers see it.
+  pub fn screen_mut(&mut self) -> &mut Screen {
+    &mut self.screen
+  }
+
+  pub fn size(&self) -> Size {
+    self.screen.size()
+  }
+
+  /// The pty size: cells, and pixels from the cell size an observer
+  /// reported (0 while none has).
+  pub fn winsize(&self) -> Winsize {
+    self.size
+  }
+
+  /// Clears the screen for a fresh program.
+  pub fn reset_screen(&mut self) {
+    self.screen.reset();
+    self.publish();
+  }
+
+  fn publish(&mut self) {
+    self.handle.publish(self.screen.frame());
+  }
+
+  /// Runs `f` on the emulator. A bug there must not take the task down
+  /// with it (the handler would be gone, and with it the task's place in
+  /// an upgrade): the panic is logged and the screen reset, the program
+  /// keeps running.
+  fn guarded(&mut self, what: &str, f: impl FnOnce(&mut Screen)) {
+    let run = std::panic::AssertUnwindSafe(|| f(&mut self.screen));
+    if std::panic::catch_unwind(run).is_err() {
+      log::error!(
+        "task {}: the terminal emulation panicked while {what}; the screen is reset",
+        self.task_id.0
+      );
+      self.screen.reset();
+    }
+  }
+
+  /// Publishes the screen and tells observers to paint it.
+  fn render(&mut self) {
+    self.publish();
+    self.broadcast(|screen| ScreenNotify::Render { screen });
   }
 
   /// When the view should scroll again for a drag resting on the top or
@@ -206,13 +290,34 @@ impl TaskScreen {
     self.drag_scroll_at = None;
     if self.drag_edge_scroll() {
       self.sync_drag_extent();
-      self.render_present();
-      self.broadcast(|_| ScreenNotify::Render);
+      self.repaint_copy();
+    }
+  }
+
+  /// When a synchronized update left open must be painted anyway.
+  pub fn sync_deadline(&self) -> Option<Instant> {
+    self.sync_since.map(|since| since + SYNC_TIMEOUT)
+  }
+
+  /// Ends an overlong synchronized update and paints.
+  pub fn sync_timeout(&mut self) {
+    if self.sync_since.take().is_some() {
+      self.screen.end_sync_update();
+      self.render();
     }
   }
 
   pub fn has_observers(&self) -> bool {
     !self.observers.is_empty()
+  }
+
+  /// The smallest cell size an observer reported, if any did.
+  pub fn reported_cell_pixels(&self) -> Option<(u16, u16)> {
+    self
+      .observers
+      .iter()
+      .filter_map(|obs| obs.geometry.cell_pixels)
+      .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
   }
 
   /// The dekit versions of the attached clients, one per attach session.
@@ -251,9 +356,10 @@ impl TaskScreen {
     }
   }
 
-  /// The task drew into `vt` itself (a UI rather than process output).
+  /// The task drew into the screen itself (a UI rather than process
+  /// output).
   pub fn rendered(&mut self, effects: &mut Vec<TaskScreenEffect>) {
-    self.broadcast(|_| ScreenNotify::Render);
+    self.render();
     self.settle(effects);
   }
 
@@ -263,39 +369,46 @@ impl TaskScreen {
     self.settle(effects);
   }
 
+  /// Asks the screen for the text of lines as they finish (ready checks).
+  pub fn set_line_tap(&mut self, on: bool) {
+    self.screen.set_line_tap(on);
+  }
+
+  pub fn take_finished_lines(&mut self, out: &mut Vec<String>) {
+    self.screen.take_finished_lines(out);
+  }
+
   pub async fn process(
     &mut self,
     bytes: &[u8],
     effects: &mut Vec<TaskScreenEffect>,
   ) {
-    if let Ok(mut vt) = self.vt.write() {
-      vt.process(bytes, &mut self.events_buf);
-    }
-
-    let bell = self.events_buf.iter().any(|event| match event {
-      VtEvent::Bell => true,
-      VtEvent::Reply(_) => false,
-    });
-    if bell {
-      self.broadcast(|_| ScreenNotify::Bell);
-    }
-    self.broadcast(|_| ScreenNotify::Render);
-
+    self.guarded("processing output", |screen| screen.process(bytes));
+    self.screen.take_events(&mut self.events_buf);
     for event in std::mem::take(&mut self.events_buf) {
       match event {
-        VtEvent::Bell => (),
-        VtEvent::Reply(reply) => {
-          let mut seq = Vec::new();
-          match reply {
-            Reply::PrimaryDeviceAttrs => emit::da1_reply(&mut seq),
-            Reply::CursorPos { row, col } => emit::cpr(&mut seq, row, col),
-            Reply::KittyFlags(flags) => {
-              emit::kitty_flags_reply(&mut seq, flags)
-            }
-          }
-          effects.push(TaskScreenEffect::Write(seq));
+        VtEvent::Bell => self.broadcast(|_| ScreenNotify::Bell),
+        VtEvent::Reply(bytes) => effects.push(TaskScreenEffect::Write(bytes)),
+        // The program put text on the clipboard: the attached clients
+        // own the user's clipboard.
+        VtEvent::SetClipboard(text) => {
+          self.broadcast(|_| ScreenNotify::Yank { text: text.clone() });
+        }
+        VtEvent::Notify { title, body } => {
+          log::debug!(
+            "notification from task {}: {title} {body}",
+            self.task_id.0
+          );
         }
       }
+    }
+    // A synchronized update (`?2026`) left open holds the paint, from
+    // when it was first seen open.
+    if self.screen.in_sync_update() {
+      self.sync_since.get_or_insert_with(Instant::now);
+    } else {
+      self.sync_since = None;
+      self.render();
     }
 
     if !self.loggers.is_empty() {
@@ -315,7 +428,7 @@ impl TaskScreen {
     match cmd {
       TaskScreenCmd::Attach {
         observer,
-        size,
+        geometry,
         sink,
         client_version,
       } => {
@@ -323,7 +436,7 @@ impl TaskScreen {
         self.observers.retain(|o| o.id != observer);
         self.observers.push(Observer {
           id: observer,
-          size,
+          geometry,
           sink,
           client_version,
         });
@@ -337,12 +450,12 @@ impl TaskScreen {
           if let Some(session) = &self.copy {
             let _ = obs.sink.send(ScreenNotify::CopyPresent {
               screen: self.task_id,
-              vt: Some(session.present.clone()),
+              handle: Some(session.present_handle.clone()),
             });
           }
         }
         if resized {
-          self.broadcast(|_| ScreenNotify::Render);
+          self.render();
         }
       }
       TaskScreenCmd::Detach { observer } => {
@@ -350,21 +463,15 @@ impl TaskScreen {
         self.apply_size(effects);
       }
       TaskScreenCmd::Input { observer, event } => match event {
-        TermEvent::Resize(width, height) => {
+        TermEvent::Resize(geometry) => {
           if let Some(obs) =
             self.observers.iter_mut().find(|o| o.id == observer)
           {
-            obs.size = Winsize {
-              x: width,
-              y: height,
-              x_px: 0,
-              y_px: 0,
-            };
+            obs.geometry = geometry;
           }
           self.apply_size(effects);
           if self.copy.is_some() {
-            self.render_present();
-            self.broadcast(|_| ScreenNotify::Render);
+            self.repaint_copy();
           }
         }
         TermEvent::Mouse(event) => self.handle_mouse(event, effects),
@@ -380,7 +487,13 @@ impl TaskScreen {
             effects.push(TaskScreenEffect::Paste(text));
           }
         }
-        TermEvent::FocusGained | TermEvent::FocusLost => (),
+        TermEvent::FocusGained | TermEvent::FocusLost => {
+          if self.screen.modes().focus_report {
+            let mut seq = Vec::new();
+            emit::focus(&mut seq, event == TermEvent::FocusGained);
+            effects.push(TaskScreenEffect::Write(seq));
+          }
+        }
       },
 
       TaskScreenCmd::CopyEnter => {
@@ -388,7 +501,7 @@ impl TaskScreen {
           self.render_present();
           self.broadcast(|screen| ScreenNotify::CopyPresent {
             screen,
-            vt: Some(present.clone()),
+            handle: Some(present.clone()),
           });
         }
       }
@@ -405,7 +518,8 @@ impl TaskScreen {
 
   /// Keys an attachment with no keymap of its own can use in copy mode.
   fn copy_key(&mut self, key: Key) {
-    if key.mods != KeyMods::NONE {
+    // A terminal reporting releases would otherwise act twice.
+    if key.mods != KeyMods::NONE || key.kind == KeyEventKind::Release {
       return;
     }
     match key.code {
@@ -423,16 +537,14 @@ impl TaskScreen {
   fn copy_move(&mut self, dir: CopyMove) {
     if let Some(session) = &mut self.copy {
       session.state.move_cursor(dir);
-      self.render_present();
-      self.broadcast(|_| ScreenNotify::Render);
+      self.repaint_copy();
     }
   }
 
   fn copy_begin_selection(&mut self) {
     if let Some(session) = &mut self.copy {
       session.state.begin_selection();
-      self.render_present();
-      self.broadcast(|_| ScreenNotify::Render);
+      self.repaint_copy();
     }
   }
 
@@ -446,29 +558,34 @@ impl TaskScreen {
 
   /// Freezes the live screen into a copy session. Returns the presentation
   /// surface on fresh entry, None when already in copy mode.
-  fn enter_copy(&mut self) -> Option<SharedVt> {
+  fn enter_copy(&mut self) -> Option<ScreenHandle> {
     if self.copy.is_some() {
       return None;
     }
-    let snapshot = self.vt.read().ok()?.clone();
-    let present = SharedVt::new(Screen::new(
-      Size {
-        height: self.size.y.max(1),
-        width: self.size.x.max(1),
-      },
-      0,
-    ));
+    let mut snapshot = self.screen.grid().clone();
+    let highlight =
+      snapshot.intern_style(Style::default().fg(Color::BLACK).bg(Color::CYAN));
+    let badge = snapshot
+      .intern_style(Style::default().fg(Color::BLACK).bg(Color::BRIGHT_YELLOW));
+    let present_handle = ScreenHandle::new(Frame::of_grid(&snapshot));
     self.copy = Some(CopySession {
       state: CopyState::new(snapshot),
-      present: present.clone(),
+      images: self.screen.images().clone(),
+      colors: self.screen.frame_colors(),
+      highlight,
+      badge,
+      present_handle: present_handle.clone(),
     });
-    Some(present)
+    Some(present_handle)
   }
 
   fn leave_copy(&mut self) {
     self.drag_scroll_at = None;
     if self.copy.take().is_some() {
-      self.broadcast(|screen| ScreenNotify::CopyPresent { screen, vt: None });
+      self.broadcast(|screen| ScreenNotify::CopyPresent {
+        screen,
+        handle: None,
+      });
     }
   }
 
@@ -481,15 +598,13 @@ impl TaskScreen {
     let before = session.state.scrollback();
     let more = if row == 0 {
       session.state.scroll_up(1);
-      session.state.scrollback() < session.state.snapshot().scrollback_len()
+      session.state.scrollback() < session.state.max_scrollback()
     } else if row + 1 >= self.size.y.max(1) {
       session.state.scroll_down(1);
       session.state.scrollback() > 0
     } else {
       false
     };
-    // History reports its capacity, not its fill, so a view that did not
-    // move is the other sign that the edge has been reached.
     let moved = session.state.scrollback() != before;
     self.drag_scroll_at =
       (moved && more).then(|| Instant::now() + DRAG_SCROLL_INTERVAL);
@@ -510,29 +625,41 @@ impl TaskScreen {
     event: MouseEvent,
     effects: &mut Vec<TaskScreenEffect>,
   ) {
-    let (mouse_mode, encoding) = self
-      .vt
-      .read()
-      .map(|screen| {
-        (
-          screen.mouse_protocol_mode(),
-          screen.mouse_protocol_encoding(),
-        )
-      })
-      .unwrap_or((MouseProtocolMode::None, MouseProtocolEncoding::Default));
+    let modes = self.screen.observed_modes();
 
-    if mouse_mode != MouseProtocolMode::None {
-      if mouse_forwarded(mouse_mode, event.kind) {
+    if modes.mouse != MouseProtocolMode::None && self.copy.is_none() {
+      if mouse_forwarded(modes.mouse, event.kind) {
         let mut event = event;
         // X10 mode predates modifier reporting.
-        if mouse_mode == MouseProtocolMode::Press {
+        if modes.mouse == MouseProtocolMode::Press {
           event.mods = KeyMods::NONE;
         }
         let mut seq = Vec::new();
-        emit::mouse(&mut seq, &event, encoding);
+        emit::mouse(
+          &mut seq,
+          &event,
+          modes.mouse_encoding,
+          self.screen.cell_pixels(),
+        );
         effects.push(TaskScreenEffect::Write(seq));
       }
       return;
+    }
+
+    // In the alternate screen the wheel drives the program as arrow
+    // keys (`?1007`), unless it is in copy mode.
+    if modes.alt_screen && modes.alt_scroll && self.copy.is_none() {
+      let key = match event.kind {
+        MouseEventKind::ScrollUp => Some(KeyCode::Up),
+        MouseEventKind::ScrollDown => Some(KeyCode::Down),
+        _ => None,
+      };
+      if let Some(code) = key {
+        for _ in 0..self.wheel_lines {
+          effects.push(TaskScreenEffect::Key(Key::new(code, KeyMods::NONE)));
+        }
+        return;
+      }
     }
 
     let row = event.y.max(0) as u16;
@@ -547,8 +674,7 @@ impl TaskScreen {
         if let Some(session) = &mut self.copy {
           let pos = session.state.pos_at(row, col);
           session.state.set_anchor(pos);
-          self.render_present();
-          self.broadcast(|_| ScreenNotify::Render);
+          self.repaint_copy();
         }
       }
       MouseEventKind::Drag(MouseButton::Left) => {
@@ -568,9 +694,9 @@ impl TaskScreen {
         match entered {
           Some(present) => self.broadcast(|screen| ScreenNotify::CopyPresent {
             screen,
-            vt: Some(present.clone()),
+            handle: Some(present.clone()),
           }),
-          None => self.broadcast(|_| ScreenNotify::Render),
+          None => self.broadcast(|screen| ScreenNotify::Render { screen }),
         }
       }
       MouseEventKind::Up(_) => {
@@ -610,61 +736,67 @@ impl TaskScreen {
       }
       // A wheel turned mid-drag moves the content, not the pointer.
       self.sync_drag_extent();
-      self.render_present();
-    } else if let Ok(mut screen) = self.vt.write() {
+      self.repaint_copy();
+    } else {
       if delta >= 0 {
-        screen.scroll_screen_up(delta as usize);
+        self.screen.scroll_screen_up(delta as usize);
       } else {
-        screen.scroll_screen_down(delta.unsigned_abs() as usize);
+        self
+          .screen
+          .scroll_screen_down(delta.unsigned_abs() as usize);
       }
+      self.render();
     }
-    self.broadcast(|_| ScreenNotify::Render);
   }
 
   /// Composes the frozen snapshot (scrolled), the selection highlight, the HUD
   /// badge, and the selection cursor into the `present` surface that observers
   /// render.
+  /// Repaints copy mode for its observers.
+  fn repaint_copy(&mut self) {
+    self.render_present();
+    self.broadcast(|screen| ScreenNotify::Render { screen });
+  }
+
+  /// Publishes what observers draw in copy mode: the frozen screen at
+  /// the observers' size, the selection over it, the badge, the cursor.
+  /// Rows are shared with the frozen grid; only those the selection or
+  /// the badge touch are copied.
   fn render_present(&mut self) {
-    let Some(session) = &self.copy else {
-      return;
-    };
-    let copy = &session.state;
-    let Ok(mut present) = session.present.write() else {
+    let Some(session) = &mut self.copy else {
       return;
     };
     let size = Size {
       width: self.size.x.max(1),
       height: self.size.y.max(1),
     };
-    present.set_size(size.height, size.width);
-    let grid = present.grid_mut();
-    grid.set_scrollback(0);
-    grid.erase_all(Attrs::default());
-
+    session.state.snapshot_mut().set_size(size);
+    let copy = &session.state;
     let snapshot = copy.snapshot();
     let scrollback = copy.scrollback() as i32;
     let start = copy.start();
     let end = copy.end().unwrap_or(start);
-    let highlight = Attrs::default().fg(Color::BLACK).bg(Color::CYAN);
 
-    for row in 0..size.height {
-      for col in 0..size.width {
-        let Some(cell) = snapshot.cell(row, col) else {
-          continue;
-        };
-        let Some(dst) = grid.drawing_cell_mut(GridPos { row, col }) else {
-          continue;
-        };
-        *dst = cell.clone();
-        if !cell.has_contents() {
-          dst.set_str(" ");
-        }
-        let target = Pos {
-          y: row as i32 - scrollback,
-          x: col as i32,
-        };
-        if Pos::within(start, end, target) {
-          dst.set_attrs(highlight);
+    let mut rows = snapshot.visible_rows();
+    let images = &session.images;
+    let placements =
+      snapshot.visible_placements(&rows, &|id| images.key_of(id));
+    let mut tables = snapshot.tables().clone();
+    if !session.colors.is_plain() {
+      tables.styles = Arc::new(session.colors.apply_table(&tables.styles));
+    }
+
+    // The selection, on the rows it covers.
+    let (low, high) = Pos::to_low_high(start, end);
+    for (r, row) in rows.iter_mut().enumerate() {
+      let y = r as i32 - scrollback;
+      if y < low.y || y > high.y {
+        continue;
+      }
+      let row = Arc::make_mut(row);
+      for (x, cell) in row.cells.iter_mut().enumerate() {
+        if Pos::within(start, end, Pos { y, x: x as i32 }) {
+          cell.style = session.highlight;
         }
       }
     }
@@ -672,30 +804,40 @@ impl TaskScreen {
     // HUD badge in the top-right corner.
     let off = copy.scrollback();
     let label = if off > 0 {
-      format!(" COPY -{} ", off)
+      format!(" COPY -{off} ")
     } else {
       " COPY ".to_string()
     };
-    let mut top_row = grid.area().take_top(1);
-    grid.draw_text(
-      top_row.take_right(label.len() as u16),
-      &label,
-      Attrs::default().fg(Color::BLACK).bg(Color::BRIGHT_YELLOW),
-    );
+    if let Some(top) = rows.first_mut() {
+      let top = Arc::make_mut(top);
+      let first = size.width.saturating_sub(label.len() as u16);
+      for (i, c) in label.chars().enumerate() {
+        let cell = Cell::new(CellText::scalar(c, 1), session.badge);
+        top.set(first + i as u16, cell);
+      }
+    }
 
-    // Place the cursor at the selection position.
+    // The cursor at the selection position.
     let cursor = copy.cursor();
     let cy = cursor.y + scrollback;
-    if cy >= 0
-      && cy < size.height as i32
+    let cursor = (cy >= 0
+      && cy < i32::from(size.height)
       && cursor.x >= 0
-      && cursor.x < size.width as i32
-    {
-      grid.set_pos(GridPos {
-        row: cy as u16,
-        col: cursor.x as u16,
-      });
-    }
+      && cursor.x < i32::from(size.width))
+    .then_some(GridPos {
+      row: cy as u16,
+      col: cursor.x as u16,
+    });
+    session.present_handle.publish(Frame {
+      size,
+      rows,
+      tables,
+      cursor,
+      cursor_style: CursorStyle::Default,
+      title: Arc::from(""),
+      images: images.table(),
+      placements,
+    });
   }
 
   /// Waits until every logger has written what it was sent.
@@ -726,7 +868,7 @@ impl TaskScreen {
     if self.copy.is_some() {
       self.render_present();
     }
-    self.broadcast(|_| ScreenNotify::Render);
+    self.render();
     true
   }
 
@@ -736,32 +878,50 @@ impl TaskScreen {
     let size = self
       .observers
       .iter()
-      .map(|obs| obs.size)
-      .reduce(|a, b| Winsize {
-        x: a.x.min(b.x),
-        y: a.y.min(b.y),
-        x_px: 0,
-        y_px: 0,
+      .map(|obs| obs.geometry.size)
+      .reduce(|a, b| Size {
+        width: a.width.min(b.width),
+        height: a.height.min(b.height),
       })
-      .unwrap_or(self.size);
+      .unwrap_or(Size {
+        width: self.size.x,
+        height: self.size.y,
+      });
+    // The cell size is the smallest any observer reported: images sized
+    // by it fit everyone. The pty learns it too, as pixels.
+    let cell_pixels = self.reported_cell_pixels();
+    if let Some((w, h)) = cell_pixels {
+      self.screen.set_cell_pixels(w, h);
+    }
     // An observer on a degenerate terminal (0 rows or columns) must not
-    // shrink the vt to nothing: the grid needs at least one cell.
-    let size = Winsize {
-      x: size.x.max(1),
-      y: size.y.max(1),
-      x_px: 0,
-      y_px: 0,
-    };
-    if size == self.size {
-      return false;
+    // shrink the screen to nothing: the grid needs at least one cell.
+    let size = Geometry {
+      size: Size {
+        width: size.width.max(1),
+        height: size.height.max(1),
+      },
+      cell_pixels,
     }
-    self.size = size;
-    // Observers paint from vt; resize it before the following Render.
-    if let Ok(mut vt) = self.vt.write() {
-      vt.set_size(size.y, size.x);
+    .winsize();
+    let changed = size != self.size;
+    if changed {
+      self.size = size;
+      // Observers paint from the published frame; resize before the
+      // following Render.
+      self.guarded("resizing", |screen| screen.set_size(size.y, size.x));
     }
-    effects.push(TaskScreenEffect::Resize(size));
-    true
+    // What the size or the cell size made the screen say (an in-band
+    // resize report) goes to the child now, not with its next output.
+    self.screen.take_events(&mut self.events_buf);
+    for event in std::mem::take(&mut self.events_buf) {
+      if let VtEvent::Reply(bytes) = event {
+        effects.push(TaskScreenEffect::Write(bytes));
+      }
+    }
+    if changed {
+      effects.push(TaskScreenEffect::Resize(size));
+    }
+    changed
   }
 }
 
@@ -809,22 +969,23 @@ mod tests {
 
   use super::*;
 
-  fn winsize(x: u16, y: u16) -> Winsize {
-    Winsize {
-      x,
-      y,
-      x_px: 0,
-      y_px: 0,
-    }
+  fn cells(x: u16, y: u16) -> Geometry {
+    Geometry::cells(x, y)
+  }
+
+  fn screen_of(size: Size, scrollback: usize, wheel: usize) -> TaskScreen {
+    let screen = Screen::new(size, scrollback);
+    let handle = ScreenHandle::new(screen.frame());
+    TaskScreen::new(TaskId(1), screen, handle, wheel)
   }
 
   fn screen() -> TaskScreen {
-    TaskScreen::new(TaskId(1), SharedVt::new(Screen::new(DEFAULT_SIZE, 0)), 1)
+    screen_of(DEFAULT_SIZE, 0, 1)
   }
 
   fn attach(
     screen: &mut TaskScreen,
-    size: Winsize,
+    geometry: Geometry,
   ) -> (
     ObserverId,
     UnboundedReceiver<ScreenNotify>,
@@ -836,7 +997,7 @@ mod tests {
     screen.handle_cmd(
       TaskScreenCmd::Attach {
         observer,
-        size,
+        geometry,
         sink,
         client_version: None,
       },
@@ -852,7 +1013,7 @@ mod tests {
     loop {
       match rx.try_recv() {
         Ok(ScreenNotify::Attached) => out.push("attached"),
-        Ok(ScreenNotify::Render) => out.push("render"),
+        Ok(ScreenNotify::Render { .. }) => out.push("render"),
         Ok(ScreenNotify::Bell) => out.push("bell"),
         Ok(ScreenNotify::CopyPresent { .. }) => out.push("copy"),
         Ok(ScreenNotify::Yank { .. }) => out.push("yank"),
@@ -864,20 +1025,24 @@ mod tests {
   }
 
   fn resize_of(effects: &[TaskScreenEffect]) -> Option<(u16, u16)> {
+    winsize_of(effects).map(|size| (size.x, size.y))
+  }
+
+  fn winsize_of(effects: &[TaskScreenEffect]) -> Option<Winsize> {
     effects.iter().find_map(|effect| match effect {
-      TaskScreenEffect::Resize(size) => Some((size.x, size.y)),
+      TaskScreenEffect::Resize(size) => Some(*size),
       _ => None,
     })
   }
 
   fn vt_size(screen: &TaskScreen) -> Size {
-    screen.vt().read().unwrap().size()
+    screen.handle().load().size
   }
 
   #[test]
   fn attach_at_default_size_sends_attached_only() {
     let mut screen = screen();
-    let (_, mut rx, effects) = attach(&mut screen, winsize(80, 24));
+    let (_, mut rx, effects) = attach(&mut screen, cells(80, 24));
     assert_eq!(take_notifies(&mut rx), ["attached"]);
     assert!(resize_of(&effects).is_none());
     assert_eq!(vt_size(&screen), DEFAULT_SIZE);
@@ -886,7 +1051,7 @@ mod tests {
   #[test]
   fn attach_at_other_size_resizes_vt_and_renders() {
     let mut screen = screen();
-    let (_, mut rx, effects) = attach(&mut screen, winsize(100, 30));
+    let (_, mut rx, effects) = attach(&mut screen, cells(100, 30));
     assert_eq!(take_notifies(&mut rx), ["attached", "render"]);
     assert_eq!(resize_of(&effects), Some((100, 30)));
     assert_eq!(
@@ -901,14 +1066,14 @@ mod tests {
   #[test]
   fn resize_notifies_observers_after_geometry_change() {
     let mut screen = screen();
-    let (observer, mut rx, _) = attach(&mut screen, winsize(80, 24));
+    let (observer, mut rx, _) = attach(&mut screen, cells(80, 24));
     let _ = take_notifies(&mut rx);
 
     let mut effects = Vec::new();
     screen.handle_cmd(
       TaskScreenCmd::Input {
         observer,
-        event: TermEvent::Resize(120, 40),
+        event: TermEvent::resize(120, 40),
       },
       &mut effects,
     );
@@ -926,14 +1091,14 @@ mod tests {
   #[test]
   fn same_size_resize_is_silent() {
     let mut screen = screen();
-    let (observer, mut rx, _) = attach(&mut screen, winsize(80, 24));
+    let (observer, mut rx, _) = attach(&mut screen, cells(80, 24));
     let _ = take_notifies(&mut rx);
 
     let mut effects = Vec::new();
     screen.handle_cmd(
       TaskScreenCmd::Input {
         observer,
-        event: TermEvent::Resize(80, 24),
+        event: TermEvent::resize(80, 24),
       },
       &mut effects,
     );
@@ -941,12 +1106,68 @@ mod tests {
     assert!(resize_of(&effects).is_none());
   }
 
+  fn writes_of(effects: &[TaskScreenEffect]) -> Vec<u8> {
+    effects
+      .iter()
+      .filter_map(|effect| match effect {
+        TaskScreenEffect::Write(bytes) => Some(bytes.as_slice()),
+        _ => None,
+      })
+      .flatten()
+      .copied()
+      .collect()
+  }
+
+  #[test]
+  fn pty_pixels_follow_a_measured_cell_size() {
+    let mut screen = screen();
+    let (observer, _rx, effects) = attach(&mut screen, cells(80, 24));
+    // Nothing measured yet: the pty's pixel size is unknown.
+    assert!(resize_of(&effects).is_none());
+    let size = screen.winsize();
+    assert_eq!((size.x_px, size.y_px), (0, 0));
+    // The child asked for in-band resize reports (and got one at once).
+    screen.screen_mut().process(b"\x1b[?2048h");
+    let mut events = Vec::new();
+    screen.screen_mut().take_events(&mut events);
+    assert_eq!(events.len(), 1);
+    let geometry = TermEvent::Resize(Geometry {
+      size: Size {
+        width: 80,
+        height: 24,
+      },
+      cell_pixels: Some((10, 20)),
+    });
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: geometry.clone(),
+      },
+      &mut effects,
+    );
+    let size = winsize_of(&effects).expect("the pty learns the pixel size");
+    assert_eq!((size.x, size.y, size.x_px, size.y_px), (80, 24, 800, 480));
+    // The child hears of the new cell size now, not with its next output.
+    assert_eq!(writes_of(&effects), b"\x1b[48;24;80;480;800t");
+    // The same geometry again changes nothing.
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: geometry,
+      },
+      &mut effects,
+    );
+    assert!(effects.is_empty());
+  }
+
   #[test]
   fn detach_of_smaller_observer_grows_and_renders() {
     let mut screen = screen();
-    let (small, mut small_rx, _) = attach(&mut screen, winsize(40, 12));
+    let (small, mut small_rx, _) = attach(&mut screen, cells(40, 12));
     let _ = take_notifies(&mut small_rx);
-    let (_, mut large_rx, _) = attach(&mut screen, winsize(80, 24));
+    let (_, mut large_rx, _) = attach(&mut screen, cells(80, 24));
     // Second attach keeps the min size, so no geometry change.
     assert_eq!(take_notifies(&mut large_rx), ["attached"]);
 
@@ -970,12 +1191,8 @@ mod tests {
   /// `line37..line59` are visible and 37 rows sit above them.
   async fn screen_with_history()
   -> (TaskScreen, ObserverId, UnboundedReceiver<ScreenNotify>) {
-    let mut screen = TaskScreen::new(
-      TaskId(1),
-      SharedVt::new(Screen::new(DEFAULT_SIZE, 200)),
-      3,
-    );
-    let (observer, rx, mut effects) = attach(&mut screen, winsize(80, 24));
+    let mut screen = screen_of(DEFAULT_SIZE, 200, 3);
+    let (observer, rx, mut effects) = attach(&mut screen, cells(80, 24));
     let mut out = String::new();
     for i in 0..60 {
       out.push_str(&format!("line{i}\r\n"));
@@ -1117,5 +1334,146 @@ mod tests {
     );
     assert_eq!(copy_offset(&screen), 3);
     assert_eq!(copy_end(&screen), Pos { y: 17, x: 4 });
+  }
+
+  #[tokio::test]
+  async fn output_held_by_a_synchronized_update_is_published_at_the_end() {
+    let mut screen = screen_of(DEFAULT_SIZE, 0, 1);
+    let (_observer, _rx, mut effects) = attach(&mut screen, cells(80, 24));
+    screen
+      .process(b"\x1b[?2026hfinal words", &mut effects)
+      .await;
+    assert_eq!(screen.handle().load().row_text(0, 0, 11).trim_end(), "");
+    assert!(screen.sync_deadline().is_some());
+    // What the task does once the program's output ends.
+    screen.sync_timeout();
+    assert_eq!(screen.handle().load().row_text(0, 0, 11), "final words");
+  }
+
+  #[tokio::test]
+  async fn a_panic_in_the_emulator_resets_the_screen_and_keeps_the_task() {
+    let mut screen = screen_of(DEFAULT_SIZE, 100, 3);
+    let (_observer, _rx, mut effects) = attach(&mut screen, cells(80, 24));
+    screen.process(b"hello", &mut effects).await;
+    // Swallowed by the hook, not by the task.
+    let outcome =
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        futures::executor::block_on(
+          screen.process(b"\x1b_PANIC\x1b\\", &mut effects),
+        )
+      }));
+    assert!(outcome.is_ok(), "the panic must not escape the task screen");
+    screen.process(b"after", &mut effects).await;
+    let frame = screen.handle().load();
+    assert_eq!(frame.row_text(0, 0, 10).trim_end(), "after");
+  }
+
+  #[tokio::test]
+  async fn copy_mode_shows_images() {
+    use base64::Engine as _;
+    let mut screen = screen_of(DEFAULT_SIZE, 100, 3);
+    let (_observer, _rx, mut effects) = attach(&mut screen, cells(80, 24));
+    let data =
+      base64::engine::general_purpose::STANDARD.encode([255, 0, 0, 0, 255, 0]);
+    let put = format!("\x1b[2;1H\x1b_Ga=T,f=24,s=2,v=1,i=1,q=2;{data}\x1b\\");
+    screen.process(put.as_bytes(), &mut effects).await;
+    screen.handle_cmd(TaskScreenCmd::CopyEnter, &mut effects);
+    let present = screen.copy.as_ref().unwrap().present_handle.load();
+    assert_eq!(present.placements.len(), 1);
+    assert_eq!(
+      (present.placements[0].row, present.placements[0].col),
+      (1, 0)
+    );
+    assert!(present.images.contains_key(&present.placements[0].key));
+  }
+
+  #[tokio::test]
+  async fn key_releases_do_not_drive_copy_mode() {
+    let (mut screen, observer, _rx) = screen_with_history().await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(TaskScreenCmd::CopyEnter, &mut effects);
+    let before = screen.copy.as_ref().unwrap().state.cursor();
+    let release = Key::new_with_kind(
+      KeyCode::Char('k'),
+      KeyMods::NONE,
+      KeyEventKind::Release,
+    );
+    input(&mut screen, observer, TermEvent::Key(release));
+    assert_eq!(screen.copy.as_ref().unwrap().state.cursor(), before);
+    let press = Key::new(KeyCode::Char('k'), KeyMods::NONE);
+    input(&mut screen, observer, TermEvent::Key(press));
+    assert_ne!(screen.copy.as_ref().unwrap().state.cursor(), before);
+  }
+
+  #[tokio::test]
+  async fn wheel_in_the_alternate_screen_sends_arrows() {
+    let mut screen = screen_of(DEFAULT_SIZE, 0, 3);
+    let (observer, _rx, mut effects) = attach(&mut screen, cells(80, 24));
+    screen.process(b"\x1b[?1049h", &mut effects).await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: mouse(MouseEventKind::ScrollUp, 1, 1),
+      },
+      &mut effects,
+    );
+    let keys: Vec<KeyCode> = effects
+      .iter()
+      .filter_map(|e| match e {
+        TaskScreenEffect::Key(key) => Some(key.code),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(keys, vec![KeyCode::Up, KeyCode::Up, KeyCode::Up]);
+    // Off, the wheel scrolls nothing in the alternate screen.
+    screen.process(b"\x1b[?1007l", &mut effects).await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: mouse(MouseEventKind::ScrollUp, 1, 1),
+      },
+      &mut effects,
+    );
+    assert!(effects.is_empty());
+  }
+
+  #[tokio::test]
+  async fn synchronized_updates_hold_paints() {
+    let mut screen = screen();
+    let (_, mut rx, mut effects) = attach(&mut screen, cells(80, 24));
+    let _ = take_notifies(&mut rx);
+    screen.process(b"\x1b[?2026hhidden", &mut effects).await;
+    assert!(take_notifies(&mut rx).is_empty());
+    assert!(screen.sync_deadline().is_some());
+    screen.process(b" more\x1b[?2026l", &mut effects).await;
+    assert_eq!(take_notifies(&mut rx), ["render"]);
+    assert!(screen.sync_deadline().is_none());
+    // Left open, the timeout paints.
+    screen.process(b"\x1b[?2026hstuck", &mut effects).await;
+    screen.sync_timeout();
+    assert_eq!(take_notifies(&mut rx), ["render"]);
+  }
+
+  #[tokio::test]
+  async fn clipboard_and_focus() {
+    let mut screen = screen();
+    let (observer, mut rx, mut effects) = attach(&mut screen, cells(80, 24));
+    let _ = take_notifies(&mut rx);
+    screen.process(b"\x1b]52;c;aGk=\x07", &mut effects).await;
+    assert!(take_notifies(&mut rx).contains(&"yank"));
+    screen.process(b"\x1b[?1004h", &mut effects).await;
+    let mut effects = Vec::new();
+    screen.handle_cmd(
+      TaskScreenCmd::Input {
+        observer,
+        event: TermEvent::FocusGained,
+      },
+      &mut effects,
+    );
+    assert!(
+      matches!(&effects[..], [TaskScreenEffect::Write(seq)] if seq == b"\x1b[I")
+    );
   }
 }

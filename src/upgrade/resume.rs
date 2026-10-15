@@ -16,7 +16,7 @@ use crate::{
   config::{config::Config, hook::watch_idle},
   console::app::console_task_registration,
   dekit::{
-    attach::resume_session,
+    attach::{Attachment, resume_session},
     main::print_warnings,
     server::{
       Connections, Resumed, ServerCtx, dispatch_connection,
@@ -44,7 +44,7 @@ use crate::{
     },
     process_task::{process_task_from_snapshot, resumed_instance},
   },
-  term::Size,
+  term::{Geometry, Size},
   upgrade::{set_cloexec, snapshot as snap},
 };
 
@@ -165,10 +165,9 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
       Carried::Attach {
         hello,
         task,
-        size,
-        until_exit,
+        attach,
       } => Box::pin(resume_session(
-        ctx, reg, fd, hello, task, size, until_exit, sender, receiver,
+        ctx, reg, fd, hello, task, attach, sender, receiver,
       )),
     });
   }
@@ -269,8 +268,7 @@ enum Carried {
   Attach {
     hello: Hello,
     task: TaskId,
-    size: Size,
-    until_exit: bool,
+    attach: Attachment,
   },
 }
 
@@ -429,16 +427,24 @@ fn prepare<'a>(
         width,
         height,
         until_exit,
+        caps,
+        cell_pixels,
       } => Carried::Attach {
         hello: hello.ok_or_else(|| {
           anyhow::anyhow!("attach connection {} has no hello", conn.fd)
         })?,
         task: TaskId(*task),
-        size: Size {
-          width: *width,
-          height: *height,
+        attach: Attachment {
+          geometry: Geometry {
+            size: Size {
+              width: *width,
+              height: *height,
+            },
+            cell_pixels: *cell_pixels,
+          },
+          until_exit: *until_exit,
+          caps: *caps,
         },
-        until_exit: *until_exit,
       },
     };
     connections.push(Connection {

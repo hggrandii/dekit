@@ -1,13 +1,12 @@
 use std::{
   any::Any,
   fmt::{self, Debug},
-  ops::Deref,
-  sync::{Arc, RwLock, atomic::AtomicUsize},
+  sync::{Arc, atomic::AtomicUsize},
 };
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::term::Screen;
+pub use crate::term::ScreenHandle;
 
 use super::sub_trie::SubMode;
 use super::task::{ExitInfo, Task, TaskCmd, TaskDef, TaskId, TaskState};
@@ -262,7 +261,7 @@ pub struct TaskInfo {
   pub path: Option<TaskPath>,
   pub label: Option<String>,
   pub state: TaskState,
-  pub vt: Option<SharedVt>,
+  pub vt: Option<ScreenHandle>,
 }
 
 impl TaskInfo {
@@ -307,29 +306,6 @@ pub struct DepExplain {
   pub state: TaskState,
   pub wanted: bool,
   pub satisfied: bool,
-}
-
-#[derive(Clone)]
-pub struct SharedVt(Arc<RwLock<Screen>>);
-
-impl SharedVt {
-  pub fn new(screen: Screen) -> Self {
-    SharedVt(Arc::new(RwLock::new(screen)))
-  }
-}
-
-impl Debug for SharedVt {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_tuple("SharedVt").finish()
-  }
-}
-
-impl Deref for SharedVt {
-  type Target = Arc<RwLock<Screen>>;
-
-  fn deref(&self) -> &Self::Target {
-    &self.0
-  }
 }
 
 #[derive(Clone)]

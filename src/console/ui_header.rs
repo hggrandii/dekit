@@ -2,7 +2,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::console::theme::Theme;
 use crate::runner::{RunnerKind, RunnerSpec};
-use crate::term::{Grid, Rgb, attrs::Attrs, grid::Rect};
+use crate::term::{Grid, Rgb, grid::Rect, style::Style};
 
 /// The badge at the bar's left end. `≡` is in every monospace font and
 /// reads as "menu".
@@ -64,14 +64,14 @@ pub fn render_header(
       || info.held.is_some_and(|held| hit.contains(held.x, held.y))
   };
   let bg = block.header_bg.into();
-  let on_bg = |fg: Rgb| Attrs::default().bg(bg).fg(fg.into());
+  let on_bg = |fg: Rgb| Style::default().bg(bg).fg(fg.into());
   let text = on_bg(block.text);
   let dim = on_bg(block.dim);
   grid.fill_area(area, ' ', text);
 
   // Right side first, so the left gets whatever is left.
   let mut line = area;
-  let mut right: Vec<(String, Attrs)> = Vec::new();
+  let mut right: Vec<(String, Style)> = Vec::new();
   let mut others: Vec<&str> = info
     .client_versions
     .iter()
@@ -105,7 +105,7 @@ pub fn render_header(
   grid.draw_text(
     logo,
     LOGO,
-    Attrs::default()
+    Style::default()
       .bg(logo_bg.into())
       .fg(block.logo_fg.into())
       .set_bold(true),
@@ -125,7 +125,7 @@ pub fn render_header(
   if hovered(hit) {
     project_bg = project_bg.blend(block.text, HOVER);
   }
-  let project = Attrs::default()
+  let project = Style::default()
     .bg(project_bg.into())
     .fg(block.header_project.into())
     .set_bold(true);
@@ -145,21 +145,15 @@ mod tests {
   use crate::term::{Size, grid::Pos};
 
   fn row_text(grid: &Grid) -> String {
-    let mut out = String::new();
-    for col in 0..grid.size().width {
-      match grid.drawing_cell(Pos { col, row: 0 }) {
-        Some(cell) if cell.has_contents() => out.push_str(cell.contents()),
-        _ => out.push(' '),
-      }
+    let mut out = grid.row_text(0);
+    while out.chars().count() < grid.size().width as usize {
+      out.push(' ');
     }
     out
   }
 
   fn bg_at(grid: &Grid, col: u16) -> crate::term::Color {
-    grid
-      .drawing_cell(Pos { col, row: 0 })
-      .map(|cell| cell.attrs().bgcolor)
-      .unwrap()
+    grid.style_at(Pos { col, row: 0 }).unwrap().bg
   }
 
   fn spec(kind: RunnerKind, root: &str) -> RunnerSpec {

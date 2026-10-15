@@ -8,7 +8,7 @@ use crate::console::task_tree::{Group, Node};
 use crate::console::task_view::TaskView;
 use crate::console::theme::{TaskListTheme, Theme};
 use crate::kernel::task::{ExitInfo, TaskKind, TaskState};
-use crate::term::{Grid, Rgb, attrs::Attrs, grid::Rect};
+use crate::term::{Grid, Rgb, grid::Rect, style::Style};
 
 /// Blank cells between the border and each row.
 const PAD: u16 = 1;
@@ -40,7 +40,7 @@ pub fn render_tasks(
     } else {
       theme.block.bg
     };
-    let paint = |color: Rgb| Attrs::default().bg(bg.into()).fg(color.into());
+    let paint = |color: Rgb| Style::default().bg(bg.into()).fg(color.into());
     let (status_text, status_color) = match node {
       Node::Task(task) => task_status(task, &theme.tasks),
       Node::Group(group) => group_status(group, &theme.tasks),

@@ -4,14 +4,13 @@ use anyhow::{Context, bail};
 use tokio::io::AsyncWriteExt;
 
 use crate::protocol::{
-  ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
+  ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Msg, Request, RpcRequest,
   client_handshake, codes,
-  ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT},
+  ctl::{CopyEvent, EVENT_COPY, GeometryParams, InputDialect},
 };
 use crate::runner::{RunnerKind, RunnerSpec};
 use crate::target::Target;
 use crate::term::TermEvent;
-use crate::term::key::{Key, KeyEventKind};
 use crate::term::vt::emit;
 use crate::term_driver::TermDriver;
 
@@ -35,11 +34,26 @@ pub async fn client_main(
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) -> anyhow::Result<AttachEnd> {
-  client_handshake(&mut sender, &mut receiver).await?;
-
+  // The driver writes its probes at once; the terminal answers them
+  // before anything else it sends, so the attach can carry what it can
+  // show. The wait overlaps the socket handshake.
   let mut term_driver = TermDriver::create()?;
-  let result =
-    client_loop(&mut term_driver, target, until_exit, sender, receiver).await;
+  let (server, probed) = tokio::join!(
+    client_handshake(&mut sender, &mut receiver),
+    term_driver.probe()
+  );
+  let server = server?;
+  probed?;
+  let dialect = InputDialect::of(&server);
+  let result = client_loop(
+    &mut term_driver,
+    target,
+    until_exit,
+    dialect,
+    sender,
+    receiver,
+  )
+  .await;
   // Drop first: leaving the alternate screen restores the main screen,
   // so a foreground run's final output must be reprinted afterward to
   // survive on it.
@@ -111,15 +125,15 @@ async fn client_loop(
   term_driver: &mut TermDriver,
   target: Target,
   until_exit: bool,
+  dialect: InputDialect,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) -> anyhow::Result<LoopEnd> {
-  let size = term_driver.size()?;
   let (method, params) = RpcRequest::Attach {
     target,
-    width: size.width,
-    height: size.height,
+    geometry: GeometryParams::of(term_driver.geometry()?),
     until_exit,
+    caps: Some(*term_driver.caps()),
   }
   .to_wire();
   sender
@@ -188,16 +202,9 @@ async fn client_loop(
         None => break,
       },
       LocalEvent::TermEvent(event) => match event? {
-        Some(TermEvent::Key(Key {
-          kind: KeyEventKind::Release,
-          ..
-        })) => (),
         Some(event) => {
           sender
-            .send_ctl(CtlMsg::Event(Event {
-              name: EVENT_INPUT.to_string(),
-              params: serde_json::to_value(&event)?,
-            }))
+            .send_ctl(CtlMsg::Event(dialect.input_event(&event)))
             .await?;
         }
         _ => break,

@@ -10,9 +10,9 @@ use crate::console::{
 use crate::help::layout::{Span, wrap};
 use crate::term::{
   Grid,
-  attrs::Attrs,
   grid::Rect,
   key::{Key, KeyCode},
+  style::Style,
 };
 
 use super::modal::{Modal, ModalResult};
@@ -38,7 +38,7 @@ impl AddTaskModal {
     };
     let text = vec![Span {
       text: error.clone(),
-      attrs: Attrs::default(),
+      attrs: Style::default(),
     }];
     wrap(text, width.into(), Vec::new(), Vec::new())
       .into_iter()
@@ -87,8 +87,8 @@ impl Modal for AddTaskModal {
       .inner()
       .inner((0, 1));
     let input = inner.take_top(1);
-    let error = Attrs {
-      fgcolor: theme.tasks.failed.into(),
+    let error = Style {
+      fg: theme.tasks.failed.into(),
       ..style.text
     };
     for (row, line) in inner.rows().zip(self.error_lines(inner.width)) {
@@ -113,7 +113,7 @@ mod tests {
       },
       0,
     );
-    grid.fill_area(grid.area(), '#', Attrs::default());
+    grid.fill_area(grid.area(), '#', Style::default());
     let error = crate::parse_shell::split_argv("a && b")
       .unwrap_err()
       .to_string();

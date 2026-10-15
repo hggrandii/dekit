@@ -82,11 +82,13 @@ impl EventDecoder {
       }
       return;
     }
-    if let Seq::Csi(p) = &seq {
-      if p.prefix == 0 && p.final_ == b'~' && p.get(0, 0) == 200 {
-        self.paste = Some(String::new());
-        return;
-      }
+    if let Seq::Csi(p) = &seq
+      && p.prefix == 0
+      && p.final_ == b'~'
+      && p.get(0, 0) == 200
+    {
+      self.paste = Some(String::new());
+      return;
     }
     decode_seq(seq, f);
   }
@@ -136,7 +138,13 @@ fn decode_seq<F: FnMut(E)>(seq: Seq, f: &mut F) {
     Seq::Esc { inter, final_ } => {
       log::debug!("Unexpected escape on input: {inter:#x} {final_:#x}")
     }
-    Seq::Osc(_) | Seq::Dcs(_) => (),
+    Seq::Apc(data) => {
+      if let Some(body) = data.strip_prefix(b"G") {
+        f(E::GraphicsReply(body.to_vec()));
+      }
+    }
+    Seq::Dcs(data) => f(E::DcsReply(data.to_vec())),
+    Seq::Osc(_) => (),
   }
 }
 
@@ -156,7 +164,20 @@ fn decode_csi<F: FnMut(E)>(p: &Params, f: &mut F) {
       };
       f(E::Key(Key::new_with_kind(code, mods, kind)));
     }
-    b'c' if p.prefix == b'?' => f(E::PrimaryDeviceAttributes),
+    b'c' if p.prefix == b'?' => {
+      let params = (0..p.len()).filter_map(|i| p.get_opt(i)).collect();
+      f(E::PrimaryDeviceAttributes(params));
+    }
+    // XTWINOPS report.
+    b't' if p.prefix == 0 && p.inter == 0 => {
+      f(E::WindowReport(p.get(0, 0), p.get(1, 0), p.get(2, 0)));
+    }
+    // DECRPM.
+    b'y' if p.inter == b'$' => f(E::ModeReport {
+      dec: p.prefix == b'?',
+      mode: p.get(0, 0),
+      state: p.get(1, 0),
+    }),
     b'Z' => f(E::Key(Key::new(KeyCode::Tab, KeyMods::SHIFT))),
     b'I' => f(E::FocusGained),
     b'O' => f(E::FocusLost),
@@ -232,6 +253,12 @@ fn decode_csi<F: FnMut(E)>(p: &Params, f: &mut F) {
       let wire = p.get16(1, 0).min(255) as u8;
       let mods = keys::mask_mods(wire);
       let state = keys::mask_state(wire);
+      // The kitty event type is a colon subparam of the modifiers.
+      let kind = if p.is_sub(2) {
+        keys::event_kind(p.get16(2, 0).min(255) as u8)
+      } else {
+        KeyEventKind::Press
+      };
 
       let code = if first == 27 {
         // modifyOtherKeys
@@ -262,8 +289,11 @@ fn decode_csi<F: FnMut(E)>(p: &Params, f: &mut F) {
       f(E::Key(Key {
         code,
         mods,
-        kind: KeyEventKind::Press,
+        kind,
         state,
+        unshifted: None,
+        base: None,
+        text: None,
       }));
     }
     _ => log::debug!("Unknown CSI on input: {p:?}"),
@@ -271,9 +301,14 @@ fn decode_csi<F: FnMut(E)>(p: &Params, f: &mut F) {
 }
 
 fn decode_csi_u(p: &Params) -> Option<Key> {
+  // CSI code[:shifted[:base]] ; mods[:event] ; text[:text...] u
   let code = p.get(0, 0);
-  // The shifted key is a colon subparam of the key code.
-  let alt_code = if p.is_sub(1) { p.get_opt(1) } else { None };
+  let shifted_code = if p.is_sub(1) { p.get_opt(1) } else { None };
+  let base_code = if p.is_sub(1) && p.is_sub(2) {
+    p.get_opt(2)
+  } else {
+    None
+  };
 
   // The modifiers group starts at the first non-subparam after the code.
   let mut mods_at = 1;
@@ -286,6 +321,21 @@ fn decode_csi_u(p: &Params) -> Option<Key> {
   } else {
     1
   };
+  // The text group follows the modifiers group.
+  let mut text_at = mods_at + 1;
+  while p.is_sub(text_at) {
+    text_at += 1;
+  }
+  let mut text = String::new();
+  if text_at < p.len() {
+    let mut i = text_at;
+    while i < p.len() && (i == text_at || p.is_sub(i)) {
+      if let Some(c) = p.get_opt(i).and_then(char::from_u32) {
+        text.push(c);
+      }
+      i += 1;
+    }
+  }
 
   let mut mods = keys::mask_mods(wire);
   let kind = keys::event_kind(kind);
@@ -294,7 +344,8 @@ fn decode_csi_u(p: &Params) -> Option<Key> {
   let (mut keycode, state_from_keycode) =
     if let Some((code, state)) = keys::functional_key(code) {
       (code, state)
-    } else if let Some(c) = char::from_u32(code) {
+    } else {
+      let c = char::from_u32(code)?;
       (
         match c {
           '\x1B' => KeyCode::Esc,
@@ -305,8 +356,6 @@ fn decode_csi_u(p: &Params) -> Option<Key> {
         },
         KeyEventState::empty(),
       )
-    } else {
-      return None;
     };
 
   if let KeyCode::Modifier(modifier) = keycode {
@@ -321,23 +370,38 @@ fn decode_csi_u(p: &Params) -> Option<Key> {
     }
   }
 
-  // When the "report alternate keys" flag is enabled in the Kitty Keyboard
-  // Protocol and the terminal sends a keyboard event containing shift, the
-  // sequence will contain an additional codepoint separated by a ':'
-  // character which contains the shifted character according to the
-  // keyboard layout.
-  if mods.contains(KeyMods::SHIFT) {
-    if let Some(shifted) = alt_code.and_then(char::from_u32) {
-      keycode = KeyCode::Char(shifted);
-      mods.set(KeyMods::SHIFT, false);
-    }
+  // With "report alternate keys" a shifted key carries the character
+  // Shift makes of it: that is the key as users and keymaps know it
+  // (`<A>`, not `<S-a>`), with the unshifted key kept as its base.
+  let mut unshifted = None;
+  if mods.contains(KeyMods::SHIFT)
+    && let KeyCode::Char(plain) = keycode
+    && let Some(shifted) = shifted_code.and_then(char::from_u32)
+  {
+    keycode = KeyCode::Char(shifted);
+    mods.set(KeyMods::SHIFT, false);
+    unshifted = Some(plain);
   }
+  let base = match (base_code.and_then(char::from_u32), keycode) {
+    (Some(layout_base), KeyCode::Char(c)) if layout_base != c => {
+      Some(layout_base)
+    }
+    _ => None,
+  };
+  let text = match (&keycode, text.is_empty()) {
+    (_, true) => None,
+    (KeyCode::Char(c), false) if text == c.to_string() => None,
+    _ => Some(text),
+  };
 
   Some(Key {
     code: keycode,
     mods,
     kind,
     state: state_from_keycode | state_from_mods,
+    unshifted,
+    base,
+    text,
   })
 }
 
@@ -450,6 +514,23 @@ mod tests {
     assert_eq!(keys_of(&[b"\x1b[15~"]), vec![key("<F5>")]);
     assert_eq!(keys_of(&[b"\x1b[24;5~"]), vec![key("<C-F12>")]);
     assert_eq!(keys_of(&[b"\x1b[3~"]), vec![key("<Del>")]);
+    // Event types on tilde keys: a release is not another press.
+    assert_eq!(
+      keys_of(&[b"\x1b[3;1:3~"]),
+      vec![Key::new_with_kind(
+        KeyCode::Delete,
+        KeyMods::NONE,
+        KeyEventKind::Release
+      )]
+    );
+    assert_eq!(
+      keys_of(&[b"\x1b[5;5:2~"]),
+      vec![Key::new_with_kind(
+        KeyCode::PageUp,
+        KeyMods::CONTROL,
+        KeyEventKind::Repeat
+      )]
+    );
     assert_eq!(keys_of(&[b"\x1b[Z"]), vec![key("<S-Tab>")]);
   }
 
@@ -460,8 +541,17 @@ mod tests {
     // Release event kind.
     let released = keys_of(&[b"\x1b[97;1:3u"]);
     assert_eq!(released[0].kind, KeyEventKind::Release);
-    // Shifted char via alternate code.
-    assert_eq!(keys_of(&[b"\x1b[97:65;2u"]), vec![key("<A>")]);
+    // Shifted char via alternate code, with the unshifted key as base.
+    let shifted = keys_of(&[b"\x1b[97:65;2u"]);
+    assert_eq!(shifted[0].plain(), key("<A>"));
+    assert_eq!(shifted[0].unshifted, Some('a'));
+    // A layout key with its base, and associated text.
+    let layout = keys_of(&[b"\x1b[1092::97;5;1092u"]);
+    assert_eq!(layout[0].code, KeyCode::Char('\u{444}'));
+    assert_eq!(layout[0].base, Some('a'));
+    assert_eq!(layout[0].text, None);
+    let texted = keys_of(&[b"\x1b[97;1;98:99u"]);
+    assert_eq!(texted[0].text.as_deref(), Some("bc"));
     // Functional keys.
     assert_eq!(keys_of(&[b"\x1b[57376u"]), vec![key("<F13>")]);
     let keypad = keys_of(&[b"\x1b[57400u"]);
@@ -500,7 +590,30 @@ mod tests {
 
   #[test]
   fn special_reports() {
-    assert_eq!(decode(&[b"\x1b[?65;6c"]), vec![E::PrimaryDeviceAttributes]);
+    assert_eq!(
+      decode(&[b"\x1b[?65;6c"]),
+      vec![E::PrimaryDeviceAttributes(vec![65, 6])]
+    );
+    assert_eq!(
+      decode(&[b"\x1b[6;20;10t"]),
+      vec![E::WindowReport(6, 20, 10)]
+    );
+    assert_eq!(
+      decode(&[b"\x1b[?2026;2$y"]),
+      vec![E::ModeReport {
+        dec: true,
+        mode: 2026,
+        state: 2
+      }]
+    );
+    assert_eq!(
+      decode(&[b"\x1b_Gi=31;OK\x1b\\"]),
+      vec![E::GraphicsReply(b"i=31;OK".to_vec())]
+    );
+    assert_eq!(
+      decode(&[b"\x1bP>|kitty 0.40\x1b\\"]),
+      vec![E::DcsReply(b">|kitty 0.40".to_vec())]
+    );
     assert_eq!(decode(&[b"\x1b[I"]), vec![E::FocusGained]);
     assert_eq!(decode(&[b"\x1b[O"]), vec![E::FocusLost]);
     assert_eq!(decode(&[b"\x1b[5;10R"]), vec![E::CursorPos(9, 4)]);
@@ -616,9 +729,9 @@ mod tests {
             && !(csi_u && (c == 'i' || c == 'm')))
             // Ctrl+digit maps onto other control chars.
             || (ctrl && c.is_ascii_digit())
-            // Shift is not represented for plain chars on the legacy
-            // wire.
-            || (shift && !csi_u)
+            // Shift on a plain char is the shifted char itself on the
+            // wire, whichever encoding.
+            || shift
         }
         // Alt+Esc encodes as ESC ESC, which reads back as plain Esc.
         KeyCode::Esc => alt || (!csi_u && (ctrl || shift)),
@@ -643,7 +756,7 @@ mod tests {
         prop_assume!(!aliased(&key, csi_u));
 
         let modes = KeyEncodeModes {
-          enable_csi_u_key_encoding: csi_u,
+          kitty_flags: u8::from(csi_u),
           application_cursor_keys: false,
           newline_mode: false,
         };

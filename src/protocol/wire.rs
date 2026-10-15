@@ -5,6 +5,11 @@ use tokio_util::codec::{Decoder, Encoder};
 /// `len` covers the kind byte plus the payload.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Terminal output is sent in frames no larger than this: one paint that
+/// carries an image may exceed what a frame can.
+pub const OUT_FRAME_BYTES: usize = 1024 * 1024;
+const _: () = assert!(OUT_FRAME_BYTES <= MAX_FRAME);
+
 pub const KIND_CTL: u8 = 0;
 pub const KIND_OUT: u8 = 1;
 

@@ -177,6 +177,121 @@ pub fn event_kind(n: u8) -> KeyEventKind {
   }
 }
 
+/// The kitty functional key codepoint of a key, for keys that have one:
+/// lock keys, F13+, keypad keys (when `keypad`), media and modifier keys.
+pub fn functional_codepoint(code: KeyCode, keypad: bool) -> Option<u32> {
+  if keypad {
+    let kp = match code {
+      KeyCode::Char('0') => Some(57399),
+      KeyCode::Char('1') => Some(57400),
+      KeyCode::Char('2') => Some(57401),
+      KeyCode::Char('3') => Some(57402),
+      KeyCode::Char('4') => Some(57403),
+      KeyCode::Char('5') => Some(57404),
+      KeyCode::Char('6') => Some(57405),
+      KeyCode::Char('7') => Some(57406),
+      KeyCode::Char('8') => Some(57407),
+      KeyCode::Char('9') => Some(57408),
+      KeyCode::Char('.') => Some(57409),
+      KeyCode::Char('/') => Some(57410),
+      KeyCode::Char('*') => Some(57411),
+      KeyCode::Char('-') => Some(57412),
+      KeyCode::Char('+') => Some(57413),
+      KeyCode::Enter => Some(57414),
+      KeyCode::Char('=') => Some(57415),
+      KeyCode::Char(',') => Some(57416),
+      KeyCode::Left => Some(57417),
+      KeyCode::Right => Some(57418),
+      KeyCode::Up => Some(57419),
+      KeyCode::Down => Some(57420),
+      KeyCode::PageUp => Some(57421),
+      KeyCode::PageDown => Some(57422),
+      KeyCode::Home => Some(57423),
+      KeyCode::End => Some(57424),
+      KeyCode::Insert => Some(57425),
+      KeyCode::Delete => Some(57426),
+      KeyCode::KeypadBegin => Some(57427),
+      _ => None,
+    };
+    if kp.is_some() {
+      return kp;
+    }
+  }
+  Some(match code {
+    KeyCode::CapsLock => 57358,
+    KeyCode::ScrollLock => 57359,
+    KeyCode::NumLock => 57360,
+    KeyCode::PrintScreen => 57361,
+    KeyCode::Pause => 57362,
+    KeyCode::Menu => 57363,
+    KeyCode::KeypadBegin => 57427,
+    KeyCode::F(n) if (13..=35).contains(&n) => 57376 + u32::from(n) - 13,
+    KeyCode::Media(media) => match media {
+      MediaKeyCode::Play => 57428,
+      MediaKeyCode::Pause => 57429,
+      MediaKeyCode::PlayPause => 57430,
+      MediaKeyCode::Reverse => 57431,
+      MediaKeyCode::Stop => 57432,
+      MediaKeyCode::FastForward => 57433,
+      MediaKeyCode::Rewind => 57434,
+      MediaKeyCode::Next => 57435,
+      MediaKeyCode::Prev => 57436,
+      MediaKeyCode::Record => 57437,
+      MediaKeyCode::VolumeDown => 57438,
+      MediaKeyCode::VolumeUp => 57439,
+      MediaKeyCode::VolumeMute => 57440,
+    },
+    KeyCode::Modifier(modifier) => match modifier {
+      ModKeyCode::LeftShift => 57441,
+      ModKeyCode::LeftControl => 57442,
+      ModKeyCode::LeftAlt => 57443,
+      ModKeyCode::LeftSuper => 57444,
+      ModKeyCode::LeftHyper => 57445,
+      ModKeyCode::LeftMeta => 57446,
+      ModKeyCode::RightShift => 57447,
+      ModKeyCode::RightControl => 57448,
+      ModKeyCode::RightAlt => 57449,
+      ModKeyCode::RightSuper => 57450,
+      ModKeyCode::RightHyper => 57451,
+      ModKeyCode::RightMeta => 57452,
+    },
+    _ => return None,
+  })
+}
+
+/// The kitty modifier value, lock bits included when asked: the wire
+/// value is this plus one.
+pub fn kitty_mods(mods: KeyMods, state: KeyEventState, locks: bool) -> u32 {
+  let mut mask = 0u32;
+  if mods.contains(KeyMods::SHIFT) {
+    mask |= 1;
+  }
+  if mods.contains(KeyMods::ALT) {
+    mask |= 2;
+  }
+  if mods.contains(KeyMods::CONTROL) {
+    mask |= 4;
+  }
+  if mods.contains(KeyMods::SUPER) {
+    mask |= 8;
+  }
+  if mods.contains(KeyMods::HYPER) {
+    mask |= 16;
+  }
+  if mods.contains(KeyMods::META) {
+    mask |= 32;
+  }
+  if locks {
+    if state.contains(KeyEventState::CAPS_LOCK) {
+      mask |= 64;
+    }
+    if state.contains(KeyEventState::NUM_LOCK) {
+      mask |= 128;
+    }
+  }
+  mask
+}
+
 /// Kitty keyboard protocol functional key codepoints.
 pub fn functional_key(codepoint: u32) -> Option<(KeyCode, KeyEventState)> {
   let keypad = match codepoint {

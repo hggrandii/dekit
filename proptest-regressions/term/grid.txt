@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 18bf4959ed03fac5fea8c5bbf64fdc2e6d3f6f5840c81473eb64372a0c07ad34 # shrinks to lines = ["a测😀a a测a a😀 aaa😀a😀aa😀😀 a  😀a 😀 a  测"], narrow = 9, height = 2
+cc 8b6c64c5159f8e3dab915a7c4a44e06ad9278b1e2462b923c3abde44f2f30307 # shrinks to lines = ["aa测  aa😀测a😀 a测😀😀测 测测测😀a a测测aa 😀a 测😀😀 测aa a测a测aa a测😀 😀a😀a😀测aa aaaa😀😀测a😀😀😀"], narrow = 25, height = 2
+cc f9f4d0bd502944bf8d16b06951b37ff53b9a2106b575f4bb326a5267c10fec97 # shrinks to lines = [" 测测测 a😀测 测aaa测测测a  aaaaaa测 aaa a 测 😀😀😀a 测   测", "", "a😀 aa  😀aa a😀😀😀a测a😀测 😀测 a测😀测aa测测测测a测a 😀😀    测测a测😀 测😀a😀a😀a aaa😀a 测a测😀   😀测a😀 测 😀😀测 "], narrow = 3, height = 6
+cc dea9528072f0ea192df2dc3350716dc9a680aed94a6bca07fe0739c8e5c116e4 # shrinks to lines = ["测"], narrow = 1, height = 2

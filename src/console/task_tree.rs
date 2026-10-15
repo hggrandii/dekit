@@ -386,10 +386,9 @@ fn under<'a>(group: &str, path: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::kernel::kernel_message::SharedVt;
+  use crate::kernel::kernel_message::ScreenHandle;
   use crate::kernel::path_trie::PathTrie;
   use crate::kernel::task::ExitInfo;
-  use crate::term::Screen;
 
   fn task(id: usize, path: &str) -> TaskView {
     TaskView {
@@ -398,7 +397,9 @@ mod tests {
       path: Arc::new(TaskPath::new(path).unwrap()),
       kind: crate::kernel::task::TaskKind::Service,
       status: TaskState::Idle,
-      vt: SharedVt::new(Screen::new(crate::term::Size::default(), 0)),
+      vt: ScreenHandle::new(crate::term::Frame::empty(
+        crate::term::Size::default(),
+      )),
       present: None,
     }
   }

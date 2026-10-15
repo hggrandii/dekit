@@ -121,7 +121,7 @@ impl Modal for QuitModal {
     let inner = style.draw(grid, area).title(" Quit ", style.title).inner();
     for row in self.list.rows(inner) {
       let item = &ITEMS[row.index];
-      let mut style = theme.block.modal_row(style, row.selected);
+      let style = theme.block.modal_row(style, row.selected);
       if row.selected {
         grid.fill_area(row.area, ' ', style.text);
       }

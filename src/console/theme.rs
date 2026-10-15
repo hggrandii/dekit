@@ -1,7 +1,8 @@
 use crate::term::{
   Grid, Palette, Rgb,
-  attrs::Attrs,
-  grid::{Block, BorderType, Rect},
+  draw::{Block, BorderType},
+  grid::Rect,
+  style::Style,
 };
 
 /// The console paints every color itself, so it reads the same on light and
@@ -176,12 +177,12 @@ impl Theme {
 /// The attrs of one drawn block, resolved from the theme.
 #[derive(Clone, Copy)]
 pub struct BlockStyle {
-  pub border: Attrs,
-  pub title: Attrs,
-  pub text: Attrs,
-  pub dim: Attrs,
-  pub key: Attrs,
-  pub alert: Attrs,
+  pub border: Style,
+  pub title: Style,
+  pub text: Style,
+  pub dim: Style,
+  pub key: Style,
+  pub alert: Style,
 }
 
 impl BlockTheme {
@@ -205,7 +206,7 @@ impl BlockTheme {
   }
 
   fn style(&self, bg: Rgb, focused: bool) -> BlockStyle {
-    let on_bg = |fg: Rgb| Attrs::default().bg(bg.into()).fg(fg.into());
+    let on_bg = |fg: Rgb| Style::default().bg(bg.into()).fg(fg.into());
     let (border, title) = if focused {
       (self.border_focused, self.title_focused)
     } else {
@@ -217,7 +218,7 @@ impl BlockTheme {
       text: on_bg(self.text),
       dim: on_bg(self.dim),
       key: on_bg(self.key),
-      alert: Attrs::default()
+      alert: Style::default()
         .bg(self.alert_bg.into())
         .fg(self.alert.into())
         .set_bold(true),
@@ -228,8 +229,8 @@ impl BlockTheme {
 impl BlockStyle {
   /// The same attrs on another background: a list row that is selected.
   pub fn on_bg(self, bg: Rgb) -> BlockStyle {
-    let on_bg = |attrs: Attrs| Attrs {
-      bgcolor: bg.into(),
+    let on_bg = |attrs: Style| Style {
+      bg: bg.into(),
       ..attrs
     };
     BlockStyle {

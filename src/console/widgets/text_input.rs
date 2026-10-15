@@ -4,9 +4,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::theme::BlockStyle;
 use crate::term::{
   Grid,
-  attrs::Attrs,
   grid::{Pos, Rect},
   key::{Key, KeyCode, KeyMods},
+  style::Style,
 };
 
 /// A prompt, the input, and a `selected/total` counter at the right;
@@ -32,7 +32,7 @@ pub fn render_text_input(
   input: &Input,
   area: Rect,
   grid: &mut Grid,
-  attrs: Attrs,
+  attrs: Style,
 ) -> Pos {
   let value = input.value();
 

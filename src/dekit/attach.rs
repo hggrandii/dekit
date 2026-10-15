@@ -12,22 +12,49 @@ use crate::{
   kernel::{
     copy_mode::CopyMove,
     kernel_message::{
-      KernelCommand, KernelQuery, KernelQueryResponse, SharedVt, TaskContext,
-      TaskSelector,
+      KernelCommand, KernelQuery, KernelQueryResponse, ScreenHandle,
+      TaskContext, TaskSelector,
     },
     task::TaskId,
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
     Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg,
-    ScreenCommand, codes,
-    ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT, EVENT_SCREEN, Hello},
+    ScreenCommand, TermCaps, codes,
+    ctl::{
+      CopyEvent, EVENT_COPY, EVENT_SCREEN, Hello, input_of, is_input_event,
+    },
     ok_result, screen,
   },
   target::Target,
-  term::{ScreenDiffer, Size, TermEvent, Winsize, reveal, vt::emit},
+  term::{Frame, Geometry, Painter, TermEvent, reveal, vt::emit},
   upgrade::snapshot as snap,
 };
+
+/// What an attach request asked for, kept for the session's life: the
+/// geometry follows the client's resizes, and all of it goes into the
+/// snapshot when the session is carried across an upgrade.
+pub struct Attachment {
+  pub geometry: Geometry,
+  /// End the session when the task's execution finishes.
+  pub until_exit: bool,
+  /// The client's terminal, as it said; `None` from a client that did
+  /// not say, which is painted as a plain true-color terminal.
+  pub caps: Option<TermCaps>,
+}
+
+impl Attachment {
+  fn snapshot(&self, task: TaskId) -> snap::ConnectionKind {
+    snap::ConnectionKind::Attach {
+      task: task.0,
+      width: self.geometry.size.width,
+      height: self.geometry.size.height,
+      until_exit: self.until_exit,
+      caps: self.caps,
+      cell_pixels: self.geometry.cell_pixels,
+    }
+  }
+}
 
 pub async fn attach_session(
   ctx: &Arc<ServerCtx>,
@@ -36,8 +63,7 @@ pub async fn attach_session(
   hello: &Hello,
   request_id: u64,
   target: Target,
-  size: Size,
-  until_exit: bool,
+  attach: Attachment,
   mut sender: ConnSender,
   receiver: ConnReceiver,
 ) {
@@ -65,7 +91,7 @@ pub async fn attach_session(
     return;
   }
   run_attached(
-    ctx, reg, fd, hello, task.id, vt, size, until_exit, false, sender, receiver,
+    ctx, reg, fd, hello, task.id, vt, attach, false, sender, receiver,
   )
   .await;
 }
@@ -79,8 +105,7 @@ pub async fn resume_session(
   fd: Option<i32>,
   hello: Hello,
   task: TaskId,
-  size: Size,
-  until_exit: bool,
+  attach: Attachment,
   mut sender: ConnSender,
   receiver: ConnReceiver,
 ) {
@@ -99,15 +124,8 @@ pub async fn resume_session(
     }
     return;
   };
-  // The client's terminal still has whatever state the old image's
-  // painting left.
-  let mut reset = Vec::new();
-  ScreenDiffer::reset(&mut reset);
-  if sender.queue_out(reset.into()).is_err() {
-    return;
-  }
   run_attached(
-    &ctx, reg, fd, &hello, task, vt, size, until_exit, true, sender, receiver,
+    &ctx, reg, fd, &hello, task, vt, attach, true, sender, receiver,
   )
   .await;
 }
@@ -118,33 +136,37 @@ async fn run_attached(
   fd: Option<i32>,
   hello: &Hello,
   task: TaskId,
-  vt: SharedVt,
-  size: Size,
-  until_exit: bool,
+  vt: ScreenHandle,
+  attach: Attachment,
   resumed: bool,
   mut sender: ConnSender,
   mut receiver: ConnReceiver,
 ) {
   let pc = &ctx.pc;
+  let caps = attach.caps.unwrap_or_default();
+  if resumed {
+    // The client's terminal still has whatever state the old image's
+    // painting left.
+    let mut reset = Vec::new();
+    Painter::reset(&mut reset, &caps);
+    if sender.queue_out(reset.into()).is_err() {
+      return;
+    }
+  }
   let observer = ObserverId::new();
   let (sink, notifies) = unbounded_channel();
   pc.send_msg(
     task,
     TaskScreenCmd::Attach {
       observer,
-      size: Winsize {
-        x: size.width,
-        y: size.height,
-        x_px: 0,
-        y_px: 0,
-      },
+      geometry: attach.geometry,
       sink,
       client_version: Some(hello.version.clone()),
     },
   );
   let mut until = None;
   let mut ended = false;
-  if until_exit {
+  if attach.until_exit {
     // The watch is registered before the state query and both go
     // through the one kernel queue, so an exit is never missed:
     // either the query already sees it or the watch reports it.
@@ -153,12 +175,8 @@ async fn run_attached(
       .await
       .is_some_and(|state| state.is_active());
   }
-  let freeze = FreezeInfo {
-    fd,
-    hello,
-    size,
-    until_exit,
-  };
+  let freeze = FreezeInfo { fd, hello, attach };
+  let mut painter = Painter::new(caps);
   let end = session(
     pc,
     task,
@@ -172,10 +190,17 @@ async fn run_attached(
     &mut receiver,
     &mut reg.ctl,
     freeze,
+    &mut painter,
   )
   .await;
   // Whatever ended the session, the screen must not keep our geometry.
   pc.send_msg(task, TaskScreenCmd::Detach { observer });
+  // Images placed on the client's terminal go with the session.
+  let mut cleanup = Vec::new();
+  painter.cleanup(&mut cleanup);
+  if !cleanup.is_empty() {
+    let _ = sender.queue_out(cleanup.into());
+  }
   let bye = match end {
     SessionEnd::TaskExited => {
       // Capture the final state and screen before reaping the task.
@@ -223,9 +248,10 @@ enum Reveal {
   Settling {
     deadline: tokio::time::Instant,
   },
-  /// Frames still to write, one per `FRAME_INTERVAL`.
+  /// Frames still to write, one per `FRAME_INTERVAL`, painting `shown`.
   Sweeping {
     frames: VecDeque<Vec<u8>>,
+    shown: Arc<Frame>,
   },
 }
 
@@ -233,15 +259,13 @@ enum Reveal {
 struct FreezeInfo<'a> {
   fd: Option<i32>,
   hello: &'a Hello,
-  size: Size,
-  until_exit: bool,
+  attach: Attachment,
 }
 
 /// The task's final screen as ANSI text, trailing blank space trimmed,
 /// or `None` if it is empty.
-fn final_screen_text(vt: &SharedVt) -> Option<String> {
-  let screen = vt.read().ok()?;
-  let text = crate::term::ansi::render_screen_ansi(&screen);
+fn final_screen_text(vt: &ScreenHandle) -> Option<String> {
+  let text = crate::term::ansi::render_frame_ansi(&vt.load());
   let trimmed = text.trim_end_matches(['\n', '\r', ' ']);
   if trimmed.is_empty() {
     None
@@ -275,7 +299,7 @@ async fn session(
   pc: &TaskContext,
   task: TaskId,
   observer: ObserverId,
-  vt: &SharedVt,
+  vt: &ScreenHandle,
   mut notifies: UnboundedReceiver<ScreenNotify>,
   mut until: Option<UnboundedReceiver<bool>>,
   mut ended: bool,
@@ -284,10 +308,10 @@ async fn session(
   receiver: &mut ConnReceiver,
   ctl: &mut UnboundedReceiver<ConnCtl>,
   mut freeze: FreezeInfo<'_>,
+  painter: &mut Painter,
 ) -> SessionEnd {
-  let mut differ = ScreenDiffer::new();
   // Copy-mode surface, painted instead of `vt` while set.
-  let mut present: Option<SharedVt> = None;
+  let mut present: Option<ScreenHandle> = None;
   let mut title = String::new();
   let mut batch = Vec::new();
   // Frozen for an upgrade: nothing read or painted until thawed.
@@ -313,7 +337,7 @@ async fn session(
       // vt, so painting now shows the complete final screen even if
       // render notifies are still queued.
       let mut out = Vec::new();
-      render(&mut differ, vt, &present, &mut title, &mut out);
+      render(painter, vt, &present, &mut title, &mut out);
       if !out.is_empty() {
         let _ = sender.queue_out(out.into());
       }
@@ -329,12 +353,7 @@ async fn session(
       msg = ctl.recv() => match msg {
         Some(ConnCtl::Freeze(reply)) => {
           frozen = true;
-          let kind = snap::ConnectionKind::Attach {
-            task: task.0,
-            width: freeze.size.width,
-            height: freeze.size.height,
-            until_exit: freeze.until_exit,
-          };
+          let kind = freeze.attach.snapshot(task);
           let _ = reply.send(carried(
             freeze.fd,
             Some(freeze.hello),
@@ -356,10 +375,12 @@ async fn session(
         let mut out = Vec::new();
         for notify in batch.drain(..) {
           match notify {
-            ScreenNotify::Attached | ScreenNotify::Render => paint = true,
+            ScreenNotify::Attached | ScreenNotify::Render { .. } => {
+              paint = true
+            }
             ScreenNotify::Bell => out.push(0x07),
-            ScreenNotify::CopyPresent { vt, .. } => {
-              present = vt;
+            ScreenNotify::CopyPresent { handle, .. } => {
+              present = handle;
               paint = true;
             }
             // The client owns the user's clipboard: it knows which
@@ -381,7 +402,7 @@ async fn session(
         }
         match &reveal {
           Reveal::Off if paint => {
-            render(&mut differ, vt, &present, &mut title, &mut out);
+            render(painter, vt, &present, &mut title, &mut out);
           }
           Reveal::Settling { deadline, .. } if paint => {
             let quiet = tokio::time::Instant::now() + REVEAL_SETTLE;
@@ -396,15 +417,14 @@ async fn session(
         }
       }
       _ = reveal_timer.as_mut(), if !matches!(reveal, Reveal::Off) && !frozen && sender.pending().is_empty() => {
-        let mut frames = match std::mem::replace(&mut reveal, Reveal::Off) {
+        let (mut frames, shown) = match std::mem::replace(&mut reveal, Reveal::Off) {
           Reveal::Off => unreachable!("guarded"),
           Reveal::Settling { .. } => {
-            match present.as_ref().unwrap_or(vt).read() {
-              Ok(screen) => VecDeque::from(reveal::frames(&*screen)),
-              Err(_) => VecDeque::new(),
-            }
+            let shown = present.as_ref().unwrap_or(vt).load();
+            let links = painter.caps().hyperlinks;
+            (VecDeque::from(reveal::frames(&shown, links)), shown)
           }
-          Reveal::Sweeping { frames } => frames,
+          Reveal::Sweeping { frames, shown } => (frames, shown),
         };
         let mut out = Vec::new();
         let swept = match frames.pop_front() {
@@ -415,14 +435,14 @@ async fn session(
           None => false,
         };
         if frames.is_empty() {
-          // Also places the cursor the sweep hid and resets what it
-          // left.
+          // The sweep painted `shown` whole with the cursor hidden; this
+          // paint places the cursor and brings in what changed since.
           if swept {
-            differ.cursor_hidden();
+            painter.assume(Some(shown));
           }
-          render(&mut differ, vt, &present, &mut title, &mut out);
+          render(painter, vt, &present, &mut title, &mut out);
         } else {
-          reveal = Reveal::Sweeping { frames };
+          reveal = Reveal::Sweeping { frames, shown };
           reveal_timer
             .as_mut()
             .reset(tokio::time::Instant::now() + reveal::FRAME_INTERVAL);
@@ -444,16 +464,16 @@ async fn session(
         None => return SessionEnd::Closed,
       },
       msg = receiver.recv(), if !frozen => match msg {
-        Some(Ok(Msg::Ctl(CtlMsg::Event(event)))) if event.name == EVENT_INPUT => {
-          match serde_json::from_value::<TermEvent>(event.params) {
+        Some(Ok(Msg::Ctl(CtlMsg::Event(event)))) if is_input_event(&event.name) => {
+          match input_of(event) {
             Ok(event) => {
-              if let TermEvent::Resize(width, height) = event {
-                freeze.size = Size { width, height };
+              if let TermEvent::Resize(geometry) = &event {
+                freeze.attach.geometry = *geometry;
                 // The frames were cut for the old size; the paint the
                 // resize brings repaints everything instead.
                 if matches!(reveal, Reveal::Sweeping { .. }) {
                   reveal = Reveal::Off;
-                  differ.cursor_hidden();
+                  painter.assume(None);
                 }
               }
               pc.send_msg(task, TaskScreenCmd::Input { observer, event });
@@ -479,21 +499,22 @@ async fn session(
 }
 
 fn render(
-  differ: &mut ScreenDiffer,
-  vt: &SharedVt,
-  present: &Option<SharedVt>,
+  painter: &mut Painter,
+  vt: &ScreenHandle,
+  present: &Option<ScreenHandle>,
   title: &mut String,
   out: &mut Vec<u8>,
 ) {
-  if let Ok(screen) = vt.read()
-    && screen.title() != *title
-  {
-    *title = screen.title().to_string();
+  let live = vt.load();
+  if live.title.as_ref() != title.as_str() {
+    *title = live.title.to_string();
     emit::osc_title(out, title);
   }
-  if let Ok(screen) = present.as_ref().unwrap_or(vt).read() {
-    differ.diff(out, &*screen);
-  }
+  let frame = match present {
+    Some(present) => present.load(),
+    None => live,
+  };
+  painter.paint(out, &frame);
 }
 
 fn screen_cmd(command: ScreenCommand) -> TaskScreenCmd {
@@ -540,11 +561,13 @@ mod tests {
     },
     protocol::{
       Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request,
-      RpcRequest, client_handshake, codes,
-      ctl::{CopyEvent, EVENT_COPY, EVENT_INPUT},
+      RpcRequest, codes,
+      ctl::{
+        CopyEvent, EVENT_COPY, GeometryParams, Hello, InputDialect, local_hello,
+      },
     },
     term::{
-      TermEvent,
+      Geometry, TermEvent,
       key::{Key, KeyCode, KeyMods},
     },
   };
@@ -566,10 +589,9 @@ mod tests {
   async fn press(sender: &mut ConnSender, c: char) {
     let key = Key::new(KeyCode::Char(c), KeyMods::NONE);
     sender
-      .send_ctl(CtlMsg::Event(Event {
-        name: EVENT_INPUT.to_string(),
-        params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
-      }))
+      .send_ctl(CtlMsg::Event(
+        InputDialect::Named.input_event(&TermEvent::Key(key)),
+      ))
       .await
       .unwrap();
   }
@@ -606,13 +628,15 @@ mod tests {
     until_exit: bool,
   ) -> (ConnSender, ConnReceiver, tokio::task::JoinHandle<()>) {
     let ctx = ServerCtx::local(pc.clone(), config.clone());
-    attach_through(&ctx, target, until_exit, 64 * 1024, None).await
+    attach_through(&ctx, local_hello(), target, until_exit, 64 * 1024, None)
+      .await
   }
 
   /// `attach` over a pipe of `buffer` bytes, with `fd` standing in for
-  /// the socket fd.
+  /// the socket fd, from a client that says `hello` of itself.
   async fn attach_through(
     ctx: &Arc<ServerCtx>,
+    hello: Hello,
     target: &str,
     until_exit: bool,
     buffer: usize,
@@ -631,12 +655,16 @@ mod tests {
     ));
     let mut sender = ConnSender::new(client_write);
     let mut receiver = ConnReceiver::new(client_read);
-    client_handshake(&mut sender, &mut receiver).await.unwrap();
+    sender.send_ctl(CtlMsg::Hello(hello)).await.unwrap();
+    assert!(matches!(
+      receiver.recv_ctl().await.unwrap(),
+      CtlMsg::Hello(_)
+    ));
     let (method, params) = RpcRequest::Attach {
       target: target.parse().unwrap(),
-      width: 80,
-      height: 24,
+      geometry: GeometryParams::of(Geometry::cells(80, 24)),
       until_exit,
+      caps: None,
     }
     .to_wire();
     sender
@@ -717,6 +745,31 @@ mod tests {
     .unwrap();
     assert_eq!(bye.as_deref(), Some(codes::TASK_EXITED));
 
+    finish(pc, sender, receiver, session, kernel_handle).await;
+  }
+
+  #[tokio::test]
+  async fn clients_without_atch2_are_served_the_first_dialect() {
+    let config = Arc::new(Config::make_default());
+    let (pc, _, kernel_handle) = console_kernel(&config);
+    let ctx = ServerCtx::local(pc.clone(), config.clone());
+    // A client from before the feature.
+    let hello = Hello {
+      features: vec![],
+      ..local_hello()
+    };
+    let (mut sender, mut receiver, session) =
+      attach_through(&ctx, hello, "@dekit/console", false, 64 * 1024, None)
+        .await;
+    assert!(next_out(&mut receiver).await.is_some());
+    // Its resizes come in the first dialect and still work.
+    sender
+      .send_ctl(CtlMsg::Event(
+        InputDialect::Input.input_event(&TermEvent::resize(100, 30)),
+      ))
+      .await
+      .unwrap();
+    assert!(wait_for(&mut receiver, b"Tasks").await);
     finish(pc, sender, receiver, session, kernel_handle).await;
   }
 
@@ -827,10 +880,9 @@ mod tests {
 
   async fn press_key(sender: &mut ConnSender, key: Key) {
     sender
-      .send_ctl(CtlMsg::Event(Event {
-        name: EVENT_INPUT.to_string(),
-        params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
-      }))
+      .send_ctl(CtlMsg::Event(
+        InputDialect::Named.input_event(&TermEvent::Key(key)),
+      ))
       .await
       .unwrap();
   }
@@ -896,8 +948,15 @@ mod tests {
     let (pc, _, kernel_handle) = console_kernel(&config);
     let ctx = ServerCtx::local(pc.clone(), config.clone());
     // A pipe far smaller than a paint of the console.
-    let (_sender, _receiver, session) =
-      attach_through(&ctx, "@dekit/console", false, 256, Some(7)).await;
+    let (_sender, _receiver, session) = attach_through(
+      &ctx,
+      local_hello(),
+      "@dekit/console",
+      false,
+      256,
+      Some(7),
+    )
+    .await;
     // From here on the client reads nothing. Once the paint is stuck in
     // the pipe, the freeze still comes back, carrying the rest.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -947,15 +1006,15 @@ mod tests {
       None,
       crate::protocol::ctl::local_hello(),
       console_id,
-      crate::term::Size {
-        width: 80,
-        height: 24,
+      super::Attachment {
+        geometry: Geometry::cells(80, 24),
+        until_exit: false,
+        caps: None,
       },
-      false,
       ConnSender::new(server_write),
       ConnReceiver::new(server_read),
     ));
-    let sender = ConnSender::new(client_write);
+    let mut sender = ConnSender::new(client_write);
     let mut receiver = ConnReceiver::new(client_read);
 
     let first = timeout(Duration::from_secs(2), next_out(&mut receiver))
@@ -972,6 +1031,15 @@ mod tests {
     // this waits well past it.
     assert!(wait_for(&mut receiver, b"\x1b[?25l").await);
     assert!(wait_for(&mut receiver, b"48;2;").await);
+    // The sweep paints cell by cell as the band passes; a resize, during
+    // or after it, brings the next whole paint, which the painter must
+    // be ready for.
+    sender
+      .send_ctl(CtlMsg::Event(
+        InputDialect::Input.input_event(&TermEvent::resize(81, 24)),
+      ))
+      .await
+      .unwrap();
     assert!(
       wait_for_within(&mut receiver, b"Tasks", Duration::from_secs(10)).await
     );

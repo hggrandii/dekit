@@ -33,7 +33,7 @@ use crate::{
   },
   kernel::{
     copy_mode::CopyMove as KernelCopyMove,
-    kernel_message::{KernelCommand, SharedVt, TaskContext, TaskRegistration},
+    kernel_message::{KernelCommand, TaskContext, TaskRegistration},
     sub_trie::SubMode,
     task::{
       ChannelTask, ExitInfo, TaskCmd, TaskDef, TaskId, TaskKind,
@@ -48,11 +48,11 @@ use crate::{
   },
   target::Target,
   term::{
-    CursorStyle, Grid, Screen, Size, TermEvent, Winsize,
-    attrs::Attrs,
-    grid::{Pos, Rect},
+    CursorStyle, Geometry, Grid, Screen, ScreenHandle, TermEvent,
+    grid::Rect,
     key::{Key, KeyEventKind},
     mouse::{MouseButton, MouseEventKind},
+    style::Style,
   },
 };
 
@@ -75,26 +75,18 @@ fn kernel_scroll_unit(unit: ScrollUnit) -> KernelScrollUnit {
   }
 }
 
-fn winsize(size: Size) -> Winsize {
-  Winsize {
-    x: size.width,
-    y: size.height,
-    x_px: 0,
-    y_px: 0,
-  }
-}
-
 pub fn console_task_registration(
   task_id: TaskId,
   def: TaskDef,
   config: Arc<Config>,
   keymap: Keymap,
 ) -> TaskRegistration {
-  let vt = SharedVt::new(Screen::new(DEFAULT_SIZE, 0));
+  let screen = Screen::new(DEFAULT_SIZE, 0);
+  let handle = ScreenHandle::new(screen.frame());
   TaskRegistration {
     task_id,
     def: TaskDef {
-      vt: Some(vt.clone()),
+      vt: Some(handle.clone()),
       ..def
     },
     factory: Box::new(move |pc| {
@@ -106,7 +98,7 @@ pub fn console_task_registration(
         SubMode::Subtree,
       );
       let (tx, rx) = unbounded_channel();
-      tokio::spawn(App::new(config, keymap, rx, pc, vt).run());
+      tokio::spawn(App::new(config, keymap, rx, pc, screen, handle).run());
       Box::new(ChannelTask::new(tx))
     }),
   }
@@ -124,7 +116,6 @@ pub struct App {
   receiver: UnboundedReceiver<TaskCmd>,
   pc: TaskContext,
 
-  vt: SharedVt,
   screen: TaskScreen,
   effects: Vec<TaskScreenEffect>,
 
@@ -135,6 +126,8 @@ pub struct App {
   notifies: UnboundedReceiver<ScreenNotify>,
 
   stop: bool,
+  /// Something the picture depends on changed since the last render.
+  dirty: bool,
 }
 
 impl App {
@@ -143,7 +136,8 @@ impl App {
     keymap: Keymap,
     receiver: UnboundedReceiver<TaskCmd>,
     pc: TaskContext,
-    vt: SharedVt,
+    screen: Screen,
+    handle: ScreenHandle,
   ) -> Self {
     let (sink, notifies) = unbounded_channel();
     App {
@@ -160,31 +154,31 @@ impl App {
       theme: Theme::dark(),
       modal: None,
       receiver,
-      screen: TaskScreen::new(pc.task_id, vt.clone(), 1),
+      screen: TaskScreen::new(pc.task_id, screen, handle, 1),
       pc,
-      vt,
       effects: Vec::new(),
       observer: ObserverId::new(),
       sink,
       notifies,
       stop: false,
+      dirty: true,
     }
   }
 
   async fn run(mut self) {
-    let mut term_size = self.layout().term_area().size();
+    let mut geometry = self.task_geometry();
     let mut cmds = Vec::new();
     let mut notifies = Vec::new();
     while !self.stop {
-      let size = self.layout().term_area().size();
-      if size != term_size {
-        term_size = size;
+      let now = self.task_geometry();
+      if now != geometry {
+        geometry = now;
         for task in self.state.tasks.iter() {
           self.pc.send_msg(
             task.id,
             TaskScreenCmd::Input {
               observer: self.observer,
-              event: TermEvent::Resize(size.width, size.height),
+              event: TermEvent::Resize(now),
             },
           );
         }
@@ -197,6 +191,7 @@ impl App {
             break;
           }
           for cmd in cmds.drain(..) {
+            self.dirty = true;
             self.handle_task_cmd(cmd);
           }
         }
@@ -207,7 +202,8 @@ impl App {
         }
       }
 
-      if self.screen.has_observers() {
+      if self.dirty && self.screen.has_observers() {
+        self.dirty = false;
         self.render();
       }
     }
@@ -220,45 +216,41 @@ impl App {
 
   fn render(&mut self) {
     let layout = self.layout();
-    let Ok(mut vt) = self.vt.write() else {
-      return;
-    };
+    let client_versions: Vec<String> =
+      self.screen.client_versions().map(String::from).collect();
+    let theme = &self.theme;
+    let vt = self.screen.screen_mut();
     let grid = vt.grid_mut();
-    grid.erase_all(
-      Attrs::default()
-        .bg(self.theme.block.bg.into())
-        .fg(self.theme.block.text.into()),
-    );
+    let bg = Style::default()
+      .bg(theme.block.bg.into())
+      .fg(theme.block.text.into());
+    let bg = grid.intern_style(bg);
+    grid.erase_all(bg);
     grid.cursor_pos = None;
     grid.cursor_style = CursorStyle::Default;
 
-    self.state.header = render_header(
+    let header = render_header(
       layout.header,
       grid,
       &HeaderInfo {
         runner: self.config.runner.as_ref(),
         version: env!("CARGO_PKG_VERSION"),
-        client_versions: self.screen.client_versions().collect(),
+        client_versions: client_versions.iter().map(String::as_str).collect(),
         hover: self.state.hover,
         held: self.modal.as_ref().and_then(|modal| modal.unshaded()),
       },
-      &self.theme,
+      theme,
     );
-    render_tasks(
-      layout.sidebar,
-      grid,
-      &mut self.state,
-      &self.config,
-      &self.theme,
-    );
-    render_term(layout.term, grid, &self.state, &self.theme);
-    render_keymap(layout.keymap, grid, &self.state, &self.keymap, &self.theme);
-    render_zoom_tip(layout.zoom_banner, grid, &self.keymap, &self.theme);
+    self.state.header = header;
+    render_tasks(layout.sidebar, grid, &mut self.state, &self.config, theme);
+    render_term(layout.term, grid, &self.state, theme);
+    render_keymap(layout.keymap, grid, &self.state, &self.keymap, theme);
+    render_zoom_tip(layout.zoom_banner, grid, &self.keymap, theme);
     if let Some(modal) = &mut self.modal {
-      shade(grid, &self.theme.block, modal.unshaded());
+      shade(grid, &theme.block, modal.unshaded());
       grid.cursor_pos = None;
       grid.cursor_style = CursorStyle::Default;
-      modal.render(grid, &self.keymap, &self.theme);
+      modal.render(grid, &self.keymap, theme);
     }
 
     match grid.cursor_pos {
@@ -268,7 +260,6 @@ impl App {
       }
       None => vt.set_hide_cursor(true),
     }
-    drop(vt);
     let attached = self.screen.has_observers();
     self.screen.rendered(&mut self.effects);
     self.apply_screen(attached);
@@ -276,7 +267,7 @@ impl App {
 
   /// The whole screen.
   fn frame(&self) -> Rect {
-    let size = self.vt.read().map(|vt| vt.size()).unwrap_or(DEFAULT_SIZE);
+    let size = self.screen.size();
     Rect::new(0, 0, size.width, size.height)
   }
 
@@ -297,7 +288,7 @@ impl App {
     after: Option<TaskId>,
     kind: TaskKind,
     status: TaskState,
-    vt: Option<SharedVt>,
+    vt: Option<ScreenHandle>,
   ) {
     // Console tasks always have a path.
     let (Some(vt), Some(path)) = (vt, path) else {
@@ -325,11 +316,21 @@ impl App {
       id,
       TaskScreenCmd::Attach {
         observer: self.observer,
-        size: winsize(self.layout().term_area().size()),
+        geometry: self.task_geometry(),
         sink: self.sink.clone(),
         client_version: None,
       },
     );
+  }
+
+  /// What the task screens the console shows are told about their size:
+  /// the terminal pane in cells, and the cells' size as the console's
+  /// own clients report it.
+  fn task_geometry(&self) -> Geometry {
+    Geometry {
+      size: self.layout().term_area().size(),
+      cell_pixels: self.screen.reported_cell_pixels(),
+    }
   }
 
   fn observe_all(&self) {
@@ -584,9 +585,8 @@ impl App {
       }
       return;
     }
-    let key = Key::new(key.code, key.mods);
     let group = self.state.keymap_group();
-    if let Some(action) = self.keymap.action(group, &key) {
+    if let Some(action) = self.keymap.action(group, &key.plain()) {
       self.handle_action(Some(observer), action.clone());
     } else if group == KeymapGroup::Term {
       // Unbound keys go to the process; in copy mode the keymap is the
@@ -859,14 +859,19 @@ impl App {
 
   fn handle_screen_notify(&mut self, notify: ScreenNotify) {
     match notify {
-      ScreenNotify::Attached
-      | ScreenNotify::Render
-      | ScreenNotify::Bell
+      // Only the shown task's screen is part of the picture.
+      ScreenNotify::Render { screen } => {
+        if self.shown_task() == Some(screen) {
+          self.dirty = true;
+        }
+      }
+      ScreenNotify::Attached => self.dirty = true,
       // Addressed to attach sessions, never to a screen's observer.
-      | ScreenNotify::Switch { .. } => (),
-      ScreenNotify::CopyPresent { screen, vt } => {
+      ScreenNotify::Bell | ScreenNotify::Switch { .. } => (),
+      ScreenNotify::CopyPresent { screen, handle } => {
         if let Some(task) = self.state.tasks.task_mut(screen) {
-          task.present = vt;
+          task.present = handle;
+          self.dirty = true;
         }
       }
       // Copied on behalf of whoever is attached here.
@@ -875,6 +880,14 @@ impl App {
         self.screen.yank(text, &mut self.effects);
         self.apply_screen(attached);
       }
+    }
+  }
+
+  /// The task whose terminal the console shows.
+  fn shown_task(&self) -> Option<TaskId> {
+    match self.state.tasks.selected() {
+      Some((_, Node::Task(task))) => Some(task.id),
+      _ => None,
     }
   }
 
@@ -902,19 +915,33 @@ impl App {
 /// Dims everything but `keep`.
 fn shade(grid: &mut Grid, theme: &BlockTheme, keep: Option<Rect>) {
   let area = grid.area();
-  for row in area.y..area.bottom() {
-    for col in area.x..area.right() {
-      if keep.is_some_and(|keep| keep.contains(col, row)) {
-        continue;
-      }
-      if let Some(cell) = grid.drawing_cell_mut(Pos { col, row }) {
-        let attrs = cell.attrs();
-        cell.set_attrs(Attrs {
-          fgcolor: attrs.fgcolor.blend(theme.shade, theme.shade_amount),
-          bgcolor: attrs.bgcolor.blend(theme.shade, theme.shade_amount),
-          ..*attrs
-        });
-      }
+  let dim = |style: Style| Style {
+    fg: style.fg.blend(theme.shade, theme.shade_amount),
+    bg: style.bg.blend(theme.shade, theme.shade_amount),
+    ..style
+  };
+  let Some(keep) = keep.map(|keep| keep.intersect(area)) else {
+    grid.map_styles(area, dim);
+    return;
+  };
+  // The four bands around `keep`.
+  let above = Rect::new(area.x, area.y, area.width, keep.y - area.y);
+  let below = Rect::new(
+    area.x,
+    keep.bottom(),
+    area.width,
+    area.bottom() - keep.bottom(),
+  );
+  let left = Rect::new(area.x, keep.y, keep.x - area.x, keep.height);
+  let right = Rect::new(
+    keep.right(),
+    keep.y,
+    area.right() - keep.right(),
+    keep.height,
+  );
+  for band in [above, below, left, right] {
+    if band.width > 0 && band.height > 0 {
+      grid.map_styles(band, dim);
     }
   }
 }

@@ -7,20 +7,18 @@
 //! screen is painted as is. Ahead of it the terminal keeps whatever it
 //! showed.
 
-use unicode_width::UnicodeWidthStr;
-
 use super::{
-  Cell, Color, Palette, Rgb, attrs::Attrs, grid::Pos,
-  screen_differ::BufferView, vt::emit,
+  Color, Palette, Rgb, cell::Cell, frame::Frame, style::Style, vt::emit,
 };
 
 /// Frames of terminal bytes; write each, then wait `FRAME_INTERVAL`.
 /// Once the last frame is written every cell of `new` is on the
-/// terminal, the cursor hidden and the attributes reset. The caller
-/// paints again as usual afterwards, after telling its differ the cursor
-/// is hidden, to place the cursor (and any change made meanwhile).
-pub fn frames<N: BufferView>(new: &N) -> Vec<Vec<u8>> {
-  let size = new.size();
+/// terminal (hyperlinks included when `links`), the cursor hidden, the
+/// attributes reset and no link open. The caller paints again as usual
+/// afterwards, after telling its painter the sweep showed `new`, to place
+/// the cursor (and any change made meanwhile).
+pub fn frames(new: &Frame, links: bool) -> Vec<Vec<u8>> {
+  let size = new.size;
   if size.width == 0 || size.height == 0 {
     return Vec::new();
   }
@@ -29,14 +27,12 @@ pub fn frames<N: BufferView>(new: &N) -> Vec<Vec<u8>> {
   let mut out = Vec::with_capacity(steps as usize);
   let mut painted: Vec<Paint> =
     vec![Paint::Old; size.width as usize * size.height as usize];
-  let mut brush = Attrs::default();
+  let mut brush = Style::DEFAULT;
   let mut pos = None;
-  let default_cell = Cell::default();
-  let cell_of = |x: u16, y: u16| -> &Cell {
-    new
-      .get_cell(Pos { col: x, row: y })
-      .unwrap_or(&default_cell)
-  };
+  let mut link: Option<&crate::term::style::Link> = None;
+  let mut buf = [0u8; 4];
+  let cell_of =
+    |x: u16, y: u16| -> Cell { new.cell(y, x).unwrap_or(Cell::EMPTY) };
   for step in 1..=steps {
     let front = (last as u32 * step as u32).div_ceil(steps as u32) as u16;
     let mut frame = Vec::new();
@@ -60,35 +56,45 @@ pub fn frames<N: BufferView>(new: &N) -> Vec<Vec<u8>> {
           Paint::New => None,
           Paint::Band(level) => Some(TINTS[level as usize]),
         };
+        let cell = cell_of(x, y);
         // The right half of a wide glyph is never drawn on its own; it
         // follows the glyph.
-        if x > 0 && cell_of(x - 1, y).is_wide() {
+        if cell.is_continuation() {
           continue;
         }
-        let cell = cell_of(x, y);
-        let attrs = match tint {
-          Some(tint) => tinted(*cell.attrs(), tint),
-          None => *cell.attrs(),
+        let cell_style = new.style(cell);
+        let style = cell_style.with_link(Default::default());
+        let style = match tint {
+          Some(tint) => tinted(style, tint),
+          None => style,
         };
-        emit::sgr(&mut frame, brush, attrs);
-        brush = attrs;
+        emit::sgr(&mut frame, brush, style);
+        brush = style;
+        if links {
+          let wanted = new.link(&cell_style);
+          if wanted != link {
+            emit::osc_link(&mut frame, wanted);
+            link = wanted;
+          }
+        }
         if pos != Some((x, y)) {
           emit::cup(&mut frame, y, x);
         }
-        let text = if cell.width() > 0 {
-          cell.contents()
-        } else {
-          " "
-        };
+        let text = new.text(cell, &mut buf);
+        let text = if text.is_empty() { " " } else { text };
         frame.extend_from_slice(text.as_bytes());
         // Past the last column the cursor is pending a wrap; the next
         // write there must be addressed, or it scrolls the terminal.
-        let end = x + text.width() as u16;
+        let end = x + cell.width().max(1);
         pos = (end < size.width).then_some((end, y));
       }
     }
     if step == steps {
       frame.extend_from_slice(emit::SGR_RESET.as_bytes());
+      if link.is_some() {
+        emit::osc_link(&mut frame, None);
+        link = None;
+      }
     }
     out.push(frame);
   }
@@ -136,46 +142,17 @@ fn level(age: u16) -> u8 {
 const WAVE: Rgb = Rgb(0x2f, 0x81, 0xf7);
 const WAVE_TEXT: Rgb = Rgb(0xea, 0xf3, 0xff);
 
-/// Colors a terminal is assumed to use for the default and indexed ones,
-/// which have no value of their own to tint.
-fn assumed() -> Palette {
-  Palette {
-    fg: Rgb(0xd1, 0xd7, 0xe0),
-    bg: Rgb(0x16, 0x1b, 0x22),
-    ansi: [
-      Rgb(0x48, 0x4f, 0x58),
-      Rgb(0xff, 0x7b, 0x72),
-      Rgb(0x3f, 0xb9, 0x50),
-      Rgb(0xd2, 0x99, 0x22),
-      Rgb(0x58, 0xa6, 0xff),
-      Rgb(0xbc, 0x8c, 0xff),
-      Rgb(0x39, 0xc5, 0xcf),
-      Rgb(0xb1, 0xba, 0xc4),
-      Rgb(0x6e, 0x76, 0x81),
-      Rgb(0xff, 0xa1, 0x98),
-      Rgb(0x56, 0xd3, 0x64),
-      Rgb(0xe3, 0xb3, 0x41),
-      Rgb(0x79, 0xc0, 0xff),
-      Rgb(0xd2, 0xa8, 0xff),
-      Rgb(0x56, 0xd4, 0xdd),
-      Rgb(0xff, 0xff, 0xff),
-    ],
-  }
-}
-
-fn tinted(attrs: Attrs, amount: u8) -> Attrs {
-  let palette = assumed();
-  let (fg, bg) = if attrs.inverse() {
-    (palette.bg(attrs.bgcolor), palette.fg(attrs.fgcolor))
+fn tinted(style: Style, amount: u8) -> Style {
+  let palette = Palette::dark();
+  let (fg, bg) = if style.inverse() {
+    (palette.bg(style.bg), palette.fg(style.fg))
   } else {
-    (palette.fg(attrs.fgcolor), palette.bg(attrs.bgcolor))
+    (palette.fg(style.fg), palette.bg(style.bg))
   };
-  Attrs {
-    fgcolor: Color::from(fg.blend(WAVE_TEXT, amount)),
-    bgcolor: Color::from(bg.blend(WAVE, amount)),
-    ..attrs
-  }
-  .set_inverse(false)
+  style
+    .fg(Color::from(fg.blend(WAVE_TEXT, amount)))
+    .bg(Color::from(bg.blend(WAVE, amount)))
+    .set_inverse(false)
 }
 
 #[cfg(test)]
@@ -184,15 +161,9 @@ mod tests {
   use crate::term::{Screen, Size};
 
   fn screen_text(screen: &Screen) -> Vec<String> {
-    (0..screen.size().height)
-      .map(|row| {
-        (0..screen.size().width)
-          .map(|col| match screen.cell(row, col) {
-            Some(cell) if cell.has_contents() => cell.contents().to_string(),
-            _ => " ".to_string(),
-          })
-          .collect()
-      })
+    let frame = screen.frame();
+    (0..frame.size.height)
+      .map(|row| frame.row_text(row, 0, frame.size.width))
       .collect()
   }
 
@@ -203,15 +174,12 @@ mod tests {
       height: 4,
     };
     let mut wanted = Screen::new(size, 0);
-    let mut events = Vec::new();
-    wanted.process(
-      b"\x1b[1;1Hhello world!\x1b[2;3H\x1b[31mred\x1b[0m\x1b[4;12H#",
-      &mut events,
-    );
+    wanted
+      .process(b"\x1b[1;1Hhello world!\x1b[2;3H\x1b[31mred\x1b[0m\x1b[4;12H#");
     let mut shown = Screen::new(size, 0);
-    shown.process(b"\x1b[1;1Hold old old old old old old", &mut events);
+    shown.process(b"\x1b[1;1Hold old old old old old old");
 
-    let frames = frames(&wanted);
+    let frames = frames(&wanted.frame(), true);
     assert_eq!(frames.len(), 120);
     assert!(frames[0].starts_with(b"\x1b[?25l"));
     assert!(frames.last().unwrap().ends_with(b"\x1b[0m"));
@@ -224,21 +192,28 @@ mod tests {
 
     let mut seen_tinted = false;
     for (i, frame) in frames.iter().enumerate() {
-      shown.process(frame, &mut events);
+      shown.process(frame);
       let top_left = shown.cell(0, 0).unwrap();
+      let style = shown.frame().style(top_left);
       // Tinted in the band, then as is.
-      if i >= 1 && *top_left.attrs() != Attrs::default() {
-        assert_eq!(top_left.contents(), "h");
+      if i >= 1 && style != Style::DEFAULT {
+        let mut buf = [0u8; 4];
+        assert_eq!(shown.frame().text(top_left, &mut buf), "h");
         seen_tinted = true;
       }
     }
     assert!(seen_tinted);
     assert_eq!(screen_text(&shown), screen_text(&wanted));
+    let shown_frame = shown.frame();
+    let wanted_frame = wanted.frame();
     assert_eq!(
-      shown.cell(1, 2).unwrap().attrs().fgcolor,
-      wanted.cell(1, 2).unwrap().attrs().fgcolor
+      shown_frame.style(shown_frame.cell(1, 2).unwrap()).fg,
+      wanted_frame.style(wanted_frame.cell(1, 2).unwrap()).fg
     );
-    assert_eq!(*shown.cell(0, 0).unwrap().attrs(), Attrs::default());
+    assert_eq!(
+      shown_frame.style(shown_frame.cell(0, 0).unwrap()),
+      Style::DEFAULT
+    );
     assert!(shown.hide_cursor());
   }
 
@@ -251,9 +226,8 @@ mod tests {
       height: 2,
     };
     let mut wanted = Screen::new(size, 0);
-    let mut events = Vec::new();
-    wanted.process(b"abcdef\r\nwxyzab", &mut events);
-    let all = frames(&wanted).concat();
+    wanted.process(b"abcdef\r\nwxyzab");
+    let all = frames(&wanted.frame(), true).concat();
     let count = |c: u8| all.iter().filter(|b| **b == c).count();
     // Once per level of the band, then as is.
     for c in b"cdefwxyz" {
@@ -262,8 +236,38 @@ mod tests {
   }
 
   #[test]
+  fn the_sweep_paints_links_when_the_terminal_has_them() {
+    let mut wanted = Screen::new(
+      Size {
+        width: 8,
+        height: 1,
+      },
+      0,
+    );
+    wanted.process(b"\x1b]8;;http://x\x1b\\ab\x1b]8;;\x1b\\c");
+    let with = frames(&wanted.frame(), true).concat();
+    let text = String::from_utf8_lossy(&with);
+    assert!(text.contains("\x1b]8;;http://x\x1b\\"), "{text:?}");
+    // Every link opened is closed again: the painter assumes none is
+    // open when the sweep ends.
+    let opens = text.matches("]8;;http://x").count();
+    let closes = text.matches("]8;;\x1b\\").count();
+    assert!(
+      opens > 0 && opens == closes,
+      "{opens} opens, {closes} closes"
+    );
+    let without = frames(&wanted.frame(), false).concat();
+    assert!(!String::from_utf8_lossy(&without).contains("\x1b]8;"));
+  }
+
+  #[test]
   fn an_empty_screen_has_no_frames() {
-    let empty: Vec<Vec<Cell>> = Vec::new();
-    assert!(frames(&empty).is_empty());
+    let empty = Frame::empty(Size {
+      width: 0,
+      height: 0,
+    });
+    // A grid is never smaller than one cell; the frame says so too.
+    assert_eq!(empty.size.width, 1);
+    assert_eq!(frames(&empty, true).len(), 120);
   }
 }

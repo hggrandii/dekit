@@ -5,19 +5,19 @@ use rquickjs::{Ctx, Exception, Function, Object, function::Opt};
 use crate::{
   js::rquickjs_ext::ObjectExt,
   term::{
-    CursorStyle, Grid, ScreenDiffer, TermEvent,
-    attrs::Attrs,
+    CursorStyle, Frame, Grid, Painter, TermEvent,
     color::Color,
     grid::{Pos, Rect},
     key::KeyEventKind,
     mouse::{MouseButton, MouseEventKind},
+    style::Style,
   },
   term_driver::TermDriver,
 };
 
 struct TuiState {
   term_driver: TermDriver,
-  differ: ScreenDiffer,
+  painter: Painter,
   grid: Rc<RefCell<Grid>>,
   draw_buf: Vec<u8>,
 }
@@ -93,7 +93,7 @@ fn open_fn(ctx: Ctx<'_>) -> rquickjs::Result<()> {
 
   *guard = Some(TuiState {
     term_driver,
-    differ: ScreenDiffer::new(),
+    painter: Painter::new(crate::protocol::TermCaps::default()),
     grid: Rc::new(RefCell::new(Grid::new(size, 0))),
     draw_buf: Vec::new(),
   });
@@ -183,10 +183,15 @@ fn event_to_js<'js>(
       obj.set("type", "focus")?;
       obj.set("focused", false)?;
     }
-    TermEvent::Resize(width, height) => {
+    TermEvent::Resize(geometry) => {
       obj.set("type", "resize")?;
-      obj.set("width", width)?;
-      obj.set("height", height)?;
+      obj.set("width", geometry.size.width)?;
+      obj.set("height", geometry.size.height)?;
+      // The size of a cell in pixels, when the terminal says.
+      if let Some((cell_width, cell_height)) = geometry.cell_pixels {
+        obj.set("cellWidth", cell_width)?;
+        obj.set("cellHeight", cell_height)?;
+      }
     }
     TermEvent::Paste(text) => {
       obj.set("type", "paste")?;
@@ -255,7 +260,13 @@ fn draw_fn<'js>(ctx: Ctx<'js>, cb: Function<'js>) -> rquickjs::Result<()> {
     tui.draw_buf.clear();
     {
       let grid = grid.borrow();
-      tui.differ.diff(&mut tui.draw_buf, &*grid);
+      let frame = Arc::new(Frame::of_grid(&grid));
+      if tui.term_driver.take_probe_finished() {
+        // What the terminal can show is known now, and the probe wiped
+        // the first row: paint everything again, for it.
+        tui.painter = Painter::new(*tui.term_driver.caps());
+      }
+      tui.painter.paint(&mut tui.draw_buf, &frame);
     }
 
     let mut stdout = std::io::stdout();
@@ -369,29 +380,29 @@ fn frame_object<'js>(
 fn parse_attrs(
   ctx: &Ctx<'_>,
   style: Option<&Object<'_>>,
-) -> rquickjs::Result<Attrs> {
-  let mut attrs = Attrs::default();
+) -> rquickjs::Result<Style> {
+  let mut attrs = Style::default();
   let Some(style) = style else {
     return Ok(attrs);
   };
 
   if let Some(color) = parse_color(ctx, style, "fg")? {
-    attrs.fgcolor = color;
+    attrs = attrs.fg(color);
   }
   if let Some(color) = parse_color(ctx, style, "bg")? {
-    attrs.bgcolor = color;
+    attrs = attrs.bg(color);
   }
   if let Ok(Some(v)) = style.get::<_, Option<bool>>("bold") {
-    attrs.set_bold(v);
+    attrs = attrs.set_bold(v);
   }
   if let Ok(Some(v)) = style.get::<_, Option<bool>>("italic") {
-    attrs.set_italic(v);
+    attrs = attrs.set_italic(v);
   }
   if let Ok(Some(v)) = style.get::<_, Option<bool>>("underline") {
-    attrs.set_underline(v);
+    attrs = attrs.set_underlined(v);
   }
   if let Ok(Some(v)) = style.get::<_, Option<bool>>("inverse") {
-    attrs.set_inverse(v);
+    attrs = attrs.set_inverse(v);
   }
   Ok(attrs)
 }
@@ -440,23 +451,23 @@ fn parse_color(
     return Ok(Some(color));
   }
 
-  if let Ok(Some(rgb)) = style.get::<_, Option<Object<'_>>>(key) {
-    if let (Ok(r), Ok(g), Ok(b)) = (
+  if let Ok(Some(rgb)) = style.get::<_, Option<Object<'_>>>(key)
+    && let (Ok(r), Ok(g), Ok(b)) = (
       rgb.get::<_, i32>("r"),
       rgb.get::<_, i32>("g"),
       rgb.get::<_, i32>("b"),
-    ) {
-      if (0..=255).contains(&r)
-        && (0..=255).contains(&g)
-        && (0..=255).contains(&b)
-      {
-        return Ok(Some(Color::Rgb(r as u8, g as u8, b as u8)));
-      }
-      return Err(Exception::throw_message(
-        ctx,
-        &format!("tui.draw: {key} rgb components must be in 0..=255"),
-      ));
+    )
+  {
+    if (0..=255).contains(&r)
+      && (0..=255).contains(&g)
+      && (0..=255).contains(&b)
+    {
+      return Ok(Some(Color::Rgb(r as u8, g as u8, b as u8)));
     }
+    return Err(Exception::throw_message(
+      ctx,
+      &format!("tui.draw: {key} rgb components must be in 0..=255"),
+    ));
   }
 
   Ok(None)

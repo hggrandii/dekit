@@ -42,7 +42,7 @@ impl Keymap {
       KeymapGroup::Term => &mut self.term,
       KeymapGroup::Copy => &mut self.copy,
     };
-    bindings.by_key.insert(key, action.clone());
+    bindings.by_key.insert(key.clone(), action.clone());
     bindings.by_action.insert(action, key);
   }
 

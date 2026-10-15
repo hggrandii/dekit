@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::error::ResultLogger;
 use crate::kernel::kernel_message::{
-  KernelCommand, SharedVt, TaskContext, TaskRegistration, TaskSelector,
+  KernelCommand, TaskContext, TaskRegistration, TaskSelector,
 };
 use crate::kernel::task::{
   ExitInfo, ReadyMode, RestartMode, STOP_TIMEOUT, TaskCmd, TaskDef, TaskId,
@@ -26,11 +26,11 @@ use crate::task::logger::{LogSpec, spawn_logger};
 #[cfg(windows)]
 use crate::task::ready::command;
 use crate::task::ready::{
-  Probe, ReadyCheck, ReadyConfig, VisibleLine, parse_http_url, wait_ready,
+  Probe, ReadyCheck, ReadyConfig, line_ready, parse_http_url, wait_ready,
 };
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
-use crate::term::{Screen, Winsize};
+use crate::term::{Screen, ScreenHandle, Winsize};
 use crate::upgrade::snapshot as snap;
 
 /// An OS signal a `Signal` stop can deliver. The name table and the libc
@@ -178,8 +178,8 @@ pub fn process_task_registration(
   key: Option<TaskKey>,
   config: ProcessTaskConfig,
 ) -> TaskRegistration {
-  let vt = SharedVt::new(Screen::new(DEFAULT_SIZE, config.scrollback_len));
-  registration(task_id, key, config, vt, None)
+  let screen = Screen::new(DEFAULT_SIZE, config.scrollback_len);
+  registration(task_id, key, config, screen, None)
 }
 
 /// A process task re-created around its inherited child and PTY.
@@ -329,18 +329,19 @@ pub fn process_task_resumed(
   screen: &snap::Screen,
   instance: Option<snap::Instance>,
 ) -> anyhow::Result<TaskRegistration> {
-  let vt = SharedVt::new(Screen::from_snapshot(screen)?);
-  Ok(registration(task_id, key, config, vt, instance))
+  let screen = Screen::from_snapshot(screen)?;
+  Ok(registration(task_id, key, config, screen, instance))
 }
 
 fn registration(
   task_id: TaskId,
   key: Option<TaskKey>,
   config: ProcessTaskConfig,
-  vt: SharedVt,
+  screen: Screen,
   instance: Option<snap::Instance>,
 ) -> TaskRegistration {
-  let task_vt = vt.clone();
+  let handle = ScreenHandle::new(screen.frame());
+  let task_handle = handle.clone();
   let (space, path) = match key.clone() {
     Some(key) => (key.space, Some(key.path)),
     None => (Default::default(), None),
@@ -363,13 +364,14 @@ fn registration(
       path,
       label: config.label.take(),
       after: None,
-      vt: Some(vt),
+      vt: Some(handle),
       tags: std::mem::take(&mut config.tags),
       pinned: config.pinned,
       saved_pin: false,
     },
     move |ctx, receiver| async move {
-      process_main(ctx, receiver, key, task_vt, config, instance).await;
+      process_main(ctx, receiver, key, screen, task_handle, config, instance)
+        .await;
     },
   )
 }
@@ -385,7 +387,6 @@ struct Instance {
   ready_sent: bool,
   /// A stop was sent: no ready check runs.
   stop_sent: bool,
-  ready_line: VisibleLine,
   /// The log path is resolved per spawn (it may contain the pid).
   current_log: Option<(std::path::PathBuf, u64)>,
 }
@@ -399,22 +400,50 @@ impl Instance {
     }
   }
 
-  /// Feeds output to the log check, if there is one and the instance is
-  /// not ready; true when this makes it ready.
-  fn log_ready(&mut self, ready: &Option<ReadyConfig>, bytes: &[u8]) -> bool {
-    if let Some(ReadyConfig {
-      check: ReadyCheck::Log(text),
+  /// Checks the lines the screen finished since the last output, and the
+  /// line so far, against the log ready check; true when this makes the
+  /// instance ready.
+  fn log_ready(
+    &mut self,
+    ready: &Option<ReadyConfig>,
+    task_screen: &mut TaskScreen,
+    lines: &mut Vec<String>,
+    also: Option<&str>,
+  ) -> bool {
+    let Some(ReadyConfig {
+      check: ReadyCheck::Log(needle),
       ..
     }) = ready
-      && !self.ready_sent
-      && self.ready_line.feed(text.as_bytes(), bytes)
-    {
-      self.ready_sent = true;
-      self.ready_line = VisibleLine::default();
-      return true;
+    else {
+      return false;
+    };
+    if self.ready_sent {
+      // Nothing left to look for in the lines.
+      task_screen.set_line_tap(false);
+      return false;
     }
-    false
+    lines.clear();
+    task_screen.take_finished_lines(lines);
+    let found = also.is_some_and(|line| line_ready(needle, line))
+      || lines.iter().any(|line| line_ready(needle, line))
+      || line_ready(needle, &task_screen.screen().cursor_line_text());
+    if found {
+      self.ready_sent = true;
+      task_screen.set_line_tap(false);
+    }
+    found
   }
+}
+
+/// Whether the ready check reads the lines the screen finishes.
+fn watches_lines(config: &ProcessTaskConfig) -> bool {
+  matches!(
+    config.ready,
+    Some(ReadyConfig {
+      check: ReadyCheck::Log(_),
+      ..
+    })
+  )
 }
 
 fn snapshot(
@@ -467,7 +496,7 @@ fn snapshot(
       && ready_probe.is_some()
       && !instance.ready_sent
       && instance.exit_info.is_none(),
-    ready_line: snap::to_base64(&instance.ready_line.saved()),
+    ready_line: String::new(),
     log_path: instance
       .current_log
       .as_ref()
@@ -511,11 +540,7 @@ fn snapshot(
     scrollback_len: config.scrollback_len,
     mouse_scroll_speed: config.mouse_scroll_speed,
     instance,
-    screen: task_screen
-      .vt()
-      .read()
-      .map(|screen| screen.snapshot())
-      .unwrap_or_else(|_| Screen::new(DEFAULT_SIZE, 0).snapshot()),
+    screen: task_screen.screen().snapshot(),
   }
 }
 
@@ -523,13 +548,16 @@ async fn process_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
   key: Option<TaskKey>,
-  vt: SharedVt,
+  screen: Screen,
+  handle: ScreenHandle,
   config: ProcessTaskConfig,
   saved: Option<snap::Instance>,
 ) {
   let mut task_screen =
-    TaskScreen::new(ctx.task_id, vt, config.mouse_scroll_speed);
+    TaskScreen::new(ctx.task_id, screen, handle, config.mouse_scroll_speed);
+  task_screen.set_line_tap(watches_lines(&config));
   let mut screen_effects: Vec<TaskScreenEffect> = Vec::new();
+  let mut finished_lines: Vec<String> = Vec::new();
 
   // The child must not outlive this future (it panicked, or the kernel
   // went away): one that ignores SIGHUP survives the PTY's hangup.
@@ -566,10 +594,16 @@ async fn process_main(
         instance.stdout_eof = saved.stdout_eof;
         instance.ready_sent = saved.ready_sent;
         instance.stop_sent = saved.stop_sent;
-        // Checked again like new output: an older binary saved raw output
-        // it had not searched yet, since it checked only at a `\n`.
+        // An older binary saved the line it had not searched yet; the
+        // screen itself carries the rest.
         let line = snap::from_base64(&saved.ready_line).unwrap_or_default();
-        if instance.log_ready(&config.ready, &line) {
+        let line = String::from_utf8_lossy(&line);
+        if instance.log_ready(
+          &config.ready,
+          &mut task_screen,
+          &mut finished_lines,
+          Some(&line),
+        ) {
           ctx.send(KernelCommand::TaskReady);
         }
         probe = start_probe(&config, &instance);
@@ -607,6 +641,7 @@ async fn process_main(
       Exited(Option<ExitInfo>),
       Ready,
       DragScroll,
+      SyncTimeout,
     }
     let read_fut = async {
       match process.as_mut() {
@@ -637,25 +672,35 @@ async fn process_main(
         None => pending().await,
       }
     };
+    // A synchronized update the program never ends is painted anyway.
+    let sync_at = task_screen.sync_deadline();
+    let sync_fut = async {
+      match sync_at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => pending().await,
+      }
+    };
     let next = tokio::select! {
       cmd = receiver.recv() => Next::Cmd(cmd),
       n = read_fut => Next::Read(n),
       info = exit_fut => Next::Exited(info),
       () = probe_fut => Next::Ready,
       () = drag_scroll_fut => Next::DragScroll,
+      () = sync_fut => Next::SyncTimeout,
     };
 
     match next {
       Next::Cmd(None) => break,
       Next::Cmd(Some(cmd)) => match cmd {
         TaskCmd::Start if process.is_none() => {
-          match start_instance(&ctx, &config.spec, task_screen.vt()) {
+          match start_instance(&ctx, &config.spec, &mut task_screen) {
             Ok((p, receiver)) => {
               instance.exit_info = None;
               instance.stdout_eof = false;
-              instance.ready_line = VisibleLine::default();
               instance.ready_sent = false;
               instance.stop_sent = false;
+              // The ready check looks at the new instance's lines.
+              task_screen.set_line_tap(watches_lines(&config));
               probe = start_probe(&config, &instance);
               update_log_observer(
                 &mut task_screen,
@@ -680,7 +725,8 @@ async fn process_main(
           probe = None;
           instance.stop_sent = true;
           if let Some(p) = process.as_mut() {
-            stop_process(p, &config.stop, task_screen.vt(), &config.spec).await;
+            stop_process(p, &config.stop, task_screen.screen(), &config.spec)
+              .await;
           }
         }
         TaskCmd::Kill => {
@@ -759,7 +805,7 @@ async fn process_main(
             apply_effects(
               &mut screen_effects,
               &mut process,
-              task_screen.vt(),
+              task_screen.screen(),
               &mut key_buf,
             )
             .await;
@@ -780,18 +826,28 @@ async fn process_main(
         ctx.send(KernelCommand::TaskReady);
       }
       Next::DragScroll => task_screen.drag_scroll_tick(),
-      Next::Read(Ok(0)) => instance.stdout_eof = true,
+      Next::SyncTimeout => task_screen.sync_timeout(),
+      Next::Read(Ok(0)) => {
+        instance.stdout_eof = true;
+        // Nothing more will end an open synchronized update.
+        task_screen.sync_timeout();
+      }
       Next::Read(Ok(n)) => {
-        if instance.log_ready(&config.ready, &read_buf[..n]) {
-          ctx.send(KernelCommand::TaskReady);
-        }
         task_screen
           .process(&read_buf[..n], &mut screen_effects)
           .await;
+        if instance.log_ready(
+          &config.ready,
+          &mut task_screen,
+          &mut finished_lines,
+          None,
+        ) {
+          ctx.send(KernelCommand::TaskReady);
+        }
         apply_effects(
           &mut screen_effects,
           &mut process,
-          task_screen.vt(),
+          task_screen.screen(),
           &mut key_buf,
         )
         .await;
@@ -799,6 +855,7 @@ async fn process_main(
       Next::Read(Err(e)) => {
         log::warn!("Process read error: {}", e);
         instance.stdout_eof = true;
+        task_screen.sync_timeout();
       }
     }
   }
@@ -845,10 +902,10 @@ fn update_log_observer(
   let Some(sink) = log.resolve(task_id.0, pid) else {
     return;
   };
-  if let Some((path, _)) = current {
-    if *path == sink.path {
-      return;
-    }
+  if let Some((path, _)) = current
+    && *path == sink.path
+  {
+    return;
   }
   if let Some((_, id)) = current.take() {
     task_screen.remove_logger(id);
@@ -861,29 +918,10 @@ fn update_log_observer(
 fn start_instance(
   ctx: &TaskContext,
   spec: &ProcessSpec,
-  vt: &SharedVt,
+  task_screen: &mut TaskScreen,
 ) -> Result<(NativeProcess, UnboundedReceiver<ExitInfo>), String> {
-  let size = match vt.read() {
-    Ok(screen) => {
-      let s = screen.size();
-      Winsize {
-        x: s.width,
-        y: s.height,
-        x_px: 0,
-        y_px: 0,
-      }
-    }
-    Err(_) => Winsize {
-      x: 80,
-      y: 24,
-      x_px: 0,
-      y_px: 0,
-    },
-  };
-  if let Ok(mut screen) = vt.write() {
-    screen.reset();
-    screen.set_size(size.y, size.x);
-  }
+  let size = task_screen.winsize();
+  task_screen.reset_screen();
   match spawn_native(ctx, spec, size) {
     Ok(spawned) => {
       ctx.send(KernelCommand::TaskStarted);
@@ -899,6 +937,7 @@ fn start_instance(
 
 /// What the task's screen shows when its program could not start.
 fn spawn_error_message(spec: &ProcessSpec, err: &anyhow::Error) -> String {
+  #[allow(unused_mut)]
   let mut message = format!(
     "\x1b[31mCannot start `{}`: {}\x1b[0m\r\n",
     spec.prog,
@@ -953,7 +992,7 @@ fn batch_file_on_path(spec: &ProcessSpec) -> Option<std::path::PathBuf> {
 async fn apply_effects(
   effects: &mut Vec<TaskScreenEffect>,
   process: &mut Option<NativeProcess>,
-  vt: &SharedVt,
+  vt: &Screen,
   key_buf: &mut Vec<u8>,
 ) {
   for effect in effects.drain(..) {
@@ -970,10 +1009,7 @@ async fn apply_effects(
       }
       TaskScreenEffect::Paste(text) => {
         if let Some(p) = process.as_mut() {
-          let bracketed = vt
-            .read()
-            .map(|screen| screen.bracketed_paste())
-            .unwrap_or(false);
+          let bracketed = vt.bracketed_paste();
           key_buf.clear();
           emit::paste(key_buf, &text, bracketed);
           p.write_all(key_buf).await.log_ignore();
@@ -990,20 +1026,16 @@ async fn apply_effects(
 
 async fn send_key(
   process: &mut NativeProcess,
-  vt: &SharedVt,
+  vt: &Screen,
   key: Key,
   buf: &mut Vec<u8>,
 ) {
-  // CSI-u only once the program asked for the supported kitty
-  // "disambiguate escape codes" flag.
-  let (csi_u, application_cursor_keys) = vt
-    .read()
-    .map(|s| (s.kitty_flags() != 0, s.application_cursor()))
-    .unwrap_or((false, false));
+  // Keys are encoded as the program asked: the kitty flags it pushed,
+  // or the legacy encoding.
   let modes = KeyEncodeModes {
-    enable_csi_u_key_encoding: csi_u,
-    application_cursor_keys,
-    newline_mode: false,
+    kitty_flags: vt.kitty_flags(),
+    application_cursor_keys: vt.application_cursor(),
+    newline_mode: vt.modes().newline,
   };
   buf.clear();
   emit::key(buf, &key, modes);
@@ -1016,7 +1048,7 @@ async fn send_key(
 async fn stop_process(
   process: &mut NativeProcess,
   stop: &StopSignal,
-  vt: &SharedVt,
+  vt: &Screen,
   spec: &ProcessSpec,
 ) {
   match stop {
@@ -1037,7 +1069,7 @@ async fn stop_process(
 async fn stop_process(
   process: &mut NativeProcess,
   stop: &StopSignal,
-  vt: &SharedVt,
+  vt: &Screen,
   spec: &ProcessSpec,
 ) {
   match stop {
@@ -1093,6 +1125,12 @@ fn run_stop_cmd(spec: &ProcessSpec, argv: &[String]) {
 #[cfg(not(windows))]
 #[cfg(test)]
 mod tests {
+  fn test_screen(wheel: usize) -> TaskScreen {
+    let screen = Screen::new(DEFAULT_SIZE, 0);
+    let handle = ScreenHandle::new(screen.frame());
+    TaskScreen::new(TaskId(1), screen, handle, wheel)
+  }
+
   use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
   use crate::config::task_log::{LogMode, TaskLogConfig};
@@ -1362,11 +1400,7 @@ mod tests {
       }),
       ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
     };
-    let screen = TaskScreen::new(
-      TaskId(1),
-      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
-      config.mouse_scroll_speed,
-    );
+    let screen = test_screen(config.mouse_scroll_speed);
     let process = snapshot(&config, None, &screen, &Instance::default());
     assert_eq!(process.ready_log, None);
     let saved = snap::Task {
@@ -1483,11 +1517,7 @@ mod tests {
   async fn failed_adopt_reports_the_task_stopped() {
     let config =
       ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".to_string()]));
-    let screen = TaskScreen::new(
-      TaskId(1),
-      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
-      config.mouse_scroll_speed,
-    );
+    let screen = test_screen(config.mouse_scroll_speed);
     let mut process = snapshot(&config, None, &screen, &Instance::default());
     // Pid 0 cannot be adopted.
     process.instance = Some(snap::Instance {
@@ -1599,11 +1629,7 @@ mod tests {
   /// binary's saved line is checked when the task resumes.
   #[tokio::test]
   async fn a_resumed_task_checks_ready_only_while_running() {
-    let screen = TaskScreen::new(
-      TaskId(1),
-      SharedVt::new(Screen::new(DEFAULT_SIZE, 0)),
-      5,
-    );
+    let screen = test_screen(5);
     let listeners: Vec<std::net::TcpListener> = (0..2)
       .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
       .collect();

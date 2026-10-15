@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::console::{
@@ -7,9 +9,10 @@ use crate::console::{
 };
 use crate::kernel::task_path::TaskPath;
 use crate::term::{
-  Grid, Palette, Screen,
-  attrs::Attrs,
+  Frame, Grid, Palette,
+  cell::{CellText, TextKind},
   grid::{Pos, Rect},
+  style::{LinkId, Style, StyleId},
 };
 
 pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
@@ -32,28 +35,28 @@ pub fn render_term(area: Rect, grid: &mut Grid, state: &State, theme: &Theme) {
   };
 
   let handle = task.present.as_ref().unwrap_or(&task.vt);
-  let Ok(screen) = handle.read() else {
-    return;
-  };
-  let screen = &*screen;
+  let frame = handle.load();
 
   let mut block = style.draw(grid, area);
   block.title(" Terminal ", style.title);
-  let title = screen.title();
+  let title = frame.title.as_ref();
   if !title.is_empty() {
     block.title(title, style.dim).title(" ", style.dim);
   }
 
   let inner = block.inner();
-  render_screen(screen, inner, grid, &theme.palette);
+  render_frame(&frame, inner, grid, &theme.palette);
 
-  if active && !screen.hide_cursor() {
-    let (row, col) = screen.cursor_position();
+  if active
+    && let Some(cursor) = frame.cursor
+    && cursor.col < inner.width
+    && cursor.row < inner.height
+  {
     grid.cursor_pos = Some(Pos {
-      col: inner.x + col,
-      row: inner.y + row,
+      col: inner.x + cursor.col,
+      row: inner.y + cursor.row,
     });
-    grid.cursor_style = screen.cursor_style();
+    grid.cursor_style = frame.cursor_style;
   }
 }
 
@@ -79,8 +82,8 @@ fn render_group(
     grid.draw_text(area, &summary, style.text);
     if group.failed > 0 {
       let failed = format!(", {} failed", group.failed);
-      let attrs = Attrs {
-        fgcolor: theme.tasks.failed.into(),
+      let attrs = Style {
+        fg: theme.tasks.failed.into(),
         ..style.text
       };
       grid.draw_text(line, &failed, attrs);
@@ -95,32 +98,92 @@ fn render_group(
   }
 }
 
-fn render_screen(
-  screen: &Screen,
+/// Copies a frame into `area` of the grid, the frame's default colors
+/// resolved through `palette` so the console looks the same whatever
+/// the terminal's own colors are. Cells are carried over whole: text,
+/// style, and link.
+pub fn render_frame(
+  frame: &Frame,
   area: Rect,
   grid: &mut Grid,
   palette: &Palette,
 ) {
-  for row in 0..area.height {
-    for col in 0..area.width {
-      let Some(to_cell) = grid.drawing_cell_mut(Pos {
+  // Styles, links and clusters are interned per grid: each of the
+  // frame's is mapped once. Scalars, blanks and continuations carry over
+  // as they are.
+  let mut styles: Vec<Option<StyleId>> = vec![None; frame.tables.styles.len()];
+  let mut links: HashMap<LinkId, LinkId> = HashMap::new();
+  let mut graphemes: HashMap<u32, CellText> = HashMap::new();
+  let rows = area.height.min(frame.size.height);
+  let cols = area.width.min(frame.size.width);
+  for row in 0..rows {
+    let Some(src) = frame.row(row) else {
+      break;
+    };
+    for col in 0..cols {
+      let Some(cell) = src.get(col) else {
+        break;
+      };
+      if cell.is_continuation() {
+        continue;
+      }
+      let width = cell.width().max(1);
+      let pos = Pos {
         col: area.x + col,
         row: area.y + row,
-      }) else {
-        continue;
       };
-      if let Some(cell) = screen.cell(row, col) {
-        *to_cell = cell.clone();
-        if !cell.has_contents() {
-          to_cell.set_str(" ");
-        }
-        let attrs = cell.attrs();
-        to_cell.set_attrs(Attrs {
-          fgcolor: palette.fg(attrs.fgcolor).into(),
-          bgcolor: palette.bg(attrs.bgcolor).into(),
-          ..*attrs
-        });
+      if col + width > cols {
+        grid.write_cell(pos, CellText::EMPTY, StyleId::DEFAULT);
+        continue;
       }
+      let style = match styles.get(cell.style.0 as usize).copied().flatten() {
+        Some(id) => id,
+        None => {
+          let source = frame.style(cell);
+          let link = if source.link.is_none() {
+            LinkId::NONE
+          } else {
+            *links.entry(source.link).or_insert_with(|| {
+              frame
+                .link(&source)
+                .map_or(LinkId::NONE, |link| grid.intern_link(link.clone()))
+            })
+          };
+          let id = grid.intern_style(Style {
+            fg: palette.fg(source.fg).into(),
+            bg: palette.bg(source.bg).into(),
+            link,
+            ..source
+          });
+          if let Some(slot) = styles.get_mut(cell.style.0 as usize) {
+            *slot = Some(id);
+          }
+          id
+        }
+      };
+      let text = match cell.text.kind() {
+        TextKind::Grapheme(index) => {
+          *graphemes.entry(index).or_insert_with(|| {
+            grid.cell_text(frame.tables.graphemes.get(index), width as u8)
+          })
+        }
+        // Placeholder cells belong to the frame's own image slots; its
+        // placements come along below.
+        TextKind::Image { .. } => CellText::EMPTY,
+        _ => cell.text,
+      };
+      grid.write_cell(pos, text, style);
+    }
+  }
+  // Images come along, cut to the area.
+  let pane = Rect::new(area.x, area.y, cols, rows);
+  for placement in &frame.placements {
+    let Some(shown) = placement.clipped(pane, area.x, area.y) else {
+      continue;
+    };
+    if let Some(image) = frame.images.get(&placement.key) {
+      grid.add_image(image.clone());
+      grid.put_placement(shown);
     }
   }
 }

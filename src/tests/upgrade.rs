@@ -11,11 +11,11 @@ use std::process::Output;
 use std::time::Duration;
 
 use lib::protocol::{
-  ConnReceiver, ConnSender, CtlMsg, Event, Msg, Request, RpcRequest,
-  client_handshake, ctl::EVENT_INPUT,
+  ConnReceiver, ConnSender, CtlMsg, Msg, Request, RpcRequest, client_handshake,
+  ctl::{GeometryParams, InputDialect},
 };
 use lib::runner::socket::connect_socket;
-use lib::term::{TermEvent, key::Key};
+use lib::term::{Geometry, TermEvent, key::Key};
 
 mod common;
 use common::{DEKIT, TestRunner, stderr_of as stderr, task_line, wait_until};
@@ -308,9 +308,9 @@ async fn attach(
   client_handshake(&mut sender, &mut receiver).await.unwrap();
   let (method, params) = RpcRequest::Attach {
     target: target.parse().unwrap(),
-    width: 80,
-    height: 24,
+    geometry: GeometryParams::of(Geometry::cells(80, 24)),
     until_exit: false,
+    caps: None,
   }
   .to_wire();
   sender
@@ -352,10 +352,9 @@ async fn saw(receiver: &mut ConnReceiver, needle: &[u8]) -> bool {
 async fn send_key(sender: &mut ConnSender, spec: &str) {
   let key = Key::parse(spec).unwrap();
   sender
-    .send_ctl(CtlMsg::Event(Event {
-      name: EVENT_INPUT.to_string(),
-      params: serde_json::to_value(TermEvent::Key(key)).unwrap(),
-    }))
+    .send_ctl(CtlMsg::Event(
+      InputDialect::Named.input_event(&TermEvent::Key(key)),
+    ))
     .await
     .unwrap();
 }

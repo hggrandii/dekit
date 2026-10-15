@@ -65,6 +65,10 @@ impl Params {
     self.len as usize
   }
 
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
   /// True when the sequence had no params, prefix, or intermediates.
   pub fn is_bare(&self) -> bool {
     self.len == 0 && self.prefix == 0 && self.inter == 0 && !self.invalid

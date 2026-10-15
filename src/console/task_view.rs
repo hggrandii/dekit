@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::kernel::{
-  kernel_message::SharedVt,
+  kernel_message::ScreenHandle,
   task::{TaskId, TaskKind, TaskState},
   task_path::TaskPath,
 };
@@ -12,9 +12,9 @@ pub struct TaskView {
   pub path: Arc<TaskPath>,
   pub kind: TaskKind,
   pub status: TaskState,
-  pub vt: SharedVt,
+  pub vt: ScreenHandle,
   /// Copy-mode surface, shown instead of `vt` while set.
-  pub present: Option<SharedVt>,
+  pub present: Option<ScreenHandle>,
 }
 
 impl TaskView {

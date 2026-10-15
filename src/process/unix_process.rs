@@ -52,7 +52,7 @@ impl UnixProcess {
       .map(|cwd| CString::new(cwd.as_str()).unwrap_or_default());
 
     let env_c: Vec<(CString, Option<CString>)> = spec
-      .env
+      .child_env()
       .iter()
       .filter_map(|(k, v)| {
         let k_c = CString::new(k.as_str()).ok()?;

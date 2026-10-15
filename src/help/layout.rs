@@ -5,19 +5,19 @@
 use unicode_width::UnicodeWidthStr;
 
 use super::ir::{Block, CalloutVariant, DocsIr, FieldKind, Inline, Topic};
-use crate::term::{Color, attrs::Attrs};
+use crate::term::{Color, style::Style};
 
 pub const MAX_WIDTH: usize = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
   pub text: String,
-  pub attrs: Attrs,
+  pub attrs: Style,
 }
 
 pub type Line = Vec<Span>;
 
-fn span(text: impl Into<String>, attrs: Attrs) -> Span {
+fn span(text: impl Into<String>, attrs: Style) -> Span {
   Span {
     text: text.into(),
     attrs,
@@ -25,19 +25,19 @@ fn span(text: impl Into<String>, attrs: Attrs) -> Span {
 }
 
 fn plain(text: impl Into<String>) -> Span {
-  span(text, Attrs::default())
+  span(text, Style::default())
 }
 
-fn bold() -> Attrs {
-  Attrs::default().set_bold(true)
+fn bold() -> Style {
+  Style::default().set_bold(true)
 }
 
-fn dim() -> Attrs {
-  Attrs::default().fg(Color::BRIGHT_BLACK)
+fn dim() -> Style {
+  Style::default().fg(Color::BRIGHT_BLACK)
 }
 
-fn code_style() -> Attrs {
-  Attrs::default().fg(Color::CYAN)
+fn code_style() -> Style {
+  Style::default().fg(Color::CYAN)
 }
 
 fn spaces(n: usize) -> Span {
@@ -119,11 +119,11 @@ pub fn index(docs: &DocsIr, width: usize) -> Vec<Line> {
   out
 }
 
-fn with(mut attrs: Attrs, change: impl FnOnce(&mut Attrs) -> Attrs) -> Attrs {
+fn with(mut attrs: Style, change: impl FnOnce(&mut Style) -> Style) -> Style {
   change(&mut attrs)
 }
 
-fn inlines(inlines: &[Inline], base: Attrs) -> Vec<Span> {
+fn inlines(inlines: &[Inline], base: Style) -> Vec<Span> {
   let mut out = Vec::new();
   for inline in inlines {
     match inline {
@@ -138,12 +138,12 @@ fn inlines(inlines: &[Inline], base: Attrs) -> Vec<Span> {
         out.extend(self::inlines(children, with(base, |a| a.set_italic(true))))
       }
       Inline::TagLink { tag } => {
-        out.push(span(tag, with(base, |a| a.set_underline(true))))
+        out.push(span(tag, with(base, |a| a.set_underlined(true))))
       }
       Inline::UrlLink { href, children } => {
         out.extend(self::inlines(
           children,
-          with(base, |a| a.set_underline(true)),
+          with(base, |a| a.set_underlined(true)),
         ));
         out.push(span(format!(" ({href})"), dim()));
       }
@@ -168,7 +168,7 @@ fn blocks(blocks: &[Block], width: usize, out: &mut Vec<Line>) {
       }
       Block::Paragraph { inlines } => {
         out.extend(wrap(
-          self::inlines(inlines, Attrs::default()),
+          self::inlines(inlines, Style::default()),
           width,
           vec![],
           vec![],
@@ -188,7 +188,7 @@ fn blocks(blocks: &[Block], width: usize, out: &mut Vec<Line>) {
           };
           let indent = spaces(marker.width());
           out.extend(wrap(
-            self::inlines(item, Attrs::default()),
+            self::inlines(item, Style::default()),
             width,
             vec![plain(marker)],
             vec![indent],
@@ -205,7 +205,7 @@ fn blocks(blocks: &[Block], width: usize, out: &mut Vec<Line>) {
           CalloutVariant::Tip => Color::GREEN,
           CalloutVariant::Warning => Color::YELLOW,
         };
-        let bar = span("│ ", Attrs::default().fg(color));
+        let bar = span("│ ", Style::default().fg(color));
         let label =
           title.clone().unwrap_or_else(|| variant.label().to_string());
         out.push(vec![bar.clone(), span(label, bold().fg(color))]);
