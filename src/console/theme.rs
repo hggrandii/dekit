@@ -35,6 +35,14 @@ pub struct BlockTheme {
   pub text: Rgb,
   /// Secondary text, like the terminal's own title.
   pub dim: Rgb,
+  /// What an empty text field shows in place of a value: fainter than
+  /// `dim`, so it does not read as one.
+  pub placeholder: Rgb,
+  /// The line under a text field without the focus; with it, the line is
+  /// `border_focused`.
+  pub field_line: Rgb,
+  /// What went wrong: a refused value, a failed command.
+  pub error: Rgb,
   /// Key names in help and menus.
   pub key: Rgb,
   pub border: Rgb,
@@ -98,6 +106,9 @@ impl Theme {
         selected_bg: Rgb(0x42, 0x4a, 0x57),
         text,
         dim: Rgb(0x91, 0x98, 0xa1),
+        placeholder: Rgb(0x5f, 0x66, 0x70),
+        field_line: Rgb(0x45, 0x4d, 0x57),
+        error: Rgb(0xff, 0xa1, 0x98),
         key: Rgb(0xe3, 0xb3, 0x41),
         border: Rgb(0x3d, 0x44, 0x4d),
         border_focused: Rgb(0x6c, 0xae, 0xff),
@@ -155,6 +166,9 @@ impl Theme {
         selected_bg: Rgb(0xdd, 0xe4, 0xec),
         text,
         dim: Rgb(0x59, 0x63, 0x6e),
+        placeholder: Rgb(0x9a, 0xa3, 0xad),
+        field_line: Rgb(0xc4, 0xcc, 0xd5),
+        error: Rgb(0xd1, 0x24, 0x2f),
         key: Rgb(0x9a, 0x67, 0x00),
         border: Rgb(0xb8, 0xc2, 0xcc),
         border_focused: Rgb(0x05, 0x50, 0xae),
@@ -181,6 +195,9 @@ pub struct BlockStyle {
   pub title: Style,
   pub text: Style,
   pub dim: Style,
+  /// Italic, in the theme's `placeholder`.
+  pub placeholder: Style,
+  pub error: Style,
   pub key: Style,
   pub alert: Style,
 }
@@ -217,6 +234,8 @@ impl BlockTheme {
       title: on_bg(title).set_bold(focused),
       text: on_bg(self.text),
       dim: on_bg(self.dim),
+      placeholder: on_bg(self.placeholder).set_italic(true),
+      error: on_bg(self.error),
       key: on_bg(self.key),
       alert: Style::default()
         .bg(self.alert_bg.into())
@@ -238,6 +257,8 @@ impl BlockStyle {
       title: on_bg(self.title),
       text: on_bg(self.text),
       dim: on_bg(self.dim),
+      placeholder: on_bg(self.placeholder),
+      error: on_bg(self.error),
       key: on_bg(self.key),
       alert: self.alert,
     }

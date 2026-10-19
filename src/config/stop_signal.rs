@@ -95,7 +95,7 @@ mod tests {
   fn parse(yaml: &str) -> Result<StopConfig> {
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let doc = CfgDoc::from_value(value);
     StopConfig::from_cfg(&doc.root(), &cx)
   }
 

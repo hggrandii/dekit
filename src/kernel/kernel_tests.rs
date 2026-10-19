@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{
 };
 
 use super::*;
-use crate::kernel::kernel_message::KernelSnapshot;
+use crate::kernel::kernel_message::{KernelSnapshot, Place};
 use crate::kernel::task::RestartMode;
 use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
@@ -32,7 +32,7 @@ struct RecordingTask {
 impl Task for RecordingTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => {
+      TaskCmd::Start(_) => {
         self.tx.send((self.name, RecordedCmd::Start)).unwrap();
         fx.started();
       }
@@ -44,7 +44,7 @@ impl Task for RecordingTask {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
         fx.stopped(ExitInfo::signal(9));
       }
-      TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
+      TaskCmd::Thaw => (),
       TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
         number,
         TaskKindSnapshot::Console {},
@@ -71,7 +71,7 @@ struct ExitOnNotify {
 impl Task for ExitOnNotify {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => {
+      TaskCmd::Start(_) => {
         self.tx.send((self.name, RecordedCmd::Start)).unwrap();
         fx.started();
       }
@@ -84,14 +84,14 @@ impl Task for ExitOnNotify {
         fx.stopped(ExitInfo::signal(9));
       }
       // Never frozen by these tests.
-      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
       TaskCmd::Msg(_) => fx.stopped(ExitInfo::code(0)),
     }
   }
 }
 
-/// Records commands like `RecordingTask` but never reports starting:
-/// stays in Starting until commanded down.
+/// Records commands like `RecordingTask` but reports starting only when
+/// told: stays in Starting until then, or until commanded down.
 struct SilentTask {
   name: &'static str,
   tx: UnboundedSender<(&'static str, RecordedCmd)>,
@@ -100,7 +100,7 @@ struct SilentTask {
 impl Task for SilentTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => {
+      TaskCmd::Start(_) => {
         self.tx.send((self.name, RecordedCmd::Start)).unwrap();
       }
       TaskCmd::Stop => {
@@ -112,8 +112,16 @@ impl Task for SilentTask {
         fx.stopped(ExitInfo::signal(9));
       }
       // Never frozen by these tests.
-      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
-      TaskCmd::Msg(_) => (),
+      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+      TaskCmd::Msg(m) => {
+        if let Ok(report) = m.downcast::<Report>() {
+          match *report {
+            Report::Started => fx.started(),
+            Report::Ready => fx.ready(),
+            Report::Stopped(info) => fx.stopped(info),
+          }
+        }
+      }
     }
   }
 }
@@ -128,7 +136,7 @@ struct StubbornTask {
 impl Task for StubbornTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => {
+      TaskCmd::Start(_) => {
         self.tx.send((self.name, RecordedCmd::Start)).unwrap();
         fx.started();
       }
@@ -138,7 +146,7 @@ impl Task for StubbornTask {
       TaskCmd::Kill => {
         self.tx.send((self.name, RecordedCmd::Kill)).unwrap();
       }
-      TaskCmd::Duplicate(_) | TaskCmd::Thaw => (),
+      TaskCmd::Thaw => (),
       TaskCmd::Freeze(number) => self.ctx.send(KernelCommand::TaskFrozen(
         number,
         TaskKindSnapshot::Console {},
@@ -200,11 +208,10 @@ impl Fixture {
 
   /// Round-trip a query so all previously sent messages are processed.
   async fn flush(&self) {
-    let rx = self.pc.query(KernelQuery::ListTasks(TaskSelector::all()));
+    let rx = self.pc.list_tasks(TaskSelector::all());
     tokio::time::timeout(Duration::from_secs(1), rx)
       .await
-      .expect("timed out waiting for kernel query response")
-      .expect("kernel query response channel closed");
+      .expect("timed out waiting for kernel query response");
   }
 
   async fn quit(mut self, handle: tokio::task::JoinHandle<()>) {
@@ -651,6 +658,9 @@ fn restored_running_task_follows_the_new_ready_check() {
     attempts: 0,
     last_start_secs_ago: Some(40),
     timer_ms: Some(5000),
+    spec: None,
+    run_spec: None,
+    origin: None,
     kind: TaskKindSnapshot::Console {},
   };
   let secs = Duration::from_secs;
@@ -1014,11 +1024,8 @@ async fn lists_a_batch_in_the_order_given() {
               tx.send((n.from, after)).unwrap();
             }
           }
-          TaskCmd::Start
-          | TaskCmd::Stop
-          | TaskCmd::Kill
-          | TaskCmd::Duplicate(_)
-          | TaskCmd::Thaw => (),
+          TaskCmd::Start(_) | TaskCmd::Stop | TaskCmd::Kill | TaskCmd::Thaw => {
+          }
         }
       }
     },
@@ -1073,7 +1080,7 @@ async fn lists_a_batch_in_the_order_given() {
 
   let copy = pc.alloc_id();
   let def = TaskDef {
-    after: Some(api_a),
+    place: Place::After(TaskPath::new("api/a").unwrap()),
     ..path_def("api/a-2")
   };
   let ack = pc.register_task(registration(copy, def));
@@ -1085,13 +1092,12 @@ async fn lists_a_batch_in_the_order_given() {
   assert_eq!(added.recv().await.unwrap(), (last, Some(db)));
 
   let listed = ["web", "api/a", "api/a-2", "api/b", "db", "gone/y"];
-  let rx = pc.query(KernelQuery::ListTasks(TaskSelector::Glob(
-    SpaceSelector::default_space(),
-    "**".to_string(),
-  )));
-  let KernelQueryResponse::TaskList(tasks) = rx.await.unwrap() else {
-    panic!("unexpected query response");
-  };
+  let tasks = pc
+    .list_tasks(TaskSelector::Glob(
+      SpaceSelector::default_space(),
+      "**".to_string(),
+    ))
+    .await;
   let names: Vec<String> = tasks.iter().map(|task| task.name()).collect();
   assert_eq!(names, listed);
 
@@ -1108,17 +1114,11 @@ async fn lists_a_batch_in_the_order_given() {
 }
 
 async fn label_of(pc: &TaskContext, id: TaskId) -> Option<String> {
-  let rx = pc.query(KernelQuery::ListTasks(TaskSelector::all()));
-  let resp = tokio::time::timeout(Duration::from_secs(1), rx)
+  let rx = pc.list_tasks(TaskSelector::all());
+  let list = tokio::time::timeout(Duration::from_secs(1), rx)
     .await
-    .expect("timed out listing tasks")
-    .expect("kernel query channel closed");
-  match resp {
-    KernelQueryResponse::TaskList(list) => {
-      list.into_iter().find(|t| t.id == id).and_then(|t| t.label)
-    }
-    _ => panic!("unexpected query response"),
-  }
+    .expect("timed out listing tasks");
+  list.into_iter().find(|t| t.id == id).and_then(|t| t.label)
 }
 
 #[tokio::test]
@@ -1147,17 +1147,11 @@ async fn task_label_is_stored_and_updatable() {
 }
 
 async fn state_of(pc: &TaskContext, id: TaskId) -> Option<TaskState> {
-  let rx = pc.query(KernelQuery::ListTasks(TaskSelector::all()));
-  let resp = tokio::time::timeout(Duration::from_secs(1), rx)
+  let rx = pc.list_tasks(TaskSelector::all());
+  let list = tokio::time::timeout(Duration::from_secs(1), rx)
     .await
-    .expect("timed out listing tasks")
-    .expect("kernel query channel closed");
-  match resp {
-    KernelQueryResponse::TaskList(list) => {
-      list.into_iter().find(|t| t.id == id).map(|t| t.state)
-    }
-    _ => panic!("unexpected query response"),
-  }
+    .expect("timed out listing tasks");
+  list.into_iter().find(|t| t.id == id).map(|t| t.state)
 }
 
 async fn resolve(pc: &TaskContext, path: &str) -> Option<TaskId> {
@@ -1169,18 +1163,14 @@ async fn resolve_in(
   space: TaskSpaceId,
   path: &str,
 ) -> Option<TaskId> {
-  let rx = pc.query(KernelQuery::ListTasks(TaskSelector::Glob(
+  let rx = pc.list_tasks(TaskSelector::Glob(
     SpaceSelector::One(space),
     path.to_string(),
-  )));
-  let resp = tokio::time::timeout(Duration::from_secs(1), rx)
+  ));
+  let tasks = tokio::time::timeout(Duration::from_secs(1), rx)
     .await
-    .expect("timed out resolving path")
-    .expect("kernel query channel closed");
-  match resp {
-    KernelQueryResponse::TaskList(tasks) => tasks.first().map(|t| t.id),
-    _ => panic!("unexpected query response"),
-  }
+    .expect("timed out resolving path");
+  tasks.first().map(|t| t.id)
 }
 
 #[tokio::test]
@@ -1710,17 +1700,12 @@ async fn explain_reports_block_reason() {
     [("base", RecordedCmd::Start), ("dep", RecordedCmd::Start)]
   );
 
-  let rx = fx.pc.query(KernelQuery::Explain(TaskSelector::Id(app)));
-  let resp = tokio::time::timeout(Duration::from_secs(1), rx)
+  let rx = fx.pc.explain(TaskSelector::Id(app));
+  let mut explains = tokio::time::timeout(Duration::from_secs(1), rx)
     .await
-    .unwrap()
     .unwrap();
-  let explain = match resp {
-    KernelQueryResponse::Explain(mut explains) if explains.len() == 1 => {
-      explains.pop().unwrap()
-    }
-    _ => panic!("missing explain response"),
-  };
+  assert_eq!(explains.len(), 1);
+  let explain = explains.pop().unwrap();
   assert_eq!(explain.name, "app");
   assert_eq!(explain.state, TaskState::Idle);
   assert!(explain.wanted);
@@ -1943,26 +1928,16 @@ async fn spaces_keep_paths_separate() {
     .register_task(dekit_def, |_| Box::new(crate::kernel::task::TargetTask));
   let handle = tokio::spawn(kernel.run());
 
-  let default = pc
-    .query(KernelQuery::ListTasks(TaskSelector::all()))
-    .await
-    .unwrap();
-  let KernelQueryResponse::TaskList(default) = default else {
-    panic!("unexpected response");
-  };
+  let default = pc.list_tasks(TaskSelector::all()).await;
   assert_eq!(default.len(), 1);
   assert_eq!(default[0].id, default_id);
 
   let dekit = pc
-    .query(KernelQuery::ListTasks(TaskSelector::Glob(
+    .list_tasks(TaskSelector::Glob(
       SpaceSelector::One(TaskSpaceId::dekit()),
       "**".to_string(),
-    )))
-    .await
-    .unwrap();
-  let KernelQueryResponse::TaskList(dekit) = dekit else {
-    panic!("unexpected response");
-  };
+    ))
+    .await;
   assert_eq!(dekit.len(), 1);
   assert_eq!(dekit[0].id, dekit_id);
 
@@ -2094,6 +2069,36 @@ async fn active_watch_reports_transitions_only() {
   fx.quit(handle).await;
 }
 
+/// A watch sees a task move out of what it selects.
+#[tokio::test]
+async fn active_watch_sees_a_move() {
+  let mut fx = Fixture::new();
+  let a = fx.add("a", path_def("web/a"));
+  let handle = fx.run();
+
+  let glob =
+    TaskSelector::Glob(SpaceSelector::default_space(), "web/**".into());
+  let mut watch = fx.pc.watch_active(glob);
+  fx.pc.send(KernelCommand::Start(TaskSelector::Id(a), None));
+  assert_eq!(fx.recv().await, ("a", RecordedCmd::Start));
+  assert_eq!(watch.recv().await, Some(true));
+
+  let (reply, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("web/a").unwrap(),
+      to: TaskPath::new("a").unwrap(),
+      place: Place::Last,
+    },
+    reply,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  assert_eq!(watch.recv().await, Some(false));
+
+  fx.quit(handle).await;
+}
+
 #[tokio::test]
 async fn subscribe_replays_existing_tasks() {
   let kernel = Kernel::new();
@@ -2144,8 +2149,7 @@ async fn subscribe_replays_existing_tasks() {
   );
   assert!(ack.await.unwrap().is_ok());
   subscribed_rx.await.unwrap();
-  let flush = pc.query(KernelQuery::ListTasks(TaskSelector::all()));
-  flush.await.unwrap();
+  pc.list_tasks(TaskSelector::all()).await;
 
   let mut replayed = HashSet::new();
   for _ in 0..2 {
@@ -2237,16 +2241,8 @@ async fn second_freeze_is_refused_and_reports_still_apply() {
   task_ctx.send(KernelCommand::TaskStopped(ExitInfo::code(1)));
   fx.flush().await;
   fx.assert_no_cmd();
-  match fx
-    .pc
-    .query(KernelQuery::ListTasks(TaskSelector::Id(a)))
-    .await
-  {
-    Ok(KernelQueryResponse::TaskList(tasks)) => {
-      assert_eq!(tasks[0].state, TaskState::Exited(ExitInfo::code(1)));
-    }
-    _ => panic!("query failed"),
-  }
+  let tasks = fx.pc.list_tasks(TaskSelector::Id(a)).await;
+  assert_eq!(tasks[0].state, TaskState::Exited(ExitInfo::code(1)));
 
   fx.pc.send(KernelCommand::Thaw);
   fx.quit(handle).await;
@@ -2503,7 +2499,7 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
         ..Default::default()
       };
       (
-        Some(saved),
+        saved,
         TaskRegistration {
           task_id: TaskId(saved.id),
           def,
@@ -2524,18 +2520,10 @@ async fn restore_rebuilds_graph_and_drives_only_what_changed() {
   restored.flush().await;
   restored.assert_no_cmd();
 
-  match restored
-    .pc
-    .query(KernelQuery::Explain(TaskSelector::Id(b)))
-    .await
-  {
-    Ok(KernelQueryResponse::Explain(explain)) => {
-      assert_eq!(explain[0].state, TaskState::Ready);
-      assert!(explain[0].pinned);
-      assert_eq!(explain[0].deps.len(), 1);
-    }
-    _ => panic!("explain failed"),
-  }
+  let explain = restored.pc.explain(TaskSelector::Id(b)).await;
+  assert_eq!(explain[0].state, TaskState::Ready);
+  assert!(explain[0].pinned);
+  assert_eq!(explain[0].deps.len(), 1);
 
   // Dropping the pin now stops b first, then a: the edges survived.
   restored
@@ -2613,15 +2601,7 @@ async fn not_ready_in_time_backs_off_and_retries_on_failure() {
   tokio::time::advance(Duration::from_secs(5)).await;
   assert_eq!(fx.recv().await, ("a", RecordedCmd::Stop));
   fx.flush().await;
-  let graph_attempts = match fx
-    .pc
-    .query(KernelQuery::Explain(TaskSelector::Id(a)))
-    .await
-    .unwrap()
-  {
-    KernelQueryResponse::Explain(explains) => explains[0].attempts,
-    KernelQueryResponse::TaskList(_) => unreachable!(),
-  };
+  let graph_attempts = fx.pc.explain(TaskSelector::Id(a)).await[0].attempts;
   assert_eq!(graph_attempts, 2);
 
   fx.quit(handle).await;
@@ -2805,6 +2785,9 @@ fn saved_task(state: snap::TaskState) -> snap::Task {
     attempts: 0,
     last_start_secs_ago: Some(40),
     timer_ms: Some(4000),
+    spec: None,
+    run_spec: None,
+    origin: None,
     kind: TaskKindSnapshot::Console {},
   }
 }
@@ -2954,7 +2937,7 @@ async fn restored_done_job_that_is_now_a_service_is_started() {
         ..Default::default()
       };
       (
-        Some(saved),
+        saved,
         TaskRegistration {
           task_id: TaskId(saved.id),
           def,
@@ -3318,4 +3301,591 @@ fn saved_pin_is_carried_through_a_snapshot() {
     .graph
     .snapshot(HashMap::from([(TaskId(1), TaskKindSnapshot::Console {})]));
   assert!(snapshot.tasks[0].saved_pin);
+}
+
+async fn described(pc: &TaskContext) -> Vec<TaskDescription> {
+  pc.describe(TaskSelector::all()).await
+}
+
+fn update(deps: Vec<TaskSelector>, label: &str) -> Box<TaskUpdate> {
+  let mut spec = crate::spec::TaskSpec::with_cmd(vec!["x".to_string()]);
+  spec.set_label(Some(label));
+  Box::new(TaskUpdate {
+    next: NextRun {
+      kind: TaskKind::Job,
+      ready: ReadyMode::Immediate,
+      stop_timeout: STOP_TIMEOUT,
+      spec: Some(spec),
+    },
+    restart: RestartMode::Never,
+    deps,
+    tags: vec!["t".to_string()],
+    label: Some(label.to_string()),
+    was: None,
+    restart_running: false,
+  })
+}
+
+/// An update while a task is getting ready leaves that run getting ready
+/// as it started to; the next run gets ready the new way.
+#[tokio::test]
+async fn an_update_while_getting_ready_applies_from_the_next_start() {
+  let mut fx = Fixture::new();
+  let tx = fx.tx.clone();
+  let api = fx.kernel.as_mut().unwrap().register_task(
+    TaskDef {
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+      ..path_def("api")
+    },
+    move |_| Box::new(SilentTask { name: "api", tx }),
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut reported = update(Vec::new(), "api");
+  reported.next.kind = TaskKind::Service;
+  reported.next.ready = ReadyMode::Reported { timeout: None };
+  fx.pc
+    .send(KernelCommand::Update(TaskSelector::Id(api), reported, tx));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  fx.pc.send_msg(api, Report::Started);
+  fx.flush().await;
+  assert_eq!(state_of(&fx.pc, api).await, Some(TaskState::Ready));
+
+  fx.pc
+    .send(KernelCommand::Restart(TaskSelector::Id(api), None));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Stop));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
+  fx.pc.send_msg(api, Report::Started);
+  fx.flush().await;
+  assert_eq!(state_of(&fx.pc, api).await, Some(TaskState::Running));
+
+  fx.quit(handle).await;
+}
+
+/// A run keeps what it started from: an update during it is the next
+/// run's, its stop timeout too, and a snapshot carries both definitions.
+#[tokio::test]
+async fn a_run_keeps_its_definition_through_an_update() {
+  let mut fx = Fixture::new();
+  let api = fx.add(
+    "api",
+    TaskDef {
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+      ..path_def("api")
+    },
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
+  fx.flush().await;
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut slow = update(Vec::new(), "v2");
+  slow.next.kind = TaskKind::Service;
+  slow.next.stop_timeout = Duration::from_secs(60);
+  fx.pc
+    .send(KernelCommand::Update(TaskSelector::Id(api), slow, tx));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  fx.flush().await;
+  let snapshot = freeze(&fx).await;
+  let task = &snapshot.tasks[0];
+  assert_eq!(task.stop_timeout_ms, None, "the run's own");
+  let said = |spec: &Option<crate::spec::TaskSpec>| {
+    spec.as_ref().and_then(|s| s.label().map(String::from))
+  };
+  assert_eq!(said(&task.spec).as_deref(), Some("v2"));
+  assert_eq!(
+    task.run_spec.as_ref().and_then(|s| s.argv()),
+    Some(vec!["api".into()])
+  );
+  fx.pc.send(KernelCommand::Thaw);
+
+  fx.pc
+    .send(KernelCommand::Restart(TaskSelector::Id(api), None));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Stop));
+  assert_eq!(fx.recv().await, ("api", RecordedCmd::Start));
+  fx.flush().await;
+  let snapshot = freeze(&fx).await;
+  let task = &snapshot.tasks[0];
+  assert_eq!(task.stop_timeout_ms, Some(60_000));
+  assert_eq!(task.run_spec, None, "the run is the definition now");
+  fx.pc.send(KernelCommand::Thaw);
+
+  fx.quit(handle).await;
+}
+
+/// A copy is made from the original's definition, after it, with its
+/// deps; one that can't be registered is refused, not reported done.
+#[tokio::test]
+async fn a_copy_is_made_from_the_definition() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", path_def("db"));
+  let make_copy: crate::kernel::kernel_message::MakeCopy =
+    std::sync::Arc::new(|task_id, key, spec| {
+      Ok(TaskRegistration {
+        task_id,
+        def: TaskDef {
+          path: key.map(|key| key.path),
+          label: spec.label().map(String::from),
+          spec: Some(spec),
+          ..TaskDef::default()
+        },
+        factory: Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+      })
+    });
+  let api = fx.add(
+    "api",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+      make_copy: Some(make_copy),
+      ..path_def("api")
+    },
+  );
+  let handle = fx.run();
+  let copy = |path: &str| {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    fx.pc.send(KernelCommand::Duplicate(
+      TaskSelector::Id(api),
+      DuplicateRequest {
+        label: Some("API 2".into()),
+        path: Some(TaskPath::new(path).unwrap()),
+        start: false,
+      },
+      tx,
+    ));
+    rx
+  };
+  assert_eq!(copy("api2").await.unwrap(), Ok(1));
+  let tasks = described(&fx.pc).await;
+  let names: Vec<String> = tasks.iter().map(|t| t.info.name()).collect();
+  assert_eq!(names, ["db", "api", "api2"]);
+  assert_eq!(tasks[2].info.label.as_deref(), Some("API 2"));
+  let copied = tasks[2].spec.as_ref().unwrap();
+  assert_eq!(copied.argv(), Some(vec!["api".into()]));
+  assert_eq!(copied.deps(), ["db"]);
+  assert!(matches!(
+    copy("db").await.unwrap(),
+    Err(RegisterError::PathTaken(_))
+  ));
+  // A task with no definition has none to copy.
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Duplicate(
+    TaskSelector::Id(db),
+    DuplicateRequest {
+      label: None,
+      path: None,
+      start: false,
+    },
+    tx,
+  ));
+  assert_eq!(rx.await.unwrap(), Err(RegisterError::NoDefinition));
+
+  fx.pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+  fx.quit(handle).await;
+}
+
+/// A running job edited into a service still ends as a job, done for
+/// what needs it; it is a service from its next start.
+#[tokio::test]
+async fn a_running_job_edited_into_a_service_ends_as_a_job() {
+  let mut fx = Fixture::new();
+  let migrate = fx.add(
+    "migrate",
+    TaskDef {
+      kind: TaskKind::Job,
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["migrate".into()])),
+      ..path_def("migrate")
+    },
+  );
+  let handle = fx.run();
+  fx.pc
+    .send(KernelCommand::Start(TaskSelector::Id(migrate), None));
+  assert_eq!(fx.recv().await, ("migrate", RecordedCmd::Start));
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut service = update(Vec::new(), "migrate");
+  service.next.kind = TaskKind::Service;
+  fx.pc.send(KernelCommand::Update(
+    TaskSelector::Id(migrate),
+    service,
+    tx,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  fx.pc.send_msg(migrate, Report::Stopped(ExitInfo::code(0)));
+  fx.flush().await;
+  assert!(matches!(
+    state_of(&fx.pc, migrate).await,
+    Some(TaskState::Done(_))
+  ));
+
+  fx.pc
+    .send(KernelCommand::Start(TaskSelector::Id(migrate), None));
+  assert_eq!(fx.recv().await, ("migrate", RecordedCmd::Start));
+  fx.flush().await;
+  let tasks = described(&fx.pc).await;
+  assert_eq!(tasks[0].kind, TaskKind::Service);
+
+  fx.quit(handle).await;
+}
+
+/// An update made from a definition the task no longer has is refused:
+/// it would undo the change in between.
+#[tokio::test]
+async fn an_update_from_another_definition_is_refused() {
+  let mut fx = Fixture::new();
+  let was = crate::spec::TaskSpec::with_cmd(vec!["api".into()]);
+  let api = fx.add(
+    "api",
+    TaskDef {
+      spec: Some(was.clone()),
+      ..path_def("api")
+    },
+  );
+  let handle = fx.run();
+
+  for (label, result) in [("A", Ok(1)), ("B", Err(RegisterError::Changed))] {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut redefined = update(Vec::new(), label);
+    redefined.was = Some(was.clone());
+    fx.pc
+      .send(KernelCommand::Update(TaskSelector::Id(api), redefined, tx));
+    assert_eq!(rx.await.unwrap(), result);
+  }
+  let tasks = described(&fx.pc).await;
+  assert_eq!(tasks[0].info.label.as_deref(), Some("A"));
+  // Nor one that is gone.
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut redefined = update(Vec::new(), "C");
+  redefined.was = Some(was);
+  fx.pc.send(KernelCommand::Update(
+    TaskSelector::Id(TaskId(999)),
+    redefined,
+    tx,
+  ));
+  assert_eq!(rx.await.unwrap(), Err(RegisterError::Changed));
+
+  fx.quit(handle).await;
+}
+
+/// A task redefined in place keeps its id and place; its deps are
+/// replaced, and one that needs the task is refused with nothing changed,
+/// as is one with no definition.
+#[tokio::test]
+async fn update_redefines_in_place_and_refuses_a_cycle() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", path_def("db"));
+  let cache = fx.add(
+    "cache",
+    TaskDef {
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["cache".into()])),
+      ..path_def("cache")
+    },
+  );
+  let api = fx.add(
+    "api",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db)],
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+      ..path_def("api")
+    },
+  );
+  let handle = fx.run();
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  let mut redefined = update(vec![TaskSelector::Id(cache)], "API");
+  let spec = redefined.next.spec.as_mut().unwrap();
+  spec.set_deps(vec!["cache".to_string()]);
+  fx.pc
+    .send(KernelCommand::Update(TaskSelector::Id(api), redefined, tx));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  let tasks = described(&fx.pc).await;
+  let api_now = tasks.iter().find(|t| t.info.id == api).unwrap();
+  assert_eq!(api_now.kind, TaskKind::Job);
+  assert_eq!(api_now.info.label.as_deref(), Some("API"));
+  let spec = api_now.spec.as_ref().unwrap();
+  assert_eq!(spec.deps(), ["cache"]);
+  assert_eq!(spec.label(), Some("API"));
+  // A spec and no origin: the runner's own.
+  let dynamic = fx
+    .pc
+    .list_tasks(TaskSelector::Tag(
+      SpaceSelector::default_space(),
+      "dynamic".to_string(),
+    ))
+    .await;
+  assert!(dynamic.iter().any(|t| t.id == api));
+
+  // cache -> api would close cache -> api -> cache.
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Update(
+    TaskSelector::Id(cache),
+    update(vec![TaskSelector::Id(api)], "C"),
+    tx,
+  ));
+  assert!(matches!(rx.await.unwrap(), Err(RegisterError::DepCycle(_))));
+  let tasks = described(&fx.pc).await;
+  let cache_now = tasks.iter().find(|t| t.info.id == cache).unwrap();
+  assert_eq!(cache_now.kind, TaskKind::Service, "nothing changed");
+  let names: Vec<String> = tasks.iter().map(|t| t.info.name()).collect();
+  assert_eq!(names, ["db", "cache", "api"]);
+
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Update(
+    TaskSelector::Id(db),
+    update(Vec::new(), "D"),
+    tx,
+  ));
+  assert_eq!(rx.await.unwrap(), Err(RegisterError::NoDefinition));
+  let tasks = described(&fx.pc).await;
+  assert!(tasks[0].spec.is_none(), "nothing changed");
+
+  fx.quit(handle).await;
+}
+
+/// A task's deps are its edges: its definition names each by where it
+/// is, after a move too, and not once it is gone.
+#[tokio::test]
+async fn deps_are_the_tasks_edges() {
+  let mut fx = Fixture::new();
+  let db = fx.add("db", path_def("db"));
+  let cache = fx.add("cache", path_def("cache"));
+  let mut spec = crate::spec::TaskSpec::with_cmd(vec!["api".into()]);
+  // What the definition said is not kept: the edges are.
+  spec.set_deps(vec!["db".to_string(), "gone".to_string()]);
+  let api = fx.add(
+    "api",
+    TaskDef {
+      deps: vec![TaskSelector::Id(db), TaskSelector::Id(cache)],
+      spec: Some(spec),
+      ..path_def("api")
+    },
+  );
+  let handle = fx.run();
+  let deps = |tasks: Vec<TaskDescription>| {
+    let api = tasks.into_iter().find(|t| t.info.id == api).unwrap();
+    api.spec.unwrap().deps()
+  };
+  assert_eq!(deps(described(&fx.pc).await), ["cache", "db"]);
+
+  let (reply, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("db").unwrap(),
+      to: TaskPath::new("data/db").unwrap(),
+      place: Place::Last,
+    },
+    reply,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  assert_eq!(deps(described(&fx.pc).await), ["cache", "data/db"]);
+
+  fx.pc
+    .send(KernelCommand::Remove(TaskSelector::Id(db), None));
+  assert_eq!(deps(described(&fx.pc).await), ["cache"]);
+
+  fx.pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+  fx.quit(handle).await;
+}
+
+/// A move tells the console where each moved task is now, in its new
+/// list order.
+#[tokio::test]
+async fn move_relists_a_group_and_notifies_in_order() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let (tx, mut moved) = unbounded_channel();
+  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+  let ack = pc.spawn_async_with_id(
+    pc.alloc_id(),
+    TaskDef::default(),
+    move |pc, mut cmds| async move {
+      pc.subscribe_path(
+        TaskKey::default_space(TaskPath::root()),
+        SubMode::Subtree,
+      );
+      subscribed_tx.send(()).unwrap();
+      while let Some(cmd) = cmds.recv().await {
+        if let TaskCmd::Msg(msg) = cmd
+          && let Ok(n) = msg.downcast::<TaskNotification>()
+          && let TaskNotify::Moved { path, after } = n.notify
+        {
+          tx.send((n.from, path.unwrap().to_string(), after)).unwrap();
+        }
+      }
+    },
+  );
+  assert!(ack.await.unwrap().is_ok());
+  subscribed_rx.await.unwrap();
+  let mut ids = Vec::new();
+  for path in ["db", "web/api", "web/ui"] {
+    let id = pc.alloc_id();
+    let ack = pc.register_task(TaskRegistration {
+      task_id: id,
+      def: path_def(path),
+      factory: Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+    });
+    assert!(ack.await.unwrap().is_ok());
+    ids.push(id);
+  }
+  let [db, api, ui] = ids[..] else {
+    unreachable!()
+  };
+
+  let (reply, rx) = tokio::sync::oneshot::channel();
+  pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("web").unwrap(),
+      to: TaskPath::new("apps/web").unwrap(),
+      place: Place::First,
+    },
+    reply,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(2));
+  // `apps` is new: listed last, after `db`.
+  assert_eq!(
+    moved.recv().await.unwrap(),
+    (api, "apps/web/api".to_string(), Some(db))
+  );
+  assert_eq!(
+    moved.recv().await.unwrap(),
+    (ui, "apps/web/ui".to_string(), Some(api))
+  );
+  let names: Vec<String> =
+    described(&pc).await.iter().map(|t| t.info.name()).collect();
+  assert_eq!(names, ["db", "apps/web/api", "apps/web/ui"]);
+
+  let (reply, rx) = tokio::sync::oneshot::channel();
+  pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("db").unwrap(),
+      to: TaskPath::new("apps/web/api/db").unwrap(),
+      place: Place::Last,
+    },
+    reply,
+  ));
+  assert!(matches!(rx.await.unwrap(), Err(MoveError::UnderTask(_))));
+
+  pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+  fx.quit(handle).await;
+}
+
+/// A run starts from the definition as it is then, and where the task
+/// is listed then: a move since names its log.
+#[tokio::test]
+async fn a_run_starts_where_the_task_is() {
+  struct Told(UnboundedSender<Option<String>>);
+  impl Task for Told {
+    fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
+      match cmd {
+        TaskCmd::Start(run) => {
+          let path = run.and_then(|run| run.path).map(|p| p.to_string());
+          self.0.send(path).unwrap();
+          fx.started();
+        }
+        TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
+        TaskCmd::Msg(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+      }
+    }
+  }
+  let mut fx = Fixture::new();
+  let (tx, mut told) = unbounded_channel();
+  let kernel = fx.kernel.as_mut().unwrap();
+  let api = kernel.register_task(
+    TaskDef {
+      spec: Some(crate::spec::TaskSpec::with_cmd(vec!["api".into()])),
+      ..path_def("web/api")
+    },
+    move |_| Box::new(Told(tx)),
+  );
+  let handle = fx.run();
+  let (reply, rx) = tokio::sync::oneshot::channel();
+  fx.pc.send(KernelCommand::Move(
+    MoveTask {
+      space: TaskSpaceId::default_space(),
+      from: TaskPath::new("web").unwrap(),
+      to: TaskPath::new("apps/web").unwrap(),
+      place: Place::Last,
+    },
+    reply,
+  ));
+  assert_eq!(rx.await.unwrap(), Ok(1));
+  fx.pc
+    .send(KernelCommand::Start(TaskSelector::Id(api), None));
+  assert_eq!(told.recv().await.unwrap().as_deref(), Some("apps/web/api"));
+  fx.quit(handle).await;
+}
+
+/// A task given another origin tells the console, which marks the
+/// runner's own; the same one again tells nothing.
+#[tokio::test]
+async fn a_new_origin_is_told() {
+  let mut fx = Fixture::new();
+  let handle = fx.run();
+  let pc = fx.pc.clone();
+  let (tx, mut told) = unbounded_channel();
+  let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+  let ack = pc.spawn_async_with_id(
+    pc.alloc_id(),
+    TaskDef::default(),
+    move |pc, mut cmds| async move {
+      pc.subscribe_path(
+        TaskKey::default_space(TaskPath::root()),
+        SubMode::Subtree,
+      );
+      subscribed_tx.send(()).unwrap();
+      while let Some(cmd) = cmds.recv().await {
+        if let TaskCmd::Msg(msg) = cmd
+          && let Ok(n) = msg.downcast::<TaskNotification>()
+        {
+          match n.notify {
+            TaskNotify::Changed { .. } => tx.send("changed").unwrap(),
+            TaskNotify::Removed => tx.send("removed").unwrap(),
+            _ => (),
+          }
+        }
+      }
+    },
+  );
+  assert!(ack.await.unwrap().is_ok());
+  subscribed_rx.await.unwrap();
+  let id = pc.alloc_id();
+  let ack = pc.register_task(TaskRegistration {
+    task_id: id,
+    def: path_def("api"),
+    factory: Box::new(|_| Box::new(crate::kernel::task::TargetTask)),
+  });
+  assert!(ack.await.unwrap().is_ok());
+  let origin = crate::spec::Source {
+    file: "dekit.yaml".into(),
+    key: "api".into(),
+    mount: String::new(),
+  };
+  for origin in [Some(origin.clone()), Some(origin), None] {
+    let (ack, rx) = tokio::sync::oneshot::channel();
+    pc.send(KernelCommand::SetOrigin(
+      TaskSelector::Id(id),
+      origin,
+      Some(ack),
+    ));
+    assert_eq!(rx.await.unwrap(), 1);
+  }
+  pc.send(KernelCommand::Remove(TaskSelector::Id(id), None));
+  let mut seen = Vec::new();
+  while seen.last() != Some(&"removed") {
+    seen.push(told.recv().await.unwrap());
+  }
+  assert_eq!(seen, ["changed", "changed", "removed"]);
+
+  pc.send(KernelCommand::Remove(TaskSelector::all(), None));
+  fx.quit(handle).await;
 }

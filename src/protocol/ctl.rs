@@ -3,7 +3,11 @@ use std::{borrow::Cow, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::term::{Geometry, Size, TermEvent, key::Key, mouse::MouseEvent};
+use crate::term::{
+  Geometry, Size, TermEvent,
+  key::{Key, KeyCode, KeyEventKind, KeyEventState, KeyMods},
+  mouse::{MouseEvent, MouseEventKind},
+};
 
 /// Bumped only if the framing or envelope breaks; additive changes
 /// (new methods, events, fields, error codes) keep it at 1.
@@ -178,6 +182,11 @@ pub mod codes {
   pub const AMBIGUOUS: &str = "ambiguous";
   pub const BAD_TARGET: &str = "bad_target";
   pub const PATH_TAKEN: &str = "path_taken";
+  /// The task is no longer what the request was made from.
+  pub const CHANGED: &str = "changed";
+  /// The config on disk does not load, so there is nothing to read it
+  /// against.
+  pub const BAD_CONFIG: &str = "bad_config";
   pub const NO_SCREEN: &str = "no_screen";
   pub const INTERNAL: &str = "internal";
   pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
@@ -297,8 +306,8 @@ impl InputDialect {
       return named(EVENT_INPUT, LegacyInput::of(event));
     }
     match event {
-      TermEvent::Key(key) => named(EVENT_KEY, key),
-      TermEvent::Mouse(mouse) => named(EVENT_MOUSE, mouse),
+      TermEvent::Key(key) => named(EVENT_KEY, KeyParams::from(key)),
+      TermEvent::Mouse(mouse) => named(EVENT_MOUSE, MouseParams::from(mouse)),
       TermEvent::Paste(text) => named(
         EVENT_PASTE,
         PasteParams {
@@ -322,8 +331,12 @@ impl InputDialect {
 pub fn input_of(event: Event) -> Result<TermEvent, serde_json::Error> {
   let Event { name, params } = event;
   Ok(match name.as_str() {
-    EVENT_KEY => TermEvent::Key(serde_json::from_value(params)?),
-    EVENT_MOUSE => TermEvent::Mouse(serde_json::from_value(params)?),
+    EVENT_KEY => {
+      TermEvent::Key(serde_json::from_value::<KeyParams>(params)?.into())
+    }
+    EVENT_MOUSE => {
+      TermEvent::Mouse(serde_json::from_value::<MouseParams>(params)?.into())
+    }
     EVENT_PASTE => {
       let PasteParams { text } = serde_json::from_value(params)?;
       TermEvent::Paste(text.into_owned())
@@ -351,6 +364,119 @@ struct PasteParams<'a> {
 #[derive(Deserialize, Serialize)]
 struct FocusParams {
   gained: bool,
+}
+
+/// The `key` event's params: a `Key` with its flags as lists of names
+/// (`flag_names`), left out when empty. A name this build does not know
+/// is dropped, and the key still reads.
+#[derive(Deserialize, Serialize)]
+struct KeyParams {
+  code: KeyCode,
+  #[serde(
+    default = "KeyMods::empty",
+    with = "flag_names",
+    skip_serializing_if = "KeyMods::is_empty"
+  )]
+  mods: KeyMods,
+  kind: KeyEventKind,
+  #[serde(
+    default = "KeyEventState::empty",
+    with = "flag_names",
+    skip_serializing_if = "KeyEventState::is_empty"
+  )]
+  state: KeyEventState,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  unshifted: Option<char>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  base: Option<char>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  text: Option<String>,
+}
+
+impl From<&Key> for KeyParams {
+  fn from(key: &Key) -> KeyParams {
+    KeyParams {
+      code: key.code,
+      mods: key.mods,
+      kind: key.kind,
+      state: key.state,
+      unshifted: key.unshifted,
+      base: key.base,
+      text: key.text.clone(),
+    }
+  }
+}
+
+impl From<KeyParams> for Key {
+  fn from(params: KeyParams) -> Key {
+    Key {
+      code: params.code,
+      mods: params.mods,
+      kind: params.kind,
+      state: params.state,
+      unshifted: params.unshifted,
+      base: params.base,
+      text: params.text,
+    }
+  }
+}
+
+/// The `mouse` event's params: a `MouseEvent` with `mods` as for `key`.
+#[derive(Deserialize, Serialize)]
+struct MouseParams {
+  kind: MouseEventKind,
+  x: i32,
+  y: i32,
+  #[serde(
+    default = "KeyMods::empty",
+    with = "flag_names",
+    skip_serializing_if = "KeyMods::is_empty"
+  )]
+  mods: KeyMods,
+}
+
+impl From<&MouseEvent> for MouseParams {
+  fn from(mouse: &MouseEvent) -> MouseParams {
+    MouseParams {
+      kind: mouse.kind,
+      x: mouse.x,
+      y: mouse.y,
+      mods: mouse.mods,
+    }
+  }
+}
+
+impl From<MouseParams> for MouseEvent {
+  fn from(params: MouseParams) -> MouseEvent {
+    MouseEvent {
+      kind: params.kind,
+      x: params.x,
+      y: params.y,
+      mods: params.mods,
+    }
+  }
+}
+
+/// Flags on the wire: the names of the ones set, `["control", "alt"]`,
+/// which dekit owns (`NamedFlags`), so no crate's text form is.
+mod flag_names {
+  use serde::{Deserialize, Deserializer, Serializer};
+
+  use crate::term::key::NamedFlags;
+
+  pub fn serialize<F: NamedFlags, S: Serializer>(
+    flags: &F,
+    serializer: S,
+  ) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(flags.names())
+  }
+
+  pub fn deserialize<'de, F: NamedFlags, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<F, D::Error> {
+    let names = Vec::<String>::deserialize(deserializer)?;
+    Ok(F::from_names(names.iter().map(String::as_str)))
+  }
 }
 
 /// The `input` event's params: the first dialect's one enum, as it
@@ -559,11 +685,11 @@ mod tests {
       ),
       (
         named_input(&ctrl_alt_c()),
-        r#"{"type":"event","name":"key","params":{"code":{"Char":"c"},"kind":"Press","mods":"CONTROL | ALT","state":""}}"#,
+        r#"{"type":"event","name":"key","params":{"code":{"Char":"c"},"kind":"Press","mods":["control","alt"]}}"#,
       ),
       (
         named_input(&left_down()),
-        r#"{"type":"event","name":"mouse","params":{"kind":{"Down":"Left"},"mods":"","x":3,"y":7}}"#,
+        r#"{"type":"event","name":"mouse","params":{"kind":{"Down":"Left"},"x":3,"y":7}}"#,
       ),
       (
         named_input(&TermEvent::Paste("hi".to_string())),
@@ -632,6 +758,14 @@ mod tests {
       params: serde_json::json!({"text":"hi","more":true}),
     };
     assert_eq!(input_of(more).unwrap(), TermEvent::Paste("hi".to_string()));
+    // A flag a later build names is dropped, and the key still reads.
+    let newer = Event {
+      name: EVENT_KEY.to_string(),
+      params: serde_json::json!({"code":"Esc","kind":"Press","mods":["control","wheel"],"state":["num-lock"]}),
+    };
+    let mut expected = Key::new(KeyCode::Esc, KeyMods::CONTROL);
+    expected.state = KeyEventState::NUM_LOCK;
+    assert_eq!(input_of(newer).unwrap(), TermEvent::Key(expected));
     // The first dialect's shapes are fixed: more in the tuple is a bug.
     let grown = Event {
       name: EVENT_INPUT.to_string(),

@@ -23,6 +23,10 @@ pub struct HeaderInfo<'a> {
   /// A control drawn highlighted whatever the mouse does: the one whose
   /// menu is open.
   pub held: Option<Rect>,
+  /// How many changes the config on disk has for the tasks.
+  pub config_changes: usize,
+  /// The config on disk does not load.
+  pub config_error: bool,
 }
 
 /// The clickable cells of the bar as last drawn.
@@ -32,6 +36,9 @@ pub struct HeaderHits {
   pub logo: Option<Rect>,
   /// The runner name; a click opens the runner selector.
   pub runner: Option<Rect>,
+  /// "config changed", or "config error"; a click opens the reload
+  /// dialog, or says why the config does not load.
+  pub reload: Option<Rect>,
 }
 
 /// The name a runner goes by in the bar: its root's last component, or
@@ -134,6 +141,31 @@ pub fn render_header(
   cells.take_left(1);
   grid.draw_text(cells.take_left(name.width() as u16), &name, project);
   hits.runner = Some(hit);
+
+  // What the config and the tasks disagree on, each a button.
+  let mut badge = |text: String, fg: Rgb| -> Option<Rect> {
+    let caption = format!(" {text} ");
+    if caption.width() + 1 > line.width as usize {
+      return None;
+    }
+    line.take_left(1);
+    let hit = line.take_left(caption.width() as u16);
+    let mut bg = block.header_bg.blend(fg, 40);
+    if hovered(hit) {
+      bg = bg.blend(block.text, HOVER);
+    }
+    grid.draw_text(hit, &caption, Style::default().bg(bg.into()).fg(fg.into()));
+    Some(hit)
+  };
+  if info.config_error {
+    hits.reload =
+      badge("\u{2715} config error".to_string(), theme.tasks.failed);
+  } else if info.config_changes > 0 {
+    hits.reload = badge(
+      format!("● config changed: {}", info.config_changes),
+      block.key,
+    );
+  }
   hits
 }
 
@@ -177,6 +209,8 @@ mod tests {
       client_versions: vec!["0.10.1"],
       hover,
       held: None,
+      config_changes: 0,
+      config_error: false,
     }
   }
 
@@ -193,6 +227,24 @@ mod tests {
     assert_eq!(row_text(&grid), " ≡ dekit  app                   v0.10.1 ");
     assert_eq!(hits.logo, Some(Rect::new(0, 0, 9, 1)));
     assert_eq!(hits.runner, Some(Rect::new(9, 0, 5, 1)));
+  }
+
+  /// A config that does not load says so, in place of its changes, which
+  /// are unknown then.
+  #[test]
+  fn a_config_that_does_not_load_says_so() {
+    let mut grid = grid(60);
+    let runner = spec(RunnerKind::Project, "/home/me/app");
+    let info = HeaderInfo {
+      config_changes: 2,
+      config_error: true,
+      ..app_info(Some(&runner), None)
+    };
+    let hits = render_header(grid.area(), &mut grid, &info, &Theme::dark());
+    let row = row_text(&grid);
+    assert!(row.contains(" \u{2715} config error "), "{row}");
+    assert!(!row.contains("changed"), "{row}");
+    assert_eq!(hits.reload.map(|hit| hit.x), Some(15));
   }
 
   #[test]
@@ -236,6 +288,8 @@ mod tests {
       &mut held,
       &HeaderInfo {
         held: Some(Rect::new(0, 0, 9, 1)),
+        config_changes: 0,
+        config_error: false,
         ..app_info(Some(&runner), Some((30, 0)))
       },
       &theme,
@@ -256,6 +310,8 @@ mod tests {
         client_versions: vec!["0.9.6", "0.10.1", "0.9.6"],
         hover: None,
         held: None,
+        config_changes: 0,
+        config_error: false,
       },
       &Theme::dark(),
     );

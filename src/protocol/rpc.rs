@@ -43,6 +43,12 @@ pub enum RpcRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     caps: Option<TermCaps>,
   },
+  /// Merge the config on disk into the tasks: with `apply`, carry out
+  /// the default choices; either way, answer with the plan.
+  Reload {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    apply: bool,
+  },
   /// Replace the runner live with the given binary.
   /// The reply comes from the new binary after activation, as
   /// `{version}`; `unsupported` where live replacement is not available,
@@ -54,8 +60,9 @@ pub enum RpcRequest {
 
 /// Gate for `from_wire`: methods not listed here are `unknown_method`
 /// instead of `invalid_params`. Kept in sync with the enum by tests.
-const METHODS: &[&str] =
-  &["command", "ls", "why", "screen", "attach", "upgrade"];
+const METHODS: &[&str] = &[
+  "command", "ls", "why", "screen", "attach", "reload", "upgrade",
+];
 
 impl RpcRequest {
   pub fn to_wire(&self) -> (String, Value) {
@@ -180,13 +187,115 @@ pub struct RpcWhyDep {
   pub satisfied: bool,
 }
 
+/// Result of `upgrade`, from the binary that took over.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct UpgradeResult {
+  pub version: String,
+}
+
 #[cfg(test)]
 mod tests {
-  use crate::config::task::CmdConfig;
   use crate::term::{Geometry, Size};
 
   use super::*;
 
+  /// Every method and every command is in the requests page.
+  #[test]
+  fn the_requests_page_names_every_method_and_command() {
+    let page = include_str!("../docs/rpc/requests.md");
+    for method in METHODS {
+      assert!(page.contains(&format!("- cmd: {method}\n")), "{method}");
+    }
+    let commands = [
+      Command::Batch {
+        commands: Vec::new(),
+      },
+      Command::Down,
+      Command::Quit,
+      Command::Up,
+      Command::Start {
+        target: Target::glob("a"),
+      },
+      Command::Stop {
+        target: Target::glob("a"),
+      },
+      Command::Kill {
+        target: Target::glob("a"),
+      },
+      Command::Veto {
+        target: Target::glob("a"),
+      },
+      Command::Restart {
+        target: Target::glob("a"),
+      },
+      Command::ForceRestart {
+        target: Target::glob("a"),
+      },
+      Command::Add {
+        target: Target::glob("a"),
+        spec: Default::default(),
+        place: Default::default(),
+        start: true,
+        defaults: true,
+        origin: None,
+      },
+      Command::Update {
+        target: Target::glob("a"),
+        spec: Default::default(),
+        was: None,
+        restart: false,
+      },
+      Command::Move {
+        target: Target::glob("a"),
+        to: None,
+        place: Default::default(),
+      },
+      Command::Remove {
+        target: Target::glob("a"),
+      },
+      Command::Rename {
+        target: Target::glob("a"),
+        name: String::new(),
+      },
+      Command::Duplicate {
+        target: Target::glob("a"),
+        name: None,
+        path: None,
+        start: true,
+      },
+      Command::SetOrigin {
+        target: Target::glob("a"),
+        origin: None,
+      },
+    ];
+    for command in &commands {
+      // A new command fails here until it is listed above.
+      match command {
+        Command::Batch { .. }
+        | Command::Down
+        | Command::Quit
+        | Command::Up
+        | Command::Start { .. }
+        | Command::Stop { .. }
+        | Command::Kill { .. }
+        | Command::Veto { .. }
+        | Command::Restart { .. }
+        | Command::ForceRestart { .. }
+        | Command::Add { .. }
+        | Command::Update { .. }
+        | Command::Move { .. }
+        | Command::Remove { .. }
+        | Command::Rename { .. }
+        | Command::Duplicate { .. }
+        | Command::SetOrigin { .. } => (),
+      }
+      let json = serde_json::to_value(command).unwrap();
+      let tag = json["command"].as_str().unwrap();
+      assert!(page.contains(&format!("`{tag}")), "{tag}");
+    }
+  }
+
+  /// What `reload` replies is wire API: its shape is pinned here.
   fn samples() -> Vec<RpcRequest> {
     vec![
       RpcRequest::Command(Command::Start {
@@ -194,16 +303,17 @@ mod tests {
       }),
       RpcRequest::Command(Command::Add {
         target: Target::glob("api"),
-        label: None,
-        cmd: CmdConfig::Cmd {
-          cmd: vec!["./api".to_string()],
-        },
-        cwd: Some("/repo".to_string()),
-        env: None,
-        deps: vec![Target::glob("db")],
-        tags: vec!["backend".to_string()],
+        spec: serde_yaml::from_str(
+          "{cmd: [./api], cwd: /repo, deps: [db], tags: [backend]}",
+        )
+        .unwrap(),
+        place: Default::default(),
+        start: true,
+        defaults: true,
+        origin: None,
       }),
       RpcRequest::Command(Command::Down),
+      RpcRequest::Reload { apply: true },
       RpcRequest::Command(Command::Quit),
       RpcRequest::Ls { target: None },
       RpcRequest::Ls {
@@ -253,9 +363,10 @@ mod tests {
       ("command", r#"{"command":"start","target":"web"}"#),
       (
         "command",
-        r#"{"cmd":["./api"],"command":"add","cwd":"/repo","deps":["db"],"tags":["backend"],"target":"api"}"#,
+        r#"{"command":"add","spec":{"cmd":["./api"],"cwd":"/repo","deps":["db"],"tags":["backend"]},"target":"api"}"#,
       ),
       ("command", r#"{"command":"down"}"#),
+      ("reload", r#"{"apply":true}"#),
       ("command", r#"{"command":"quit"}"#),
       ("ls", r#"null"#),
       ("ls", r#"{"target":"services/*"}"#),
@@ -272,7 +383,7 @@ mod tests {
       // `atch2`: the terminal's capabilities and cell size.
       (
         "attach",
-        r#"{"caps":{"colors":"true-color","focus_events":true,"hyperlinks":true,"kitty_graphics":{"animation":true,"placeholders":true},"kitty_keyboard":31,"sixel":false,"strikethrough":true,"sync_output":true,"underline_styles":true,"widths":{"flags_wide":true,"vs16_wide":true,"zwj_joins":true}},"cell_height":20,"cell_width":10,"height":24,"target":"web/dev","width":80}"#,
+        r#"{"caps":{"colors":"true-color","features":["italic","strikethrough","underline-styles","underline-colors","hyperlinks","sync","focus"],"kitty":{"graphics":["placeholders","animation"],"keyboard":31},"widths":{"flags_wide":true,"vs16_wide":true,"zwj_joins":true}},"cell_height":20,"cell_width":10,"height":24,"target":"web/dev","width":80}"#,
       ),
       ("upgrade", r#"{"binary":"/opt/dekit/bin/dekit"}"#),
       ("command", r#"{"command":"up"}"#),

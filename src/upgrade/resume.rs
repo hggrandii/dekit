@@ -3,15 +3,12 @@
 //! a target binary through first. The arguments, the check's answer, and
 //! the snapshot header are frozen.
 
-use std::{
-  collections::{HashMap, HashSet},
-  path::PathBuf,
-  sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use futures::future::BoxFuture;
 
+use crate::project::Project;
 use crate::{
   config::{config::Config, hook::watch_idle},
   console::app::console_task_registration,
@@ -27,8 +24,7 @@ use crate::{
     kernel::Kernel,
     kernel_message::{TaskContext, TaskRegistration, TaskSelector},
     task::{Effects, Task, TaskCmd, TaskDef, TaskId},
-    task_key::{TaskKey, TaskSpaceId},
-    task_path::TaskPath,
+    task_key::TaskSpaceId,
   },
   process::unix_processes_waiter::UnixProcessesWaiter,
   protocol::ctl::Hello,
@@ -38,11 +34,8 @@ use crate::{
     socket::{ServerSocket, adopt_connection},
   },
   task::{
-    config_tasks::{
-      Listed, config_task_registration, config_task_resumed, list_order,
-      resolve_task_deps,
-    },
-    process_task::{process_task_from_snapshot, resumed_instance},
+    config_tasks::{saved_base, saved_task_registration},
+    process_task::resumed_instance,
   },
   term::{Geometry, Size},
   upgrade::{set_cloexec, snapshot as snap},
@@ -76,28 +69,9 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
     anyhow::bail!("the snapshot belongs to pid {}", snapshot.pid);
   }
 
-  // From here this process is the runner. The check loaded the config and
-  // the log settings moments ago; an edit since then falls back to the
-  // defaults rather than take the tasks down.
-  let mut config = Config::load_dir(&runner.root).unwrap_or_else(|err| {
-    let mut config = Config::make_default();
-    config
-      .warnings
-      .push(format!("ignoring dekit.yaml: {err:#}"));
-    config
-  });
-  config.runner = Some(runner.clone());
-  let _logger = match init_logging(&config, log_level, &runner.root) {
-    Ok(logger) => logger,
-    Err(err) => {
-      config
-        .warnings
-        .push(format!("ignoring the log settings: {err:#}"));
-      init_logging(&Config::make_default(), log_level, &runner.root)
-        .unwrap_or(None)
-    }
-  };
-  let config = Arc::new(config);
+  // From here this process is the runner.
+  let (config, _logger) = resumed_config(&runner, log_level);
+  let project = Project::new(config.clone());
   print_warnings(&config.warnings);
   log::info!(
     "Resuming from dekit {} snapshot v{}",
@@ -111,7 +85,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
     snapshot.live_fd,
     snapshot.started_at,
   );
-  let taken = take_over(&snapshot, &runner, &config, &lock_guard);
+  let taken = take_over(&snapshot, &runner, &project, &lock_guard);
   let _ = std::fs::remove_file(&args.snapshot);
   let (kernel, console, server_socket, connections) = match taken {
     Ok(taken) => taken,
@@ -122,7 +96,7 @@ pub async fn resume(args: ResumeArgs) -> anyhow::Result<()> {
   let pc = kernel.context();
   let ctx = Arc::new(ServerCtx {
     pc: pc.clone(),
-    config: config.clone(),
+    project,
     connections: Connections::default(),
     runner: Some(runner_handle(
       &runner,
@@ -199,20 +173,46 @@ fn check(
       snapshot.pid
     );
   }
-  let mut config = Config::load_dir(&runner.root)?;
-  config.runner = Some(runner.clone());
-  let config = Arc::new(config);
-  let _logger = init_logging(&config, log_level, &runner.root)?;
-  check_graph(snapshot, &config)?;
+  let (config, _logger) = resumed_config(runner, log_level);
+  check_graph(snapshot, &Project::new(config))?;
   println!("ok {}", snapshot.pid);
   Ok(())
 }
 
+/// The config a resume runs with, and its logging. The tasks are the
+/// snapshot's, so a dekit.yaml that does not load, or log settings that
+/// don't work, fall back to the defaults with a warning rather than keep
+/// the runner from going on: the check finds what the resume will.
+fn resumed_config(
+  runner: &RunnerSpec,
+  log_level: Option<&str>,
+) -> (Arc<Config>, Option<crate::logging::LoggerHandle>) {
+  let mut config = Config::load_dir(&runner.root).unwrap_or_else(|err| {
+    let mut config = Config::make_default();
+    config
+      .warnings
+      .push(format!("ignoring dekit.yaml: {err:#}"));
+    config
+  });
+  config.runner = Some(runner.clone());
+  let logger = match init_logging(&config, log_level, &runner.root) {
+    Ok(logger) => logger,
+    Err(err) => {
+      config
+        .warnings
+        .push(format!("ignoring the log settings: {err:#}"));
+      init_logging(&Config::make_default(), log_level, &runner.root)
+        .unwrap_or(None)
+    }
+  };
+  (Arc::new(config), logger)
+}
+
 fn check_graph(
   snapshot: &snap::Snapshot,
-  config: &Arc<Config>,
+  project: &Arc<Project>,
 ) -> anyhow::Result<()> {
-  let prepared = prepare(snapshot, config)?;
+  let prepared = prepare(snapshot, project)?;
   let tasks = prepared
     .tasks
     .into_iter()
@@ -241,17 +241,13 @@ impl Task for Unstarted {
 /// Everything a resume builds from the snapshot before it touches an
 /// inherited fd; `--check` builds exactly this.
 ///
-/// The graph is the snapshot's reconciled with the config just loaded: a
-/// config task the snapshot also has is built from the config's spec
-/// around the saved child and screen, a config task the snapshot lacks
-/// is added idle, and a saved task the config lacks stays as saved. So a
-/// restart or upgrade applies an edited `dekit.yaml` without touching a
-/// running child; its new command is used at the next start. A config
-/// task above or under a saved task is left out, with a warning.
+/// The graph is the snapshot's, every task with its saved definition
+/// around its child and screen: a restart or upgrade changes nothing, and
+/// a reload takes an edited `dekit.yaml`. Only a task an older runner
+/// saved without a definition is built from the config, once.
 struct Prepared<'a> {
   next_task_id: usize,
-  tasks: Vec<(Option<&'a snap::Task>, TaskRegistration)>,
-  warnings: Vec<String>,
+  tasks: Vec<(&'a snap::Task, TaskRegistration)>,
   console: TaskId,
   connections: Vec<Connection>,
 }
@@ -274,119 +270,42 @@ enum Carried {
 
 fn prepare<'a>(
   snapshot: &'a snap::Snapshot,
-  config: &Arc<Config>,
+  project: &Arc<Project>,
 ) -> anyhow::Result<Prepared<'a>> {
-  let mut from_config = Vec::with_capacity(config.tasks.len());
-  let mut from_snapshot = HashMap::new();
+  let config = &project.config();
   let mut console = None;
-
-  // Config tasks first: a saved one keeps its id, a new one takes the
-  // next, so the config's own dependencies resolve among them.
-  let saved_by_path: HashMap<&str, &snap::Task> = snapshot
-    .tasks
-    .iter()
-    .filter(|task| task.space.is_empty())
-    .filter_map(|task| Some((task.path.as_deref()?, task)))
-    .collect();
-  let mut next_task_id = snapshot.next_task_id;
-  let ids: Vec<TaskId> = config
-    .tasks
-    .iter()
-    .map(|cfg| match saved_by_path.get(cfg.path.as_str()) {
-      Some(saved) => TaskId(saved.id),
-      None => {
-        next_task_id += 1;
-        TaskId(next_task_id - 1)
-      }
-    })
-    .collect();
-  let deps_by_task = resolve_task_deps(config, &ids)?;
-  let (order, left_out) = list_order(config, &snapshot.tasks);
-  let mut warnings = Vec::new();
-  let mut dropped = HashSet::new();
-  for (i, j) in left_out {
-    let saved = &snapshot.tasks[j];
-    warnings.push(format!(
-      "config task {} not added: it would be above or under saved task {}",
-      config.tasks[i].path,
-      saved.path.as_deref().unwrap_or_default()
-    ));
-    dropped.insert(ids[i]);
-  }
-  let mut in_config = HashSet::new();
-  for (i, cfg) in config.tasks.iter().enumerate() {
-    if dropped.contains(&ids[i]) {
-      from_config.push(None);
-      continue;
-    }
-    let mut deps = Vec::new();
-    for (dep, dep_id) in cfg.deps.iter().zip(&deps_by_task[i]) {
-      if dropped.contains(dep_id) {
-        warnings.push(format!(
-          "task {}: dropped its dependency on {dep}, which was left out",
-          cfg.path
-        ));
-      } else {
-        deps.push(TaskSelector::Id(*dep_id));
-      }
-    }
-    let saved = saved_by_path.get(cfg.path.as_str()).copied();
-    let registration = match saved {
-      Some(saved) => {
-        let snap::TaskKind::Process(process) = &saved.kind else {
-          anyhow::bail!("task {} is not a process task", cfg.path);
-        };
-        in_config.insert(saved.id);
-        config_task_resumed(
-          config,
-          cfg.clone(),
-          ids[i],
-          deps,
-          saved.pinned,
-          &process.screen,
-          resumed_instance(saved, process),
-        )?
-      }
-      // New in the config: idle, as at a runner start; `up` starts it
-      // if it autostarts.
-      None => config_task_registration(
-        config,
-        TaskSpaceId::default_space(),
-        cfg.clone(),
-        ids[i],
-        deps,
-        false,
-      ),
-    };
-    from_config.push(Some((saved, registration)));
-  }
-
-  for (j, task) in snapshot.tasks.iter().enumerate() {
-    if in_config.contains(&task.id) {
-      continue;
-    }
-    let space = if task.space.is_empty() {
-      TaskSpaceId::default_space()
-    } else {
-      TaskSpaceId::new(task.space.clone())
-        .map_err(|err| anyhow::anyhow!("task {}: {err}", task.id))?
-    };
-    let path = task
-      .path
-      .as_deref()
-      .map(TaskPath::new)
-      .transpose()
-      .map_err(|err| anyhow::anyhow!("task {}: {err}", task.id))?;
+  let mut tasks = Vec::with_capacity(snapshot.tasks.len());
+  // Every task as it was, in its order: the config is not read for them.
+  // A reload brings in what changed there.
+  for task in &snapshot.tasks {
     let task_id = TaskId(task.id);
     let registration = match &task.kind {
-      snap::TaskKind::Process(process) => process_task_from_snapshot(
-        task_id,
-        path.map(|path| TaskKey::new(space, path)),
-        task,
-        process,
-      )?,
+      snap::TaskKind::Process(process) => {
+        let deps = task
+          .deps
+          .iter()
+          .map(|id| TaskSelector::Id(TaskId(*id)))
+          .collect();
+        // Refused whole: a task left out would leave its child behind.
+        saved_task_registration(
+          config,
+          task_id,
+          task,
+          process,
+          deps,
+          resumed_instance(task, process),
+        )
+        .with_context(|| {
+          let name = task.path.clone().unwrap_or(task.id.to_string());
+          format!("saved task {name}")
+        })?
+      }
       snap::TaskKind::Console {} => {
         console = Some(task_id);
+        let (space, path) = match task.key()? {
+          Some(key) => (key.space, Some(key.path)),
+          None => (TaskSpaceId::default_space(), None),
+        };
         console_task_registration(
           task_id,
           TaskDef {
@@ -397,20 +316,14 @@ fn prepare<'a>(
             pinned: task.pinned,
             ..TaskDef::default()
           },
-          config.clone(),
+          project.clone(),
           config.keymap.build(),
         )
       }
     };
-    from_snapshot.insert(j, (Some(task), registration));
+    tasks.push((task, registration));
   }
-  let tasks = order
-    .into_iter()
-    .filter_map(|entry| match entry {
-      Listed::Config(i) => from_config[i].take(),
-      Listed::Saved(j) => from_snapshot.remove(&j),
-    })
-    .collect();
+  let next_task_id = snapshot.next_task_id;
   let console =
     console.ok_or_else(|| anyhow::anyhow!("snapshot has no console"))?;
 
@@ -457,7 +370,6 @@ fn prepare<'a>(
   Ok(Prepared {
     next_task_id,
     tasks,
-    warnings,
     console,
     connections,
   })
@@ -470,20 +382,24 @@ fn prepare<'a>(
 fn take_over(
   snapshot: &snap::Snapshot,
   runner: &RunnerSpec,
-  config: &Arc<Config>,
+  project: &Arc<Project>,
   lock_guard: &LockFileGuard,
 ) -> anyhow::Result<(Kernel, TaskId, ServerSocket, Vec<Connection>)> {
-  let prepared = prepare(snapshot, config)?;
+  let prepared = prepare(snapshot, project)?;
+  project.set_base(saved_base(
+    snapshot,
+    prepared.tasks.iter().map(|(_, registration)| registration),
+  ));
   // Children spawned by this image must not inherit what it adopts.
   set_cloexec(&snap::fds(snapshot), true)
     .map_err(|err| anyhow::anyhow!("inherited fd is not open: {err}"))?;
   let server_socket = ServerSocket::adopt(snapshot.listener_fd)?;
   UnixProcessesWaiter::init_paused()?;
   let mut kernel = Kernel::new();
-  kernel.save_on_quit(crate::dekit::server::save_on_quit(runner));
+  kernel
+    .save_on_quit(crate::dekit::server::save_on_quit(runner, project.clone()));
   kernel.restore(prepared.next_task_id, prepared.tasks)?;
-  let mut warnings = config.warnings.clone();
-  warnings.extend(prepared.warnings);
+  let warnings = project.config().warnings.clone();
   // Before the upgrade is answered: its requester reads the record next.
   lock_guard.publish(runner, &warnings)?;
   Ok((
@@ -530,6 +446,24 @@ mod tests {
   #[test]
   fn golden_v1_passes_the_check() {
     let snapshot = snap::decode(include_bytes!("fixtures/v1.json")).unwrap();
-    check_graph(&snapshot, &Arc::new(Config::make_default())).unwrap();
+    check_graph(&snapshot, &Project::new(Arc::new(Config::make_default())))
+      .unwrap();
+  }
+
+  /// A saved definition this binary refuses refuses the upgrade, by name.
+  #[test]
+  fn a_saved_task_this_binary_refuses_is_named() {
+    let mut snapshot =
+      snap::decode(include_bytes!("fixtures/v1.json")).unwrap();
+    let web = snapshot.tasks.iter_mut().find(|t| t.id == 2).unwrap();
+    web.spec =
+      Some(serde_yaml::from_str("{cmd: [web], no_such_key: 1}").unwrap());
+    let err =
+      check_graph(&snapshot, &Project::new(Arc::new(Config::make_default())))
+        .unwrap_err();
+    assert!(
+      format!("{err:#}").starts_with("saved task web: "),
+      "{err:#}"
+    );
   }
 }

@@ -1,5 +1,34 @@
 ## Unreleased
 
+- `dekit reload` brings what changed in `dekit.yaml` into a running
+  project; the console's header says when the file changed and opens the
+  reload dialog
+- A runner restart, `down` and `up`, and a live upgrade bring every task
+  back as it was; `dekit.yaml` is read at a fresh start and by `reload`
+- The console adds, edits, duplicates, moves, and removes tasks: `a`,
+  `e`, `C`, `J`/`K` or dragging a row, and `d`; `Space` or a right click
+  opens a task's menu, `y` copies its command
+- Changes made in the console are written back to `dekit.yaml` in place,
+  keeping its comments; what can't be edited safely goes to a coding
+  agent (`agent: {cmd: [...]}` in the user config) or is copied as a
+  prompt
+- Tasks are listed in the runner's order: a task moved in the console
+  stays where it was put, across restarts too
+- `dekit rm +dynamic` removes every task not from `dekit.yaml`; a
+  `dynamic` tag written in the config is refused
+- `dekit spawn --cwd` is relative to where the command is typed
+- The terminal emulator and renderer were rewritten: true color,
+  underline styles and colors, hyperlinks, the kitty keyboard and
+  graphics protocols, sixel, and output shaped to what the attached
+  terminal can show
+- Keymap: `e` opens the edit dialog (`show-rename-task` still works) and
+  `C` the duplicate dialog; `duplicate-task` copies without a dialog
+- RPC: `reload`; the `update`, `move`, and `set-origin` commands; `add`
+  takes the task entry under `spec`; `duplicate` takes `path` and
+  `start`; the `changed` and `bad_config` error codes; terminal
+  capabilities and the cell size on `attach`, and input as `key`,
+  `mouse`, `paste`, `focus`, and `resize` events
+
 ## 0.10.2 - 2026-10-11
 
 - Add TUI header with menu

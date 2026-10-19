@@ -247,9 +247,11 @@ impl TaskScreen {
     self.size
   }
 
-  /// Clears the screen for a fresh program.
-  pub fn reset_screen(&mut self) {
-    self.screen.reset();
+  /// Clears the screen for a fresh program, which keeps
+  /// `scrollback_len` lines and scrolls `wheel_lines` a wheel notch.
+  pub fn reset_screen(&mut self, scrollback_len: usize, wheel_lines: usize) {
+    self.screen.reset_with(scrollback_len);
+    self.wheel_lines = wheel_lines.max(1);
     self.publish();
   }
 

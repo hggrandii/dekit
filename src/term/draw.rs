@@ -57,6 +57,19 @@ pub struct BorderChars {
 }
 
 impl Grid {
+  /// A horizontal line across a block drawn at `area`, at row `y`,
+  /// joined to its border on both sides.
+  pub fn separator(&mut self, area: Rect, y: u16, style: Style) {
+    let mut row = Rect {
+      y,
+      height: 1,
+      ..area
+    };
+    self.draw_text(row.take_left(1), VERTICAL_RIGHT, style);
+    self.draw_text(row.take_right(1), VERTICAL_LEFT, style);
+    self.fill_area(row, '─', style);
+  }
+
   /// Puts one character at `pos`.
   pub fn put_char(&mut self, pos: Pos, c: char, style: Style) {
     let width = unicode::scalar_width(c).unwrap_or(1).max(1);
@@ -219,6 +232,18 @@ impl Block<'_> {
     self
   }
 
+  /// Puts `text` at the right end of the top border, left of what is
+  /// there already; nothing when it does not fit. Returns where it went.
+  pub fn title_right(&mut self, text: &str, style: Style) -> Option<Rect> {
+    let width = unicode::str_width(text);
+    if width > self.title.width {
+      return None;
+    }
+    let area = self.title.take_right(width);
+    self.grid.draw_text(area, text, style);
+    Some(area)
+  }
+
   /// Skips `width` border cells before the next title piece.
   pub fn gap(&mut self, width: u16) -> &mut Self {
     self.title.take_left(width);
@@ -232,18 +257,7 @@ impl Block<'_> {
   /// A horizontal line across the block at row `y`, joined to the
   /// border on both sides.
   pub fn separator(&mut self, y: u16) -> &mut Self {
-    let mut row = Rect {
-      y,
-      height: 1,
-      ..self.area
-    };
-    self
-      .grid
-      .draw_text(row.take_left(1), VERTICAL_RIGHT, self.style);
-    self
-      .grid
-      .draw_text(row.take_right(1), VERTICAL_LEFT, self.style);
-    self.grid.fill_area(row, '─', self.style);
+    self.grid.separator(self.area, y, self.style);
     self
   }
 }

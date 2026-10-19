@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-  kernel_message::SpaceSelector,
-  path_trie::{PathConflict, PathTrie},
+  kernel_message::{MoveError, Place, SpaceSelector},
+  path_trie::{Moved, PathConflict, PathTrie},
   sub_trie::{SubMode, SubTrie},
   task::TaskId,
   task_key::{TaskKey, TaskSpaceId},
@@ -51,12 +51,12 @@ impl Namespace {
     &mut self,
     key: &TaskKey,
     id: TaskId,
-    after: Option<&TaskPath>,
+    place: &Place,
   ) -> Result<(), PathConflict> {
     self
       .space_mut(&key.space)
       .paths
-      .insert(&key.path, id, after)
+      .insert(&key.path, id, place)
   }
 
   pub fn remove(&mut self, key: &TaskKey) -> Option<TaskId> {
@@ -64,6 +64,19 @@ impl Namespace {
       .spaces
       .get_mut(&key.space)
       .and_then(|space| space.paths.remove(&key.path))
+  }
+
+  pub fn move_node(
+    &mut self,
+    space: &TaskSpaceId,
+    from: &TaskPath,
+    to: &TaskPath,
+    place: &Place,
+  ) -> Result<Vec<Moved>, MoveError> {
+    match self.spaces.get_mut(space) {
+      Some(space) => space.paths.move_node(from, to, place),
+      None => Err(MoveError::NotFound(from.clone())),
+    }
   }
 
   pub fn place(&mut self, key: &TaskKey) {

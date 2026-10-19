@@ -67,13 +67,33 @@ pub enum Action {
   ForceRestartTask,
   ForceRestartAll,
   ShowAddTask,
-  ShowRenameTask,
+  /// The task dialog for the selected task. It replaced the rename
+  /// dialog, whose name user keymaps may still bind.
+  #[serde(alias = "show-rename-task")]
+  ShowEditTask,
+  /// The task dialog, filled from the selected task, for a copy of it.
+  ShowDuplicateTask,
   AddTask {
     cmd: String,
     name: Option<String>,
   },
+  /// A copy of the selected task, right after it, without a dialog.
   DuplicateTask,
   ShowRemoveTask,
+  /// The selected task's menu, also on a right click.
+  ShowTaskMenu,
+  /// Swap the selected task or group with the one above it.
+  MoveTaskUp,
+  /// Swap the selected task or group with the one below it.
+  MoveTaskDown,
+  /// Copy the selected task's command.
+  CopyTaskCommand,
+  /// What the config on disk would change, to take or keep.
+  ShowReload,
+  /// What changed here and is not in the config, to write back.
+  ShowWriteBack,
+  /// Write the selected task, the runner's own, into the config.
+  SaveToConfig,
 
   CloseCurrentModal,
 
@@ -153,11 +173,19 @@ impl Action {
       Action::RenameTask { name } => format!("Rename to \"{}\"", name),
       Action::ForceRestartTask => "Force restart".to_string(),
       Action::ForceRestartAll => "Force restart all".to_string(),
-      Action::ShowAddTask => "New task dialog".to_string(),
-      Action::ShowRenameTask => "Rename task dialog".to_string(),
+      Action::ShowAddTask => "New task".to_string(),
+      Action::ShowEditTask => "Edit task".to_string(),
+      Action::ShowDuplicateTask => "Duplicate task".to_string(),
       Action::AddTask { cmd, name: _ } => format!("New task `{}`", cmd),
-      Action::DuplicateTask => "Duplicate current task".to_string(),
-      Action::ShowRemoveTask => "Remove task dialog".to_string(),
+      Action::DuplicateTask => "Duplicate task at once".to_string(),
+      Action::ShowRemoveTask => "Remove task".to_string(),
+      Action::ShowTaskMenu => "Task menu".to_string(),
+      Action::MoveTaskUp => "Move up".to_string(),
+      Action::MoveTaskDown => "Move down".to_string(),
+      Action::CopyTaskCommand => "Copy command".to_string(),
+      Action::ShowReload => "Reload the config".to_string(),
+      Action::ShowWriteBack => "Write changes back to the config".to_string(),
+      Action::SaveToConfig => "Save the task to the config".to_string(),
       Action::CloseCurrentModal => "Close current modal".to_string(),
       Action::ScrollUp { n, unit } => scroll_desc("up", *n, *unit),
       Action::ScrollDown { n, unit } => scroll_desc("down", *n, *unit),

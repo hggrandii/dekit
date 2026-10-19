@@ -34,7 +34,7 @@ JSON objects tagged by `type`:
 {"type":"request","id":1,"method":"command","params":{"command":"start","target":"services/*"}}
 {"type":"response","id":1,"result":{}}
 {"type":"response","id":1,"error":{"code":"no_match","message":"..."}}
-{"type":"event","name":"input","params":{"Key":{}}}
+{"type":"event","name":"key","params":{"code":"Esc","kind":"Press"}}
 {"type":"bye","code":"quit"}
 ```
 

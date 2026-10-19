@@ -219,6 +219,17 @@ fn cursor_and_erase() {
 }
 
 #[test]
+fn cursor_shape_reaches_the_frame() {
+  let mut s = screen(10, 4);
+  feed(&mut s, b"\x1b[3 q");
+  assert_eq!(s.frame().cursor_style, CursorStyle::BlinkingUnderline);
+  // A task that draws into the grid sets it on the screen, as the
+  // console's text fields do.
+  s.set_cursor_style(CursorStyle::BlinkingBar);
+  assert_eq!(s.frame().cursor_style, CursorStyle::BlinkingBar);
+}
+
+#[test]
 fn tabs_and_repeat() {
   let mut s = screen(20, 1);
   feed(&mut s, b"\x1b[3G\x1bH\x1b[1Ga\tb\x1b[3G\x1b[0g\x1b[1G\tc");
@@ -911,7 +922,7 @@ fn finished_lines_are_whole_logical_lines() {
 
 #[test]
 fn reverse_video_and_dynamic_colors_show() {
-  use crate::protocol::TermCaps;
+  use crate::protocol::{Feature, TermCaps};
   use crate::term::{Painter, color::Rgb};
   let mut s = screen(4, 1);
   feed(&mut s, b"ab");
@@ -940,10 +951,7 @@ fn reverse_video_and_dynamic_colors_show() {
   assert_eq!(shown.fg, Color::Rgb(0xff, 0, 0));
   assert_eq!(style_at(&s, 0, 3).fg, Color::BLUE);
   // The painter emits them, and repaints everything when they change.
-  let mut painter = Painter::new(TermCaps {
-    sync_output: false,
-    ..TermCaps::full()
-  });
+  let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
   let mut out = Vec::new();
   painter.paint(&mut out, &Arc::new(s.frame()));
   let text = String::from_utf8_lossy(&out);

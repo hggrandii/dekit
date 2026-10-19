@@ -10,7 +10,7 @@ use crate::config::log::LogConfig;
 use crate::config::task::{TaskConfig, parse_task_settings, task_from_cfg};
 use crate::config::tui::TuiConfig;
 use crate::kernel::task::{RestartMode, TaskKind};
-use crate::kernel::task_path::TaskPath;
+use crate::kernel::task_path::{TaskPath, join};
 use crate::runner::user_config_dir;
 
 pub(crate) const ROOT_KEYS: &[&str] = &[
@@ -18,7 +18,81 @@ pub(crate) const ROOT_KEYS: &[&str] = &[
   "keymap",
 ];
 const FRAGMENT_KEYS: &[&str] = &["load", "tasks"];
+/// Root keys that moved to the user config.
 pub(crate) const PRESENTATION_KEYS: &[&str] = &["tui", "keymap"];
+const USER_KEYS: &[&str] = &["tui", "keymap", "agent"];
+
+/// Where a change can change a config: a directory, whether what is
+/// deeper under it counts too, and what a changed path there must match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Watched {
+  pub dir: PathBuf,
+  pub recursive: bool,
+  /// An absolute glob pattern.
+  pub pattern: String,
+}
+
+impl Watched {
+  fn file(path: &Path) -> Watched {
+    Watched {
+      dir: path.parent().unwrap_or(path).to_path_buf(),
+      recursive: false,
+      pattern: glob::Pattern::escape(&path.to_string_lossy()),
+    }
+  }
+
+  /// A `load` pattern from `dir`: under the directory its plain parts
+  /// name, and deeper when a part before the last has a wildcard, or the
+  /// last is `**`, which matches files at any depth. The directory is as
+  /// file events name it: no `.` or `..`, links resolved.
+  fn load(dir: &Path, pattern: &str) -> Watched {
+    let parts: Vec<&str> = pattern.split('/').collect();
+    let (last, dirs) = parts.split_last().expect("a split has a part");
+    let plain = dirs
+      .iter()
+      .take_while(|part| !part.contains(['*', '?', '[']))
+      .count();
+    let mut base = dir.to_path_buf();
+    for part in &dirs[..plain] {
+      match *part {
+        "" | "." => (),
+        ".." => {
+          base.pop();
+        }
+        part => base.push(part),
+      }
+    }
+    let base = dunce::canonicalize(&base).unwrap_or(base);
+    let escaped =
+      glob::Pattern::escape(&base.to_string_lossy().replace('\\', "/"));
+    Watched {
+      pattern: format!("{escaped}/{}", parts[plain..].join("/")),
+      dir: base,
+      recursive: plain < dirs.len() || *last == "**",
+    }
+  }
+}
+
+/// What went wrong in one config file, and which: every error reading
+/// one is in one of these, so it shows as `in <file>: ...` and a reader
+/// can name the file without parsing the message.
+#[derive(Debug)]
+pub struct InFile {
+  pub file: PathBuf,
+  pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for InFile {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "in {}", self.file.display())
+  }
+}
+
+impl std::error::Error for InFile {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(self.error.as_ref())
+  }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelConfig {
@@ -41,9 +115,24 @@ pub struct Config {
   pub system_shell: bool,
   /// Non-fatal problems found while loading; the caller reports them.
   pub warnings: Vec<String>,
+  /// Where a change can change this config: dekit.yaml, its fragments,
+  /// and where its `load` patterns look.
+  pub watched: Vec<Watched>,
+  /// The coding agent the console hands work to, as an argv the prompt
+  /// is appended to (user config `agent: {cmd: [...]}`).
+  pub agent: Option<Vec<String>>,
 }
 
 impl Config {
+  /// The task entries, in the config's order.
+  pub fn sources(&self) -> Vec<crate::spec::Source> {
+    self
+      .tasks
+      .iter()
+      .filter_map(|task| task.source.clone())
+      .collect()
+  }
+
   pub fn make_default() -> Self {
     Self {
       runner: None,
@@ -56,27 +145,46 @@ impl Config {
       on_idle: None,
       system_shell: false,
       warnings: Vec::new(),
+      watched: Vec::new(),
+      agent: None,
     }
   }
 
   pub fn load_dir(root: &Path) -> Result<Config> {
+    Config::try_load_dir(root).map_err(|(err, _)| err)
+  }
+
+  /// `load_dir`, but a config that does not load still says what it was
+  /// read from up to the error, where a fix would be made.
+  pub fn try_load_dir(
+    root: &Path,
+  ) -> std::result::Result<Config, (anyhow::Error, Vec<Watched>)> {
     let mut config = Config::make_default();
+    match config.read_dir(root) {
+      Ok(()) => Ok(config),
+      Err(err) => Err((err, config.watched)),
+    }
+  }
+
+  fn read_dir(&mut self, root: &Path) -> Result<()> {
     // A broken personal config must not keep a runner from starting.
-    if let Err(error) = config.load_presentation() {
-      config
+    if let Err(error) = self.load_presentation() {
+      self
         .warnings
         .push(format!("ignoring the user config: {error:#}"));
     }
 
+    let root = dunce::canonicalize(root).unwrap_or_else(|_| root.into());
     let path = root.join("dekit.yaml");
+    // One made later is the config too.
+    self.watch_file(&path);
     if !path.exists() {
-      return Ok(config);
+      return Ok(());
     }
-    let root = dunce::canonicalize(root)?;
     let mut stack = Vec::new();
     let mut task_paths = HashSet::new();
-    config.load_file(&root, &path, "", true, &mut stack, &mut task_paths)?;
-    for task in &config.tasks {
+    self.load_file(&root, &path, "", true, &mut stack, &mut task_paths)?;
+    for task in &self.tasks {
       let path = task.path.as_str();
       if let Some(above) = path
         .match_indices('/')
@@ -86,8 +194,8 @@ impl Config {
         bail!("a task can't have tasks under it: '{path}' is under '{above}'");
       }
     }
-    if config.defaults.autorestart == Some(RestartMode::Always)
-      && let Some(job) = config.tasks.iter().find(|task| match task.kind {
+    if self.defaults.autorestart == Some(RestartMode::Always)
+      && let Some(job) = self.tasks.iter().find(|task| match task.kind {
         TaskKind::Service => false,
         TaskKind::Job => task.autorestart.is_none(),
       })
@@ -97,7 +205,7 @@ impl Config {
         job.path
       );
     }
-    Ok(config)
+    Ok(())
   }
 
   /// Reads only the root `kernel` declaration. Bootstrap stays compatible with
@@ -120,7 +228,7 @@ impl Config {
     };
     let mut selected = serde_yaml::Mapping::new();
     selected.insert(serde_yaml::Value::from("kernel"), kernel.clone());
-    let doc = CfgDoc::from_value(serde_yaml::Value::Mapping(selected), &cx)?;
+    let doc = CfgDoc::from_value(serde_yaml::Value::Mapping(selected));
     parse_kernel(&doc.root().as_obj()?, &cx)
   }
 
@@ -129,18 +237,22 @@ impl Config {
     let Ok(dir) = user_config_dir() else {
       return Ok(());
     };
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let path = dir.join("config.yaml");
+    // Watched like dekit.yaml: an edit to it is a change to the config,
+    // and one made later is the config too.
+    self.watch_file(&path);
     if !path.exists() {
       return Ok(());
     }
     let cx = CfgCx::new(dir);
-    let doc = CfgDoc::load(&path, &cx)
+    let doc = CfgDoc::load(&path)
       .with_context(|| format!("failed to load {}", path.display()))?;
     let obj = doc.root().as_obj()?;
     // Apply each section independently: one unknown or malformed key must
     // not drop the valid tui/keymap settings alongside it.
     for (key, _) in obj.iter() {
-      if !PRESENTATION_KEYS.contains(&key) {
+      if !USER_KEYS.contains(&key) {
         self.warnings.push(format!(
           "ignoring unknown key '{key}' in {}",
           path.display()
@@ -160,6 +272,21 @@ impl Config {
       self
         .warnings
         .push(format!("ignoring 'keymap' in {}: {err:#}", path.display()));
+    }
+    if let Some(agent) = obj.get("agent") {
+      let cmd = agent.as_obj().and_then(|agent| {
+        agent.known_keys(&["cmd"])?;
+        match agent.get("cmd") {
+          Some(cmd) => crate::config::task::argv_from_cfg(&cmd).map(Some),
+          None => Ok(None),
+        }
+      });
+      match cmd {
+        Ok(cmd) => self.agent = cmd,
+        Err(err) => self
+          .warnings
+          .push(format!("ignoring 'agent' in {}: {err:#}", path.display())),
+      }
     }
     Ok(())
   }
@@ -198,11 +325,42 @@ impl Config {
       bail!("config load cycle: {}", cycle.join(" -> "));
     }
     stack.push(path.clone());
+    self.watch_file(&path);
+    let children = self
+      .read_file(project_root, &path, mount, is_root, task_paths)
+      .map_err(|error| {
+        anyhow::Error::new(InFile {
+          file: path.clone(),
+          error,
+        })
+      })?;
+    for (child, child_mount) in children {
+      self.load_file(
+        project_root,
+        &child,
+        &child_mount,
+        false,
+        stack,
+        task_paths,
+      )?;
+    }
+    stack.pop();
+    Ok(())
+  }
 
+  /// One file's settings and tasks; returns the files its `load` names,
+  /// with the path each is mounted at.
+  fn read_file(
+    &mut self,
+    project_root: &Path,
+    path: &Path,
+    mount: &str,
+    is_root: bool,
+    task_paths: &mut HashSet<String>,
+  ) -> Result<Vec<(PathBuf, String)>> {
     let dir = path.parent().expect("config path has a parent");
     let cx = CfgCx::new(dir.to_path_buf());
-    let doc = CfgDoc::load(&path, &cx)
-      .with_context(|| format!("failed to load {}", path.display()))?;
+    let doc = CfgDoc::load(path)?;
     let obj = doc.root().as_obj()?;
     if is_root {
       // Presentation settings live in the user config now; warn rather
@@ -215,31 +373,28 @@ impl Config {
           ));
         }
       }
-      obj
-        .known_keys(ROOT_KEYS)
-        .with_context(|| format!("in {}", path.display()))?;
-      let _ = parse_kernel(&obj, &cx)
-        .with_context(|| format!("in {}", path.display()))?;
-      self
-        .apply_root(&obj, &cx)
-        .with_context(|| format!("in {}", path.display()))?;
+      obj.known_keys(ROOT_KEYS)?;
+      let _ = parse_kernel(&obj, &cx)?;
+      self.apply_root(&obj, &cx)?;
     } else {
-      obj
-        .known_keys(FRAGMENT_KEYS)
-        .with_context(|| format!("in {}", path.display()))?;
+      obj.known_keys(FRAGMENT_KEYS)?;
     }
-    self
-      .load_tasks(&obj, &cx, mount, task_paths)
-      .with_context(|| format!("in {}", path.display()))?;
+    let file = path
+      .strip_prefix(project_root)
+      .unwrap_or(path)
+      .to_string_lossy()
+      .replace('\\', "/");
+    self.load_tasks(&obj, &cx, &file, mount, task_paths)?;
 
+    let mut children = Vec::new();
     if let Some(load) = obj.get("load") {
       for entry in load.as_arr()?.iter() {
         let (pattern, child_mount) = parse_load_entry(&entry, &cx)?;
-        let child_mount = join_task_path(mount, &child_mount);
+        let child_mount = join(mount, &child_mount);
         validate_mount(&child_mount, &entry)?;
-        let base_path = dir.to_string_lossy().replace('\\', "/");
-        let base = glob::Pattern::escape(&base_path);
-        let pattern = format!("{base}/{}", pattern.replace('\\', "/"));
+        let watched = Watched::load(dir, &pattern.replace('\\', "/"));
+        let pattern = watched.pattern.clone();
+        self.watch(watched);
         let mut matches = glob::glob(&pattern)
           .map_err(|err| entry.error(format!("invalid load pattern: {err}")))?
           .filter_map(|path| match path {
@@ -259,27 +414,29 @@ impl Config {
         for child in matches {
           let child = dunce::canonicalize(&child)?;
           if child != path {
-            self.load_file(
-              project_root,
-              &child,
-              &child_mount,
-              false,
-              stack,
-              task_paths,
-            )?;
+            children.push((child, child_mount.clone()));
           }
         }
       }
     }
+    Ok(children)
+  }
 
-    stack.pop();
-    Ok(())
+  fn watch_file(&mut self, path: &Path) {
+    self.watch(Watched::file(path));
+  }
+
+  fn watch(&mut self, watched: Watched) {
+    if !self.watched.contains(&watched) {
+      self.watched.push(watched);
+    }
   }
 
   fn load_tasks(
     &mut self,
     obj: &CfgObj<'_>,
     cx: &CfgCx,
+    file: &str,
     mount: &str,
     task_paths: &mut HashSet<String>,
   ) -> Result<()> {
@@ -288,16 +445,21 @@ impl Config {
     };
     let tasks = tasks.as_obj()?;
     for (name, task) in tasks.iter() {
-      let path = join_task_path(mount, name);
+      let path = join(mount, name);
       if !task_paths.insert(path.clone()) {
         bail!("duplicate task path '{}'", path);
       }
       let mut config = task_from_cfg(path, &task, cx)?;
+      config.source = Some(crate::spec::Source {
+        file: file.to_string(),
+        key: name.to_string(),
+        mount: mount.to_string(),
+      });
       for dep in &mut config.deps {
         if let Some(root_dep) = dep.strip_prefix('/') {
           *dep = root_dep.to_string();
         } else if !mount.is_empty() {
-          *dep = join_task_path(mount, dep);
+          *dep = join(mount, dep);
         }
       }
       self.tasks.push(config);
@@ -348,14 +510,6 @@ fn parse_load_entry(
     obj.required("file", cx)?,
     obj.default("at", String::new(), cx)?,
   ))
-}
-
-fn join_task_path(parent: &str, child: &str) -> String {
-  match (parent.is_empty(), child.is_empty()) {
-    (true, _) => child.to_string(),
-    (_, true) => parent.to_string(),
-    _ => format!("{parent}/{child}"),
-  }
 }
 
 fn validate_mount(mount: &str, node: &CfgNode<'_>) -> Result<()> {
@@ -532,6 +686,56 @@ mod tests {
     let _ = std::fs::remove_dir_all(root);
   }
 
+  /// A `load` pattern is watched where it can match: under its plain
+  /// directories, and deeper when a wildcard is in a directory part.
+  #[test]
+  fn load_patterns_are_watched_where_they_can_match() {
+    let dir = Path::new("/p");
+    let watched = |pattern| {
+      let w = Watched::load(dir, pattern);
+      (w.dir.to_string_lossy().into_owned(), w.recursive, w.pattern)
+    };
+    assert_eq!(watched("a.yaml"), ("/p".into(), false, "/p/a.yaml".into()));
+    assert_eq!(
+      watched("cfg/*.yaml"),
+      ("/p/cfg".into(), false, "/p/cfg/*.yaml".into())
+    );
+    assert_eq!(watched("apps/*/tasks.yaml").0, "/p/apps");
+    assert!(watched("apps/*/tasks.yaml").1);
+    assert_eq!(watched("**/tasks.yaml").0, "/p");
+    assert!(watched("**/tasks.yaml").1);
+    // A last part `**` matches files at any depth under the directory.
+    assert_eq!(
+      watched("cfg/**"),
+      ("/p/cfg".into(), true, "/p/cfg/**".into())
+    );
+    assert!(!watched("cfg/*").1);
+    assert_eq!(
+      watched("./a/../../q/*.yaml"),
+      ("/q".into(), false, "/q/*.yaml".into())
+    );
+  }
+
+  /// A config that does not load still says what it was read from, so a
+  /// fix to the fragment that broke it is seen.
+  #[test]
+  fn a_config_that_does_not_load_says_what_it_read() {
+    let root = temp_project("broken-fragment");
+    std::fs::write(root.join("dekit.yaml"), "load: [b.yaml]\n").unwrap();
+    std::fs::write(root.join("b.yaml"), "tasks: [\n").unwrap();
+    let Err((_, watched)) = Config::try_load_dir(&root) else {
+      panic!("b.yaml is broken");
+    };
+    let b = dunce::canonicalize(root.join("b.yaml")).unwrap();
+    assert!(
+      watched
+        .iter()
+        .any(|w| glob::Pattern::new(&w.pattern).unwrap().matches_path(&b)),
+      "{watched:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+  }
+
   #[test]
   fn glob_matching_only_the_declaring_file_loads_nothing() {
     let root = temp_project("only-self-glob");
@@ -563,6 +767,11 @@ mod tests {
       "{:?}",
       config.warnings
     );
+    // Never a project key: unknown there, not moved.
+    std::fs::write(root.join("dekit.yaml"), "agent: {cmd: [claude]}\n")
+      .unwrap();
+    let err = Config::load_dir(&root).err().map(|err| format!("{err:#}"));
+    assert!(err.as_ref().is_some_and(|e| e.contains("agent")), "{err:?}");
     let _ = std::fs::remove_dir_all(root);
   }
 

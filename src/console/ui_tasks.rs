@@ -3,23 +3,28 @@ use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::config::Config;
+use crate::console::action::Action;
+use crate::console::keymap::{Keymap, KeymapGroup};
 use crate::console::state::{Scope, State};
 use crate::console::task_tree::{Group, Node};
 use crate::console::task_view::TaskView;
 use crate::console::theme::{TaskListTheme, Theme};
+use crate::console::widgets::wrap::wrap;
 use crate::kernel::task::{ExitInfo, TaskKind, TaskState};
+use crate::kernel::task_path::is_at_or_under;
 use crate::term::{Grid, Rgb, grid::Rect, style::Style};
 
 /// Blank cells between the border and each row.
-const PAD: u16 = 1;
+pub(crate) const PAD: u16 = 1;
 /// Indent per path level.
-const INDENT: u16 = 2;
+pub(crate) const INDENT: u16 = 2;
 
 pub fn render_tasks(
   area: Rect,
   grid: &mut Grid,
   state: &mut State,
   config: &Config,
+  keymap: &Keymap,
   theme: &Theme,
 ) {
   let style = theme.block.panel(state.scope == Scope::Tasks);
@@ -28,19 +33,66 @@ pub fn render_tasks(
   if state.quitting {
     block.title(" QUITTING ", style.alert);
   }
+  // Changes here not in the config, in the color of the marks on the
+  // tasks they are on; a click offers to write them back.
+  // Where it was drawn last, for the hover.
+  let hovered = state
+    .unsaved_hit
+    .take()
+    .zip(state.hover)
+    .is_some_and(|(hit, (x, y))| hit.contains(x, y));
+  let unsaved = state.config.unsaved();
+  if unsaved > 0 {
+    let text = format!(" \u{2022} {unsaved} unsaved ");
+    let mut bg = theme.block.bg;
+    if hovered {
+      bg = bg.blend(theme.block.text, 24);
+    }
+    let attrs = Style::default().bg(bg.into()).fg(theme.block.key.into());
+    state.unsaved_hit = block.title_right(&text, attrs);
+  }
   let inner = block.inner();
+  let accent = Style::default()
+    .bg(theme.block.bg.into())
+    .fg(theme.block.border_focused.into());
 
+  let dragging = state
+    .drag
+    .as_ref()
+    .filter(|drag| drag.active)
+    .map(|drag| (drag.from.clone(), drag.drop.clone()));
+  if let Some((_, Some(drop))) = &dragging
+    && drop.row.is_none()
+  {
+    // The top of the list: a line on the border above it, after the
+    // title.
+    let title = config.tui.sidebar.title.width() as u16 + 3;
+    let mut line = Rect::new(inner.x, area.y, inner.width, 1);
+    line.take_left(title.min(line.width));
+    grid.fill_area(line, '━', accent);
+  }
   let tasks = &mut state.tasks;
   for list_row in tasks.rows(inner) {
     let Some((path, node)) = tasks.row(list_row.index) else {
       continue;
     };
+    let hovered = state
+      .hover
+      .is_some_and(|(x, y)| list_row.area.contains(x, y));
     let bg = if list_row.selected {
       theme.block.selected_bg
+    } else if hovered && dragging.is_none() {
+      theme.block.bg.blend(theme.block.text, 14)
     } else {
       theme.block.bg
     };
-    let paint = |color: Rgb| Style::default().bg(bg.into()).fg(color.into());
+    let carried = dragging
+      .as_ref()
+      .is_some_and(|(from, _)| is_at_or_under(path.as_str(), from.as_str()));
+    let paint = |color: Rgb| {
+      let color = if carried { color.blend(bg, 140) } else { color };
+      Style::default().bg(bg.into()).fg(color.into())
+    };
     let (status_text, status_color) = match node {
       Node::Task(task) => task_status(task, &theme.tasks),
       Node::Group(group) => group_status(group, &theme.tasks),
@@ -63,13 +115,75 @@ pub fn render_tasks(
       Node::Group(group) if group.collapsed => (path.name(), "/…"),
       Node::Group(_) => (path.name(), "/"),
     };
-    let mut name_area = area.take_left((name.width() + suffix.width()) as u16);
+    // A config task changed here and not written back.
+    let edited = match node {
+      Node::Task(task) => state.config.edited.contains(&task.id),
+      Node::Group(_) => false,
+    };
+    let edited_w = if edited { 2 } else { 0 };
+    let mut name_area =
+      area.take_left((name.width() + suffix.width()) as u16 + edited_w);
+    let edited_area = name_area.take_right(edited_w);
     let suffix_area = name_area.take_right(suffix.width() as u16);
     if name.width() > name_area.width as usize {
       grid.draw_text(name_area.take_right(1), "…", paint(theme.block.text));
     }
     grid.draw_text(name_area, name, paint(theme.block.text));
     grid.draw_text(suffix_area, suffix, paint(theme.tasks.mark));
+    if edited {
+      let mut dot = edited_area;
+      dot.take_left(1);
+      grid.draw_text(dot, "•", paint(theme.block.key));
+    }
+
+    if let Some((_, Some(drop))) = &dragging
+      && drop.row == Some(list_row.index)
+    {
+      let left = PAD + INDENT.saturating_mul(drop.parent.depth() as u16);
+      let line = list_row.area.inner((0, 0, 0, left));
+      let color = theme.block.border_focused;
+      grid.map_styles(line, |style| {
+        style.set_underlined(true).ul_color(color.into())
+      });
+    }
+  }
+
+  if let Some(toast) = &state.toast {
+    // At the bottom, as many rows as it takes.
+    let lines = wrap(&toast.text, inner.width.saturating_sub(2));
+    let height = (lines.len() as u16).min(inner.height);
+    let area = Rect {
+      y: inner.bottom().saturating_sub(height),
+      height,
+      ..inner
+    };
+    let (fg, bg) = if toast.error {
+      (theme.block.alert, theme.block.alert_bg)
+    } else {
+      (theme.block.text, theme.block.selected_bg)
+    };
+    let style = Style::default().bg(bg.into()).fg(fg.into());
+    grid.fill_area(area, ' ', style);
+    for (row, line) in area.inner((0, 1)).rows().zip(&lines) {
+      grid.draw_text(row, line, style);
+    }
+  }
+
+  if tasks.row_count() == 0 && inner.height > 2 {
+    let mut hint = inner.inner((1, PAD));
+    let dim = style.dim;
+    grid.draw_text(hint.take_top(1), "No tasks yet.", dim);
+    match keymap.key(KeymapGroup::Tasks, &Action::ShowAddTask) {
+      Some(key) => {
+        let line = format!("Press {key} to add one,");
+        grid.draw_text(hint.take_top(1), &line, dim);
+        grid.draw_text(hint.take_top(1), "or right-click here.", dim);
+      }
+      None => {
+        grid.draw_text(hint.take_top(1), "Right-click here to add", dim);
+        grid.draw_text(hint.take_top(1), "one.", dim);
+      }
+    }
   }
 }
 

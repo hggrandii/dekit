@@ -11,15 +11,12 @@ use crate::{
   },
   kernel::{
     copy_mode::CopyMove,
-    kernel_message::{
-      KernelCommand, KernelQuery, KernelQueryResponse, ScreenHandle,
-      TaskContext, TaskSelector,
-    },
+    kernel_message::{KernelCommand, ScreenHandle, TaskContext, TaskSelector},
     task::TaskId,
     task_screen::{ObserverId, ScreenNotify, ScrollUnit, TaskScreenCmd},
   },
   protocol::{
-    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Msg,
+    Bye, ByeSwitch, ConnReceiver, ConnSender, CtlMsg, Event, Feature, Msg,
     ScreenCommand, TermCaps, codes,
     ctl::{
       CopyEvent, EVENT_COPY, EVENT_SCREEN, Hello, input_of, is_input_event,
@@ -287,12 +284,8 @@ async fn kernel_task_state(
   pc: &TaskContext,
   id: TaskId,
 ) -> Option<crate::kernel::task::TaskState> {
-  match pc.query(KernelQuery::ListTasks(TaskSelector::Id(id))).await {
-    Ok(KernelQueryResponse::TaskList(tasks)) => {
-      tasks.into_iter().next().map(|task| task.state)
-    }
-    Ok(KernelQueryResponse::Explain(_)) | Err(_) => None,
-  }
+  let tasks = pc.list_tasks(TaskSelector::Id(id)).await;
+  tasks.into_iter().next().map(|task| task.state)
 }
 
 async fn session(
@@ -421,7 +414,7 @@ async fn session(
           Reveal::Off => unreachable!("guarded"),
           Reveal::Settling { .. } => {
             let shown = present.as_ref().unwrap_or(vt).load();
-            let links = painter.caps().hyperlinks;
+            let links = painter.caps().has(Feature::Hyperlinks);
             (VecDeque::from(reveal::frames(&shown, links)), shown)
           }
           Reveal::Sweeping { frames, shown } => (frames, shown),
@@ -702,31 +695,23 @@ mod tests {
   #[tokio::test]
   async fn until_exit_ends_the_attach_when_the_task_is_not_active() {
     use crate::{
-      process::process_spec::ProcessSpec,
       protocol::codes,
-      task::process_task::{ProcessTaskConfig, process_task_registration},
+      task::process_task::{RunCx, process_task},
     };
 
     let config = Arc::new(Config::make_default());
     let mut kernel = Kernel::new();
     let pc = kernel.context();
-    let spec = ProcessSpec::from_argv(vec![
-      "sh".to_string(),
-      "-c".to_string(),
-      "true".to_string(),
-    ]);
     // Never started: the task sits Idle, which `until_exit` treats as
     // already finished.
-    kernel
-      .register_task_registration(process_task_registration(
-        pc.alloc_id(),
-        Some(TaskKey::default_space(TaskPath::new("oneshot").unwrap())),
-        ProcessTaskConfig {
-          pinned: false,
-          ..ProcessTaskConfig::new(spec)
-        },
-      ))
-      .unwrap();
+    let task = process_task(
+      &RunCx::of(&config),
+      pc.alloc_id(),
+      Some(TaskKey::default_space(TaskPath::new("oneshot").unwrap())),
+      serde_yaml::from_str("{cmd: [sh, -c, 'true']}").unwrap(),
+    )
+    .unwrap();
+    kernel.register_task_registration(task).unwrap();
     let kernel_handle = tokio::spawn(kernel.run());
 
     let (sender, mut receiver, session) =
@@ -935,7 +920,7 @@ mod tests {
           path: Some(TaskPath::new("console").unwrap()),
           ..TaskDef::default()
         },
-        config.clone(),
+        crate::project::Project::new(config.clone()),
         config.keymap.build(),
       ))
       .unwrap();
@@ -1051,29 +1036,23 @@ mod tests {
   #[tokio::test]
   async fn screen_commands_drive_copy_mode_on_a_process() {
     use crate::{
-      process::process_spec::ProcessSpec,
       protocol::{ScreenCommand, ctl::EVENT_SCREEN, screen},
-      task::process_task::{ProcessTaskConfig, process_task_registration},
+      task::process_task::{RunCx, process_task},
     };
 
     let config = Arc::new(Config::make_default());
     let mut kernel = Kernel::new();
     let pc = kernel.context();
-    let spec = ProcessSpec::from_argv(vec![
-      "sh".to_string(),
-      "-c".to_string(),
-      "echo hello-copy; sleep 30".to_string(),
-    ]);
-    kernel
-      .register_task_registration(process_task_registration(
-        pc.alloc_id(),
-        Some(TaskKey::default_space(TaskPath::new("echo").unwrap())),
-        ProcessTaskConfig {
-          pinned: true,
-          ..ProcessTaskConfig::new(spec)
-        },
-      ))
-      .unwrap();
+    let mut task = process_task(
+      &RunCx::of(&config),
+      pc.alloc_id(),
+      Some(TaskKey::default_space(TaskPath::new("echo").unwrap())),
+      serde_yaml::from_str("{cmd: [sh, -c, 'echo hello-copy; sleep 30']}")
+        .unwrap(),
+    )
+    .unwrap();
+    task.def.pinned = true;
+    kernel.register_task_registration(task).unwrap();
     let kernel_handle = tokio::spawn(kernel.run());
 
     let (mut sender, mut receiver, session) =

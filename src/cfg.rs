@@ -1,29 +1,15 @@
-//! Config parsing utilities for manual YAML -> Rust config loading.
+//! Config parsing: typed accessors over a YAML value that report where
+//! a value is wrong.
 //!
-//! Provides:
-//! - [`CfgDoc`] — YAML document with write-back support and `$js` pre-resolution
-//! - [`CfgNode`] / [`CfgObj`] / [`CfgArr`] — typed accessors with path tracking for errors
-//! - [`FromCfg`] / [`IntoCfg`] — conversion traits between Rust types and YAML values
-//! - [`CfgCx`] — parsing context (config dir, optional JS evaluator)
-//!
-//! # Usage
-//! ```ignore
-//! let cx = CfgCx::new(config_dir);
-//! let doc = CfgDoc::load(path, &cx)?;
-//! let root = doc.root().as_obj()?;
-//!
-//! let name: String = root.required("name", &cx)?;
-//! let port: usize = root.default("port", 8080, &cx)?;
-//! let tags: Option<Vec<String>> = root.optional("tags", &cx)?;
-//!
-//! // Write-back: modify and save
-//! doc.set_at(&CfgPath::root().join("port"), 9090.into_cfg());
-//! doc.save()?;
-//! ```
+//! - [`CfgDoc`]: a parsed document
+//! - [`CfgNode`] / [`CfgObj`] / [`CfgArr`]: typed accessors with the path
+//!   to each value, for errors
+//! - [`FromCfg`]: how a Rust type reads from a value
+//! - [`CfgCx`]: the context a value is read in (the config's directory)
 
 use std::ffi::OsString;
 use std::fmt::{self, Display};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -59,89 +45,55 @@ impl Display for CfgPath {
 pub struct CfgCx {
   /// Parent directory of the config file, for resolving `<CONFIG_DIR>`.
   pub config_dir: PathBuf,
-  /// Optional JS evaluator for `{"$js": "..."}` directives.
-  /// Receives the source string, must return the evaluated YAML value.
-  pub js_eval: Option<Box<dyn Fn(&str) -> Result<Value>>>,
 }
 
 impl CfgCx {
   pub fn new(config_dir: PathBuf) -> Self {
-    Self {
-      config_dir,
-      js_eval: None,
-    }
+    Self { config_dir }
   }
 
-  /// Resolve a `<CONFIG_DIR>` prefix in a path string.
+  /// A path from the config: relative to its directory, or under a
+  /// `<CONFIG_DIR>` prefix. Without `.` and `..` steps, taken as written,
+  /// so a path compares equal however it is written: `.` is the directory
+  /// itself, and `../api` from `web` is `api`.
   pub fn resolve_path(&self, path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("<CONFIG_DIR>") {
-      let mut buf = self.config_dir.clone();
-      buf.push(rest.trim_start_matches(['/', '\\']));
-      buf
-    } else {
-      let path = PathBuf::from(path);
-      if path.is_relative() {
-        self.config_dir.join(path)
-      } else {
-        path
-      }
-    }
-  }
-}
-
-/// Pre-process a YAML value tree, evaluating `$js` directives.
-///
-/// - `{"$js": "cx => expr"}` — calls `cx.js_eval` and substitutes the result.
-pub fn resolve_directives(value: &Value, cx: &CfgCx) -> Result<Value> {
-  match value {
-    Value::Mapping(map) => {
-      if let Some(js_src) = map.get(&Value::from("$js")) {
-        let src = js_src
-          .as_str()
-          .ok_or_else(|| anyhow::anyhow!("$js value must be a string"))?;
-        if let Some(eval) = &cx.js_eval {
-          let result = eval(src)?;
-          return resolve_directives(&result, cx);
-        } else {
-          bail!("$js directive found but no JS evaluator is configured");
+    let path = match path.strip_prefix("<CONFIG_DIR>") {
+      Some(rest) => self.config_dir.join(rest.trim_start_matches(['/', '\\'])),
+      None => self.config_dir.join(path),
+    };
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+      match (component, resolved.components().next_back()) {
+        (Component::CurDir, _) => (),
+        (Component::ParentDir, Some(Component::Normal(_))) => {
+          resolved.pop();
         }
+        // Above the root is the root.
+        (
+          Component::ParentDir,
+          Some(Component::RootDir | Component::Prefix(_)),
+        ) => (),
+        (component, _) => resolved.push(component),
       }
-
-      // Recurse into mapping values
-      let mut result = serde_yaml::Mapping::new();
-      for (k, v) in map {
-        result.insert(k.clone(), resolve_directives(v, cx)?);
-      }
-      Ok(Value::Mapping(result))
     }
-    Value::Sequence(seq) => {
-      let items = seq
-        .iter()
-        .map(|v| resolve_directives(v, cx))
-        .collect::<Result<Vec<_>>>()?;
-      Ok(Value::Sequence(items))
-    }
-    other => Ok(other.clone()),
+    resolved
   }
 }
 
-/// A config document with its `$js` directives evaluated.
+/// A parsed config document.
 pub struct CfgDoc {
   resolved: Value,
 }
 
 impl CfgDoc {
-  /// Create from a pre-parsed YAML value.
-  pub fn from_value(source: Value, cx: &CfgCx) -> Result<Self> {
-    let resolved = resolve_directives(&source, cx)?;
-    Ok(Self { resolved })
+  pub fn from_value(source: Value) -> Self {
+    Self { resolved: source }
   }
 
-  /// Load and resolve a YAML config file.
-  pub fn load(path: &Path, cx: &CfgCx) -> Result<Self> {
+  /// Load a YAML config file.
+  pub fn load(path: &Path) -> Result<Self> {
     let content = std::fs::read_to_string(path)?;
-    let source: Value = serde_yaml::from_str(&content)?;
-    Self::from_value(source, cx)
+    Ok(Self::from_value(serde_yaml::from_str(&content)?))
   }
 
   /// Root node of the resolved tree, ready for parsing.
@@ -551,6 +503,19 @@ impl<T: FromCfg> FromCfg for IndexMap<String, T> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_resolved_path_has_no_dot_steps() {
+    let cx = CfgCx::new(PathBuf::from("/p"));
+    assert_eq!(cx.resolve_path("."), Path::new("/p"));
+    assert_eq!(cx.resolve_path("./a/./b"), Path::new("/p/a/b"));
+    assert_eq!(cx.resolve_path("/q/."), Path::new("/q"));
+    assert_eq!(cx.resolve_path("<CONFIG_DIR>/."), Path::new("/p"));
+    assert_eq!(cx.resolve_path("../q/../r"), Path::new("/r"));
+    assert_eq!(cx.resolve_path("/../.."), Path::new("/"));
+    let relative = CfgCx::new(PathBuf::from("p"));
+    assert_eq!(relative.resolve_path("../../q"), Path::new("../q"));
+  }
 
   fn obj_from_yaml(yaml: &str) -> CfgObj<'static> {
     // Leak for 'static test lifetime convenience.

@@ -1,4 +1,6 @@
+use crate::console::theme::{BlockStyle, BlockTheme};
 use crate::term::{
+  Grid,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
   mouse::{MouseButton, MouseEvent, MouseEventKind},
@@ -129,6 +131,16 @@ impl ListState {
     true
   }
 
+  /// `handle_key`, and `j`/`k` too: for a list nothing is typed into.
+  pub fn handle_vi_key(&mut self, key: &Key) -> bool {
+    match (key.code, key.mods) {
+      (KeyCode::Char('j'), KeyMods::NONE) => self.next(),
+      (KeyCode::Char('k'), KeyMods::NONE) => self.prev(),
+      _ => return self.handle_key(key),
+    }
+    true
+  }
+
   /// Menu-style mouse handling: the pointer moves the cursor, the wheel
   /// scrolls, and a left click returns the row it landed on.
   pub fn handle_mouse(&mut self, mouse: &MouseEvent) -> Option<usize> {
@@ -156,6 +168,21 @@ impl ListState {
     None
   }
 
+  /// Where a row was last drawn, if it is in view.
+  pub fn row_area(&self, index: usize) -> Option<Rect> {
+    let offset = index.checked_sub(self.drawn_top)?;
+    (offset < self.area.height as usize && index < self.len).then(|| Rect {
+      y: self.area.y + offset as u16,
+      height: 1,
+      ..self.area
+    })
+  }
+
+  /// The area the rows were last drawn in.
+  pub fn area(&self) -> Rect {
+    self.area
+  }
+
   /// The row drawn at a point by the last `rows`.
   pub fn row_at(&self, x: u16, y: u16) -> Option<ListRow> {
     if !self.area.contains(x, y) {
@@ -172,6 +199,22 @@ impl ListState {
       selected: index == self.selected,
     })
   }
+}
+
+/// Paints a row of a list in a modal, lit when selected; returns the
+/// style to draw on it in.
+pub fn paint_row(
+  grid: &mut Grid,
+  area: Rect,
+  selected: bool,
+  style: BlockStyle,
+  theme: &BlockTheme,
+) -> BlockStyle {
+  let style = theme.modal_row(style, selected);
+  if selected {
+    grid.fill_area(area, ' ', style.text);
+  }
+  style
 }
 
 #[cfg(test)]

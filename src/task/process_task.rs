@@ -1,16 +1,20 @@
 use std::future::{Future, pending};
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+use crate::config::config::Config;
+use crate::config::task::{AUTOSTART_TAG, CmdConfig, TaskConfig};
 use crate::error::ResultLogger;
 use crate::kernel::kernel_message::{
-  KernelCommand, TaskContext, TaskRegistration, TaskSelector,
+  KernelCommand, TaskContext, TaskRegistration, TaskSelector, TaskUpdate,
 };
 use crate::kernel::task::{
-  ExitInfo, ReadyMode, RestartMode, STOP_TIMEOUT, TaskCmd, TaskDef, TaskId,
-  TaskKind,
+  ExitInfo, NextRun, ReadyMode, RestartMode, Run, STOP_TIMEOUT, TaskCmd,
+  TaskDef, TaskId,
 };
 use crate::kernel::task_key::TaskKey;
 use crate::kernel::task_path::TaskPath;
@@ -20,13 +24,16 @@ use crate::kernel::task_screen::{
 use crate::process::NativeProcess;
 use crate::process::process::Process as _;
 use crate::process::process_spec::ProcessSpec;
+use crate::runner::RunnerSpec;
+use crate::spec::TaskSpec;
+use crate::task::config_tasks::project_dir;
 #[cfg(unix)]
 use crate::task::logger::LogSink;
 use crate::task::logger::{LogSpec, spawn_logger};
 #[cfg(windows)]
 use crate::task::ready::command;
 use crate::task::ready::{
-  Probe, ReadyCheck, ReadyConfig, line_ready, parse_http_url, wait_ready,
+  Probe, ReadyCheck, ReadyConfig, line_ready, wait_ready,
 };
 use crate::term::key::Key;
 use crate::term::vt::emit::{self, KeyEncodeModes};
@@ -38,7 +45,7 @@ use crate::upgrade::snapshot as snap;
 /// INT/TERM/KILL have a (terminate) fallback; every other signal is ignored.
 macro_rules! signals {
   ($($name:literal => $variant:ident => $libc:ident,)+) => {
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Sig {
       $($variant,)+
     }
@@ -98,7 +105,7 @@ signals! {
   "SIGSYS" => Sys => SIGSYS,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StopSignal {
   Signal {
     sig: Sig,
@@ -133,76 +140,191 @@ impl StopSignal {
   }
 }
 
-pub struct ProcessTaskConfig {
-  pub spec: ProcessSpec,
-  pub label: Option<String>,
-  pub kind: TaskKind,
-  pub stop: StopSignal,
-  pub stop_timeout: Duration,
-  pub log: Option<LogSpec>,
-  pub restart: RestartMode,
-  /// Without it the task is ready as soon as it starts.
-  pub ready: Option<ReadyConfig>,
-  pub scrollback_len: usize,
-  pub mouse_scroll_speed: usize,
-  pub deps: Vec<TaskSelector>,
-  pub tags: Vec<String>,
-  /// Pin to init at registration, so a registered task is already
-  /// started with no separate `Start` command.
-  pub pinned: bool,
+/// What a definition is read with: the project's directory, which
+/// relative paths are from, and the runner, which script tasks talk to.
+#[derive(Clone, Debug)]
+pub struct RunCx {
+  pub dir: PathBuf,
+  pub runner: Option<RunnerSpec>,
 }
 
-#[cfg(test)]
-impl ProcessTaskConfig {
-  pub fn new(spec: ProcessSpec) -> Self {
-    Self {
-      spec,
-      label: None,
-      kind: TaskKind::Service,
-      stop: StopSignal::default(),
-      stop_timeout: STOP_TIMEOUT,
-      log: None,
-      restart: RestartMode::Never,
-      ready: None,
-      scrollback_len: 1000,
-      mouse_scroll_speed: 5,
-      deps: Vec::new(),
-      tags: Vec::new(),
-      pinned: false,
+impl RunCx {
+  pub fn of(config: &Config) -> Arc<RunCx> {
+    Arc::new(RunCx {
+      dir: project_dir(config),
+      runner: config.runner.clone(),
+    })
+  }
+
+  /// Reads a definition as the task at `path` runs it, and as the kernel
+  /// keeps it: in one form, so equal definitions compare equal.
+  fn read(
+    &self,
+    path: &str,
+    spec: &TaskSpec,
+  ) -> anyhow::Result<(TaskConfig, TaskSpec)> {
+    let cfg = spec.parse(path, &self.dir)?;
+    match &cfg.cmd {
+      Some(CmdConfig::Script { .. }) if self.runner.is_none() => {
+        anyhow::bail!("script command has no runner identity")
+      }
+      Some(CmdConfig::Cmd { .. } | CmdConfig::Script { .. }) => {
+        let spec = TaskSpec::from_config(&cfg);
+        Ok((cfg, spec))
+      }
+      None => anyhow::bail!("expected 'cmd' or 'script'"),
     }
   }
 }
 
-pub fn process_task_registration(
-  task_id: TaskId,
-  key: Option<TaskKey>,
-  config: ProcessTaskConfig,
-) -> TaskRegistration {
-  let screen = Screen::new(DEFAULT_SIZE, config.scrollback_len);
-  registration(task_id, key, config, screen, None)
+/// What one run of a process task is: read from its definition when it
+/// starts, and kept until the next start.
+#[derive(Clone)]
+pub struct ProcessRun {
+  pub spec: ProcessSpec,
+  pub stop: StopSignal,
+  pub log: Option<LogSpec>,
+  /// Without it the run is ready as soon as it starts.
+  pub ready: Option<ReadyConfig>,
+  pub scrollback_len: usize,
+  pub mouse_scroll_speed: usize,
 }
 
-/// A process task re-created around its inherited child and PTY.
-#[cfg(unix)]
-pub fn process_task_from_snapshot(
+impl ProcessRun {
+  fn of(cx: &RunCx, cfg: &TaskConfig) -> ProcessRun {
+    ProcessRun {
+      spec: crate::config::task::process_spec(cfg, cx.runner.as_ref()),
+      stop: cfg
+        .stop
+        .as_ref()
+        .and_then(|stop| stop.signal.clone())
+        .unwrap_or_default(),
+      log: cfg.log.clone().map(|log| LogSpec {
+        config: log,
+        name: cfg.path.clone(),
+      }),
+      ready: cfg.ready.clone(),
+      scrollback_len: cfg.scrollback_len(),
+      mouse_scroll_speed: cfg.mouse_scroll_speed(),
+    }
+  }
+
+  #[cfg(test)]
+  pub fn new(spec: ProcessSpec) -> Self {
+    Self {
+      spec,
+      stop: StopSignal::default(),
+      log: None,
+      ready: None,
+      scrollback_len: 1000,
+      mouse_scroll_speed: 5,
+    }
+  }
+}
+
+fn ready_mode(cfg: &TaskConfig) -> ReadyMode {
+  match &cfg.ready {
+    Some(ready) => ReadyMode::Reported {
+      timeout: ready.timeout,
+    },
+    None => ReadyMode::Immediate,
+  }
+}
+
+fn stop_timeout(cfg: &TaskConfig) -> Duration {
+  cfg
+    .stop
+    .as_ref()
+    .and_then(|stop| stop.timeout)
+    .unwrap_or(STOP_TIMEOUT)
+}
+
+/// Its own tags, and `autostart` for one that autostarts.
+fn tags(cfg: &TaskConfig) -> Vec<String> {
+  let mut tags = cfg.tags.clone();
+  if cfg.autostart() {
+    tags.push(AUTOSTART_TAG.to_string());
+  }
+  tags
+}
+
+/// A process task made from a definition as written (`defaults`
+/// already in it): what the kernel keeps of it, around a fresh screen.
+/// Its deps, pin, origin and place are the caller's to set.
+pub fn process_task(
+  cx: &Arc<RunCx>,
   task_id: TaskId,
   key: Option<TaskKey>,
-  saved: &snap::Task,
-  process: &snap::ProcessTask,
+  spec: TaskSpec,
 ) -> anyhow::Result<TaskRegistration> {
-  let deps = saved
-    .deps
-    .iter()
-    .map(|id| TaskSelector::Id(TaskId(*id)))
-    .collect();
-  let config = process_task_config_from_snapshot(saved, process, deps)?;
-  process_task_resumed(
-    task_id,
-    key,
-    config,
-    &process.screen,
-    resumed_instance(saved, process),
-  )
+  let path = key
+    .as_ref()
+    .map_or(String::new(), |key| key.path.to_string());
+  let (cfg, spec) = cx.read(&path, &spec)?;
+  let screen = Screen::new(DEFAULT_SIZE, cfg.scrollback_len());
+  Ok(registration(
+    cx, task_id, key, &cfg, spec, None, screen, None,
+  ))
+}
+
+/// A process task around a saved screen and, if the child is still this
+/// runner's, its inherited PTY. `run_spec` is what the run under way
+/// started from, when the task was redefined since.
+pub fn process_task_resumed(
+  cx: &Arc<RunCx>,
+  task_id: TaskId,
+  key: Option<TaskKey>,
+  spec: TaskSpec,
+  run_spec: Option<TaskSpec>,
+  screen: &snap::Screen,
+  instance: Option<snap::Instance>,
+) -> anyhow::Result<TaskRegistration> {
+  let path = key
+    .as_ref()
+    .map_or(String::new(), |key| key.path.to_string());
+  let (cfg, spec) = cx.read(&path, &spec)?;
+  let run = run_spec
+    .map(|run_spec| cx.read(&path, &run_spec))
+    .transpose()?;
+  let screen = Screen::from_snapshot(screen)?;
+  Ok(registration(
+    cx, task_id, key, &cfg, spec, run, screen, instance,
+  ))
+}
+
+/// What runs of `cfg`, written as `spec`, start from.
+fn next_run(cfg: &TaskConfig, spec: TaskSpec) -> NextRun {
+  NextRun {
+    kind: cfg.kind,
+    ready: ready_mode(cfg),
+    stop_timeout: stop_timeout(cfg),
+    spec: Some(spec),
+  }
+}
+
+/// A task's new definition as `KernelCommand::Update` takes it, unless
+/// it is no longer `was`; restarted now if `restart_running`.
+pub fn process_task_update(
+  cx: &RunCx,
+  path: &TaskPath,
+  spec: TaskSpec,
+  deps: Vec<TaskSelector>,
+  was: Option<TaskSpec>,
+  restart_running: bool,
+) -> anyhow::Result<TaskUpdate> {
+  let (cfg, spec) = cx.read(path.as_str(), &spec)?;
+  // A `was` in another form is the same definition still.
+  let was =
+    was.map(|was| cx.read(path.as_str(), &was).map_or(was, |(_, was)| was));
+  Ok(TaskUpdate {
+    restart: cfg.autorestart.unwrap_or(RestartMode::Never),
+    deps,
+    tags: tags(&cfg),
+    label: cfg.label.clone(),
+    next: next_run(&cfg, spec),
+    was,
+    restart_running,
+  })
 }
 
 /// The saved child as its task resumes it. The kernel waits for a ready
@@ -228,115 +350,16 @@ pub fn resumed_instance(
   Some(instance)
 }
 
-pub fn process_task_config_from_snapshot(
-  saved: &snap::Task,
-  process: &snap::ProcessTask,
-  deps: Vec<TaskSelector>,
-) -> anyhow::Result<ProcessTaskConfig> {
-  let spec = ProcessSpec {
-    prog: process.spec.prog.clone(),
-    args: process.spec.args.clone(),
-    cwd: process.spec.cwd.clone(),
-    env: process.spec.env.iter().cloned().collect(),
-  };
-  let stop = match &process.stop {
-    snap::StopSignal::Shutdown {} => StopSignal::Signal {
-      sig: Sig::Term,
-      group: true,
-    },
-    snap::StopSignal::Kill {} => StopSignal::Signal {
-      sig: Sig::Kill,
-      group: true,
-    },
-    snap::StopSignal::Signal { sig, group } => StopSignal::Signal {
-      sig: Sig::from_name(sig)
-        .ok_or_else(|| anyhow::anyhow!("unknown stop signal {sig}"))?,
-      group: *group,
-    },
-    snap::StopSignal::SendKeys { keys } => StopSignal::Keys(keys.clone()),
-    // An older binary's line, meant for the system shell.
-    snap::StopSignal::Cmd { cmd } => {
-      StopSignal::Cmd(crate::parse_shell::system_argv(cmd))
-    }
-    snap::StopSignal::Program { argv } => StopSignal::Cmd(argv.clone()),
-  };
-  let log = process.log.as_ref().map(|log| LogSpec {
-    config: crate::config::task_log::TaskLogConfig {
-      enabled: log.enabled,
-      dir: log.dir.as_ref().map(std::path::PathBuf::from),
-      file: log.file.as_ref().map(std::path::PathBuf::from),
-      mode: Some(if log.truncate {
-        crate::config::task_log::LogMode::Truncate
-      } else {
-        crate::config::task_log::LogMode::Append
-      }),
-    },
-    name: log.name.clone(),
-  });
-  let check = match (&process.ready_log, &process.ready_probe) {
-    (None, None) => None,
-    (Some(text), None) => Some(ReadyCheck::Log(text.clone())),
-    (None, Some(probe)) => Some(ReadyCheck::Probe {
-      probe: match &probe.check {
-        snap::ReadyCheck::Tcp { host, port } => Probe::Tcp {
-          host: host.clone(),
-          port: *port,
-        },
-        snap::ReadyCheck::Http { url } => {
-          Probe::Http(parse_http_url(url).map_err(anyhow::Error::msg)?)
-        }
-        snap::ReadyCheck::Cmd { argv } => Probe::Cmd { argv: argv.clone() },
-        snap::ReadyCheck::File { path } => Probe::File {
-          path: std::path::PathBuf::from(path),
-        },
-      },
-      interval: Duration::from_millis(probe.interval_ms),
-    }),
-    (Some(_), Some(_)) => anyhow::bail!("a task has two ready checks"),
-  };
-  Ok(ProcessTaskConfig {
-    spec,
-    label: saved.label.clone(),
-    kind: if saved.job {
-      TaskKind::Job
-    } else {
-      TaskKind::Service
-    },
-    stop,
-    stop_timeout: saved
-      .stop_timeout_ms
-      .map_or(STOP_TIMEOUT, Duration::from_millis),
-    log,
-    restart: saved.restart.into(),
-    ready: check.map(|check| ReadyConfig {
-      check,
-      timeout: saved.ready_timeout_ms.map(Duration::from_millis),
-    }),
-    scrollback_len: process.scrollback_len,
-    mouse_scroll_speed: process.mouse_scroll_speed,
-    deps,
-    tags: saved.tags.clone(),
-    pinned: saved.pinned,
-  })
-}
-
-/// A process task around a saved screen and, if the child is still this
-/// runner's, its inherited PTY; the config may be newer than the child.
-pub fn process_task_resumed(
-  task_id: TaskId,
-  key: Option<TaskKey>,
-  config: ProcessTaskConfig,
-  screen: &snap::Screen,
-  instance: Option<snap::Instance>,
-) -> anyhow::Result<TaskRegistration> {
-  let screen = Screen::from_snapshot(screen)?;
-  Ok(registration(task_id, key, config, screen, instance))
-}
-
+/// `cfg` and `spec` are the task's definition; `run`, what the run
+/// under way started from when that is older.
+#[allow(clippy::too_many_arguments)]
 fn registration(
+  cx: &Arc<RunCx>,
   task_id: TaskId,
   key: Option<TaskKey>,
-  config: ProcessTaskConfig,
+  cfg: &TaskConfig,
+  spec: TaskSpec,
+  run: Option<(TaskConfig, TaskSpec)>,
   screen: Screen,
   instance: Option<snap::Instance>,
 ) -> TaskRegistration {
@@ -346,32 +369,54 @@ fn registration(
     Some(key) => (key.space, Some(key.path)),
     None => (Default::default(), None),
   };
-  let mut config = config;
+  // The kernel's run fields are the run's; the next run is the task's.
+  let (run_cfg, run_spec, next) = match run {
+    Some((run_cfg, run_spec)) => {
+      (run_cfg, run_spec, Some(Box::new(next_run(cfg, spec))))
+    }
+    None => (cfg.clone(), spec, None),
+  };
+  let process_run = ProcessRun::of(cx, &run_cfg);
+  let copier = cx.clone();
   TaskRegistration::async_task(
     task_id,
     TaskDef {
-      kind: config.kind,
-      ready: match &config.ready {
-        Some(ready) => ReadyMode::Reported {
-          timeout: ready.timeout,
-        },
-        None => ReadyMode::Immediate,
-      },
-      restart: config.restart,
-      stop_timeout: config.stop_timeout,
-      deps: std::mem::take(&mut config.deps),
+      kind: run_cfg.kind,
+      ready: ready_mode(&run_cfg),
+      restart: cfg.autorestart.unwrap_or(RestartMode::Never),
+      stop_timeout: stop_timeout(&run_cfg),
+      deps: Vec::new(),
       space,
       path,
-      label: config.label.take(),
-      after: None,
+      label: cfg.label.clone(),
+      place: Default::default(),
       vt: Some(handle),
-      tags: std::mem::take(&mut config.tags),
-      pinned: config.pinned,
+      tags: tags(cfg),
+      pinned: false,
       saved_pin: false,
+      spec: Some(run_spec),
+      origin: None,
+      next,
+      make_copy: Some(Arc::new(move |task_id, key, spec| {
+        let path = key.as_ref().map_or(String::new(), |k| k.path.to_string());
+        let spec = spec.for_copy(&path, &copier.dir);
+        process_task(&copier, task_id, key, spec)
+      })),
     },
-    move |ctx, receiver| async move {
-      process_main(ctx, receiver, key, screen, task_handle, config, instance)
+    {
+      let cx = cx.clone();
+      move |ctx, receiver| async move {
+        process_main(
+          ctx,
+          receiver,
+          screen,
+          task_handle,
+          cx,
+          process_run,
+          instance,
+        )
         .await;
+      }
     },
   )
 }
@@ -436,7 +481,7 @@ impl Instance {
 }
 
 /// Whether the ready check reads the lines the screen finishes.
-fn watches_lines(config: &ProcessTaskConfig) -> bool {
+fn watches_lines(config: &ProcessRun) -> bool {
   matches!(
     config.ready,
     Some(ReadyConfig {
@@ -447,7 +492,7 @@ fn watches_lines(config: &ProcessTaskConfig) -> bool {
 }
 
 fn snapshot(
-  config: &ProcessTaskConfig,
+  config: &ProcessRun,
   process: Option<&NativeProcess>,
   task_screen: &TaskScreen,
   instance: &Instance,
@@ -547,10 +592,12 @@ fn snapshot(
 async fn process_main(
   ctx: TaskContext,
   mut receiver: UnboundedReceiver<TaskCmd>,
-  key: Option<TaskKey>,
   screen: Screen,
   handle: ScreenHandle,
-  config: ProcessTaskConfig,
+  cx: Arc<RunCx>,
+  // The run under way, or the last one: what the task stops, checks and
+  // logs by.
+  mut config: ProcessRun,
   saved: Option<snap::Instance>,
 ) {
   let mut task_screen =
@@ -692,8 +739,23 @@ async fn process_main(
     match next {
       Next::Cmd(None) => break,
       Next::Cmd(Some(cmd)) => match cmd {
-        TaskCmd::Start if process.is_none() => {
-          match start_instance(&ctx, &config.spec, &mut task_screen) {
+        TaskCmd::Start(run) if process.is_none() => {
+          if let Some(Run { spec, path }) = run.map(|run| *run) {
+            let path = path.as_ref().map_or("", TaskPath::as_str);
+            match cx.read(path, &spec) {
+              Ok((cfg, _)) => config = ProcessRun::of(&cx, &cfg),
+              Err(err) => {
+                let message = format!("\r\n[dekit: can't run it: {err:#}]\r\n");
+                task_screen
+                  .process(message.as_bytes(), &mut screen_effects)
+                  .await;
+                screen_effects.clear();
+                ctx.send(KernelCommand::TaskStopped(ExitInfo::error()));
+                continue;
+              }
+            }
+          }
+          match start_instance(&ctx, &config, &mut task_screen) {
             Ok((p, receiver)) => {
               instance.exit_info = None;
               instance.stdout_eof = false;
@@ -720,7 +782,7 @@ async fn process_main(
             }
           }
         }
-        TaskCmd::Start => {}
+        TaskCmd::Start(_) => {}
         TaskCmd::Stop => {
           probe = None;
           instance.stop_sent = true;
@@ -735,43 +797,6 @@ async fn process_main(
           if let Some(p) = process.as_mut() {
             p.kill(config.stop.kill_group()).await.log_ignore();
           }
-        }
-        TaskCmd::Duplicate(label) => {
-          let new_id = ctx.alloc_id();
-          let key = match &key {
-            Some(k) => TaskPath::new(format!("{}_{}", k.path, new_id.0))
-              .ok()
-              .map(|path| TaskKey::new(k.space.clone(), path)),
-            None => TaskPath::new(new_id.0.to_string())
-              .ok()
-              .map(TaskKey::default_space),
-          };
-          let mut registration = process_task_registration(
-            new_id,
-            key,
-            ProcessTaskConfig {
-              spec: config.spec.clone(),
-              kind: config.kind,
-              stop: config.stop.clone(),
-              stop_timeout: config.stop_timeout,
-              log: None,
-              restart: config.restart,
-              ready: config.ready.clone(),
-              scrollback_len: config.scrollback_len,
-              mouse_scroll_speed: config.mouse_scroll_speed,
-              deps: Vec::new(),
-              label,
-              tags: Vec::new(),
-              pinned: true,
-            },
-          );
-          registration.def.after = Some(ctx.task_id);
-          let ack = ctx.register_task(registration);
-          tokio::spawn(async move {
-            if let Ok(Err(err)) = ack.await {
-              log::warn!("Duplicate failed: {err}");
-            }
-          });
         }
         TaskCmd::Freeze(number) => {
           // An exit the reaper collected before reaping paused is already
@@ -866,7 +891,7 @@ type ProbeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// The ready check that polls, unless the instance is ready, is being
 /// stopped, or has exited.
 fn start_probe(
-  config: &ProcessTaskConfig,
+  config: &ProcessRun,
   instance: &Instance,
 ) -> Option<ProbeFuture> {
   if instance.ready_sent || instance.stop_sent || instance.exit_info.is_some() {
@@ -917,11 +942,12 @@ fn update_log_observer(
 
 fn start_instance(
   ctx: &TaskContext,
-  spec: &ProcessSpec,
+  run: &ProcessRun,
   task_screen: &mut TaskScreen,
 ) -> Result<(NativeProcess, UnboundedReceiver<ExitInfo>), String> {
+  let spec = &run.spec;
   let size = task_screen.winsize();
-  task_screen.reset_screen();
+  task_screen.reset_screen(run.scrollback_len, run.mouse_scroll_speed);
   match spawn_native(ctx, spec, size) {
     Ok(spawned) => {
       ctx.send(KernelCommand::TaskStarted);
@@ -1125,6 +1151,28 @@ fn run_stop_cmd(spec: &ProcessSpec, argv: &[String]) {
 #[cfg(not(windows))]
 #[cfg(test)]
 mod tests {
+  /// A saved task as a runner resumes it, around its child.
+  #[cfg(unix)]
+  fn resumed(saved: &snap::Task) -> TaskRegistration {
+    let snap::TaskKind::Process(process) = &saved.kind else {
+      unreachable!()
+    };
+    let deps = saved
+      .deps
+      .iter()
+      .map(|id| TaskSelector::Id(TaskId(*id)))
+      .collect();
+    crate::task::config_tasks::saved_task_registration(
+      &crate::config::config::Config::make_default(),
+      TaskId(saved.id),
+      saved,
+      process,
+      deps,
+      resumed_instance(saved, process),
+    )
+    .unwrap()
+  }
+
   fn test_screen(wheel: usize) -> TaskScreen {
     let screen = Screen::new(DEFAULT_SIZE, 0);
     let handle = ScreenHandle::new(screen.frame());
@@ -1133,46 +1181,49 @@ mod tests {
 
   use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-  use crate::config::task_log::{LogMode, TaskLogConfig};
+  use crate::config::task_log::TaskLogConfig;
   use crate::kernel::kernel::Kernel;
   use crate::kernel::kernel_message::{
-    KernelCommand, KernelQuery, KernelQueryResponse, SpaceSelector, TaskContext,
+    KernelCommand, SpaceSelector, TaskContext,
   };
-  use crate::kernel::task::{TaskId, TaskState};
+  use crate::kernel::task::{TaskId, TaskKind, TaskState};
+  use crate::kernel::task_path::TaskPath;
 
   use super::*;
 
+  /// Registers a process task at `path` made from the definition `yaml`.
   fn spawn_process_task(
     parent: &TaskContext,
-    key: Option<TaskKey>,
-    config: ProcessTaskConfig,
-  ) -> (
-    TaskId,
-    tokio::sync::oneshot::Receiver<
-      Result<(), crate::kernel::kernel_message::RegisterError>,
-    >,
-  ) {
+    path: &str,
+    yaml: &str,
+  ) -> TaskId {
+    let cx = Arc::new(RunCx {
+      dir: std::env::temp_dir(),
+      runner: None,
+    });
+    let key = TaskKey::default_space(TaskPath::new(path).unwrap());
+    let spec: TaskSpec = serde_yaml::from_str(yaml).unwrap();
     let task_id = parent.alloc_id();
-    let ack =
-      parent.register_task(process_task_registration(task_id, key, config));
-    (task_id, ack)
+    let registration = process_task(&cx, task_id, Some(key), spec).unwrap();
+    drop(parent.register_task(registration));
+    task_id
+  }
+
+  /// What a definition says, as YAML: a path in it quoted.
+  fn yaml_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.display())
   }
 
   async fn resolve(pc: &TaskContext, path: &str) -> TaskId {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    pc.send(KernelCommand::Query(
-      KernelQuery::ListTasks(TaskSelector::Glob(
-        SpaceSelector::default_space(),
-        path.to_string(),
-      )),
-      tx,
+    let rx = pc.list_tasks(TaskSelector::Glob(
+      SpaceSelector::default_space(),
+      path.to_string(),
     ));
-    let resp = tokio::time::timeout(Duration::from_secs(1), rx)
+    let tasks = tokio::time::timeout(Duration::from_secs(1), rx)
       .await
-      .expect("timed out resolving path")
-      .expect("kernel query channel closed");
-    match resp {
-      KernelQueryResponse::TaskList(tasks) if tasks.len() == 1 => tasks[0].id,
+      .expect("timed out resolving path");
+    match &tasks[..] {
+      [task] => task.id,
       _ => panic!("path did not resolve: {path}"),
     }
   }
@@ -1189,28 +1240,13 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let path = TaskKey::default_space(TaskPath::new("logged").unwrap());
-    let spec = ProcessSpec::from_argv(vec![
-      "sh".to_string(),
-      "-c".to_string(),
-      "printf hello-log".to_string(),
-    ]);
-    let sink_path = log_path.clone();
-    let (id, _) = spawn_process_task(
+    let id = spawn_process_task(
       &pc,
-      Some(path),
-      ProcessTaskConfig {
-        log: Some(LogSpec {
-          config: TaskLogConfig {
-            enabled: Some(true),
-            dir: None,
-            file: Some(sink_path),
-            mode: Some(LogMode::Truncate),
-          },
-          name: "logged".to_string(),
-        }),
-        ..ProcessTaskConfig::new(spec)
-      },
+      "logged",
+      &format!(
+        "{{cmd: [sh, -c, printf hello-log], log: {{file: {}, mode: truncate}}}}",
+        yaml_path(&log_path)
+      ),
     );
     pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
 
@@ -1253,26 +1289,13 @@ mod tests {
     let kernel = Kernel::new();
     let pc = kernel.context();
 
-    let spec = ProcessSpec::from_argv(vec![
-      "sh".to_string(),
-      "-c".to_string(),
-      "printf hi".to_string(),
-    ]);
-    let (id, _) = spawn_process_task(
+    let id = spawn_process_task(
       &pc,
-      Some(TaskKey::default_space(TaskPath::new("pidlog").unwrap())),
-      ProcessTaskConfig {
-        log: Some(LogSpec {
-          config: TaskLogConfig {
-            enabled: Some(true),
-            dir: Some(dir.clone()),
-            file: Some(std::path::PathBuf::from("{pid}.log")),
-            mode: Some(LogMode::Truncate),
-          },
-          name: "pidlog".to_string(),
-        }),
-        ..ProcessTaskConfig::new(spec)
-      },
+      "pidlog",
+      &format!(
+        "{{cmd: [sh, -c, printf hi], log: {{file: {}, mode: truncate}}}}",
+        yaml_path(&dir.join("{pid}.log"))
+      ),
     );
     pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
 
@@ -1327,30 +1350,17 @@ mod tests {
     let pc = kernel.context();
 
     let stops = [
-      (
-        "by_cmd",
-        StopSignal::Cmd(vec!["touch".to_string(), "by_cmd".to_string()]),
-      ),
-      (
-        "by_sh",
-        StopSignal::Cmd(vec![
-          "sh".to_string(),
-          "-c".to_string(),
-          "printf done > by_sh".to_string(),
-        ]),
-      ),
+      ("by_cmd", "[touch, by_cmd]"),
+      ("by_sh", "[sh, -c, 'printf done > by_sh']"),
     ];
     for (name, stop) in stops {
-      let mut spec =
-        ProcessSpec::from_argv(vec!["sleep".to_string(), "100".to_string()]);
-      spec.cwd(dir.to_string_lossy());
-      let (id, _) = spawn_process_task(
+      let id = spawn_process_task(
         &pc,
-        Some(TaskKey::default_space(TaskPath::new(name).unwrap())),
-        ProcessTaskConfig {
-          stop,
-          ..ProcessTaskConfig::new(spec)
-        },
+        name,
+        &format!(
+          "{{cmd: [sleep, '100'], cwd: {}, stop: {{cmd: {stop}}}}}",
+          yaml_path(&dir)
+        ),
       );
       pc.send(KernelCommand::Start(TaskSelector::Id(id), None));
     }
@@ -1383,11 +1393,93 @@ mod tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
+  /// A saved task comes back as its spec says, whatever was saved beside
+  /// it: an older runner saved a label that was the path, which would
+  /// stay behind when the task moves.
   #[test]
-  fn snapshot_config_round_trips_ready_and_timeouts() {
-    let config = ProcessTaskConfig {
-      kind: TaskKind::Service,
-      stop_timeout: Duration::from_secs(3),
+  fn a_saved_task_comes_back_as_its_spec_says() {
+    let run = ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]));
+    let screen = test_screen(run.mouse_scroll_speed);
+    let process = snapshot(&run, None, &screen, &Instance::default());
+    let mut saved = snap::Task {
+      id: 1,
+      space: String::new(),
+      path: Some("ember-forge".to_string()),
+      label: Some("tui/ember-forge".to_string()),
+      tags: Vec::new(),
+      pinned: false,
+      deps: Vec::new(),
+      restart: snap::Restart::Never,
+      job: false,
+      ready_timeout_ms: None,
+      stop_timeout_ms: None,
+      state: snap::TaskState::Idle {},
+      vetoed: false,
+      killed: false,
+      start_failed: false,
+      saved_pin: false,
+      attempts: 0,
+      last_start_secs_ago: None,
+      timer_ms: None,
+      spec: Some(serde_yaml::from_str("{cmd: [forge]}").unwrap()),
+      run_spec: None,
+      origin: None,
+      kind: snap::TaskKind::Process(process.clone()),
+    };
+    let def = |saved: &snap::Task| {
+      crate::task::config_tasks::saved_task_registration(
+        &crate::config::config::Config::make_default(),
+        TaskId(1),
+        saved,
+        &process,
+        Vec::new(),
+        None,
+      )
+      .unwrap()
+      .def
+    };
+    assert_eq!(def(&saved).label, None);
+    saved.spec = Some(
+      serde_yaml::from_str(
+        "{label: Forge, type: job, cmd: [forge], autorestart: on-failure}",
+      )
+      .unwrap(),
+    );
+    let restored = def(&saved);
+    assert_eq!(restored.label.as_deref(), Some("Forge"));
+    assert_eq!(restored.kind, TaskKind::Job);
+    assert_eq!(restored.restart, RestartMode::OnFailure);
+    // Saved mid-run since an edit: the run goes on as it started, and
+    // the edit is the next run's.
+    saved.spec =
+      Some(serde_yaml::from_str("{label: v2, cmd: [forge, --v2]}").unwrap());
+    saved.run_spec = Some(
+      serde_yaml::from_str("{type: job, cmd: [forge], stop: {timeout: 9s}}")
+        .unwrap(),
+    );
+    let restored = def(&saved);
+    let argv = |spec: Option<&TaskSpec>| spec.and_then(TaskSpec::argv);
+    assert_eq!(argv(restored.spec.as_ref()), Some(vec!["forge".into()]));
+    assert_eq!(restored.kind, TaskKind::Job);
+    assert_eq!(restored.stop_timeout, Duration::from_secs(9));
+    assert_eq!(restored.label.as_deref(), Some("v2"));
+    let next = restored.next.expect("the edit is the next run's");
+    assert_eq!(next.kind, TaskKind::Service);
+    assert_eq!(
+      argv(next.spec.as_ref()),
+      Some(vec!["forge".into(), "--v2".into()])
+    );
+    saved.run_spec = None;
+    // Without a spec, what was saved is all there is.
+    saved.spec = None;
+    assert_eq!(def(&saved).label.as_deref(), Some("tui/ember-forge"));
+  }
+
+  /// An older runner saved no definition: one is read back from what it
+  /// saved beside its child, as that child runs.
+  #[test]
+  fn a_task_saved_without_a_definition_reads_back_as_it_ran() {
+    let run = ProcessRun {
       ready: Some(ReadyConfig {
         check: ReadyCheck::Probe {
           probe: Probe::Tcp {
@@ -1398,10 +1490,10 @@ mod tests {
         },
         timeout: Some(Duration::from_secs(30)),
       }),
-      ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+      ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
     };
-    let screen = test_screen(config.mouse_scroll_speed);
-    let process = snapshot(&config, None, &screen, &Instance::default());
+    let screen = test_screen(run.mouse_scroll_speed);
+    let process = snapshot(&run, None, &screen, &Instance::default());
     assert_eq!(process.ready_log, None);
     let saved = snap::Task {
       id: 1,
@@ -1423,92 +1515,115 @@ mod tests {
       attempts: 0,
       last_start_secs_ago: None,
       timer_ms: None,
+      spec: None,
+      run_spec: None,
+      origin: None,
       kind: snap::TaskKind::Process(process.clone()),
     };
-    let back =
-      process_task_config_from_snapshot(&saved, &process, Vec::new()).unwrap();
-    assert_eq!(back.stop_timeout, Duration::from_secs(3));
-    let ready = back.ready.unwrap();
-    assert_eq!(ready.timeout, Some(Duration::from_secs(30)));
-    match ready.check {
-      ReadyCheck::Probe {
-        probe: Probe::Tcp { host: None, port },
-        interval,
-      } => {
-        assert_eq!(port, 5432);
-        assert_eq!(interval, Duration::from_millis(250));
+    let read = |process: &snap::ProcessTask| {
+      crate::task::config_tasks::saved_task_registration(
+        &crate::config::config::Config::make_default(),
+        TaskId(1),
+        &saved,
+        process,
+        Vec::new(),
+        None,
+      )
+      .unwrap()
+      .def
+    };
+    let def = read(&process);
+    assert_eq!(def.stop_timeout, Duration::from_secs(3));
+    assert_eq!(
+      def.ready,
+      ReadyMode::Reported {
+        timeout: Some(Duration::from_secs(30))
       }
-      other => panic!("{other:?}"),
-    }
+    );
+    let said = |def: &TaskDef, key: &str| {
+      crate::spec::show_value(def.spec.as_ref().unwrap().value_at(key))
+    };
+    assert_eq!(
+      said(&def, "ready"),
+      "{tcp: 5432, interval: 250ms, timeout: 30s}"
+    );
 
     // An older snapshot's `ready_log` is the log check.
     let mut old = process.clone();
     old.ready_probe = None;
     old.ready_log = Some("listening".to_string());
-    let back =
-      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
-    match back.ready.unwrap().check {
-      ReadyCheck::Log(text) => assert_eq!(text, "listening"),
-      other => panic!("{other:?}"),
-    }
+    assert_eq!(said(&read(&old), "ready"), "{log: listening, timeout: 30s}");
 
-    for stop in [
-      StopSignal::Signal {
-        sig: Sig::Int,
-        group: false,
-      },
-      StopSignal::Keys(vec![Key::parse("<C-c>").unwrap()]),
-      StopSignal::Cmd(vec!["podman".to_string(), "stop".to_string()]),
+    for (stop, said_stop) in [
+      (
+        StopSignal::Signal {
+          sig: Sig::Int,
+          group: false,
+        },
+        "{signal: SIGINT, group: false, timeout: 3s}",
+      ),
+      (
+        StopSignal::Keys(vec![Key::parse("<C-c>").unwrap()]),
+        "{keys: [<C-c>], timeout: 3s}",
+      ),
+      (
+        StopSignal::Cmd(vec!["podman".to_string(), "stop".to_string()]),
+        "{cmd: [podman, stop], timeout: 3s}",
+      ),
     ] {
-      let config = ProcessTaskConfig {
-        stop: stop.clone(),
-        ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+      let run = ProcessRun {
+        stop,
+        ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
       };
-      let process = snapshot(&config, None, &screen, &Instance::default());
-      let back =
-        process_task_config_from_snapshot(&saved, &process, Vec::new())
-          .unwrap();
-      assert_eq!(format!("{:?}", back.stop), format!("{stop:?}"));
+      let process = snapshot(&run, None, &screen, &Instance::default());
+      assert_eq!(said(&read(&process), "stop"), said_stop);
     }
 
     // An older binary's `cmd` line was meant for the system shell and
     // keeps running there; its `shutdown` and `kill` are SIGTERM and
     // SIGKILL to the group.
-    let config = ProcessTaskConfig {
-      stop: StopSignal::Cmd(vec!["podman".to_string(), "stop".to_string()]),
-      ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
-    };
-    let mut old = snapshot(&config, None, &screen, &Instance::default());
+    let mut old = process.clone();
     old.stop = snap::StopSignal::Cmd {
       cmd: "kill $(cat pid)".to_string(),
     };
-    let back =
-      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
-    match back.stop {
-      StopSignal::Cmd(argv) => {
-        assert_eq!(argv, crate::parse_shell::system_argv("kill $(cat pid)"))
-      }
-      other => panic!("{other:?}"),
-    }
+    let argv = crate::parse_shell::system_argv("kill $(cat pid)");
+    let stop = said(&read(&old), "stop");
+    assert!(stop.contains(&argv[0]) && stop.contains("kill"), "{stop}");
     old.stop = snap::StopSignal::Shutdown {};
-    let back =
-      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
-    match back.stop {
-      StopSignal::Signal {
-        sig: Sig::Term,
-        group: true,
-      } => (),
-      other => panic!("{other:?}"),
-    }
+    assert_eq!(said(&read(&old), "stop"), "{timeout: 3s}");
     old.stop = snap::StopSignal::Kill {};
-    let back =
-      process_task_config_from_snapshot(&saved, &old, Vec::new()).unwrap();
-    match back.stop {
-      StopSignal::Signal {
-        sig: Sig::Kill,
-        group: true,
-      } => (),
-      other => panic!("{other:?}"),
+    assert_eq!(said(&read(&old), "stop"), "{signal: SIGKILL, timeout: 3s}");
+
+    // How it logs and how much it keeps, so an edit or a write-back keeps
+    // them too; what it has anyway is left out.
+    let run = ProcessRun {
+      log: Some(LogSpec {
+        config: TaskLogConfig {
+          enabled: Some(true),
+          dir: Some("/var/log/forge".into()),
+          file: None,
+          mode: None,
+        },
+        name: "forge".into(),
+      }),
+      scrollback_len: 50,
+      ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
+    };
+    let def = read(&snapshot(&run, None, &screen, &Instance::default()));
+    assert_eq!(
+      said(&def, "log"),
+      "{enabled: true, dir: /var/log/forge, mode: append}"
+    );
+    assert_eq!(said(&def, "scrollback_len"), "50");
+    assert_eq!(said(&def, "autorestart"), "never");
+    let plain = read(&snapshot(
+      &ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()])),
+      None,
+      &screen,
+      &Instance::default(),
+    ));
+    for key in ["log", "scrollback_len", "mouse_scroll_speed"] {
+      assert!(plain.spec.as_ref().unwrap().get(key).is_none(), "{key}");
     }
   }
 
@@ -1516,7 +1631,7 @@ mod tests {
   #[tokio::test]
   async fn failed_adopt_reports_the_task_stopped() {
     let config =
-      ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".to_string()]));
+      ProcessRun::new(ProcessSpec::from_argv(vec!["true".to_string()]));
     let screen = test_screen(config.mouse_scroll_speed);
     let mut process = snapshot(&config, None, &screen, &Instance::default());
     // Pid 0 cannot be adopted.
@@ -1550,31 +1665,22 @@ mod tests {
       attempts: 1,
       last_start_secs_ago: None,
       timer_ms: None,
+      spec: None,
+      run_spec: None,
+      origin: None,
       kind: snap::TaskKind::Process(process.clone()),
     };
-    let key = TaskKey::default_space(TaskPath::new("adopted").unwrap());
-    let registration =
-      process_task_from_snapshot(TaskId(1), Some(key), &saved, &process)
-        .unwrap();
+    let registration = resumed(&saved);
 
     let mut kernel = Kernel::new();
     let pc = kernel.context();
-    kernel
-      .restore(2, vec![(Some(&saved), registration)])
-      .unwrap();
+    kernel.restore(2, vec![(&saved, registration)]).unwrap();
     let kernel_task = tokio::spawn(kernel.run());
 
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-      let (tx, rx) = tokio::sync::oneshot::channel();
-      pc.send(KernelCommand::Query(
-        KernelQuery::ListTasks(TaskSelector::Id(TaskId(1))),
-        tx,
-      ));
-      let active = match rx.await.unwrap() {
-        KernelQueryResponse::TaskList(tasks) => tasks[0].state.is_active(),
-        KernelQueryResponse::Explain(_) => unreachable!(),
-      };
+      let tasks = pc.list_tasks(TaskSelector::Id(TaskId(1))).await;
+      let active = tasks[0].state.is_active();
       if !active {
         break;
       }
@@ -1590,10 +1696,7 @@ mod tests {
   }
 
   async fn state_of(pc: &TaskContext, id: TaskId) -> TaskState {
-    match pc.query(KernelQuery::ListTasks(TaskSelector::Id(id))).await {
-      Ok(KernelQueryResponse::TaskList(tasks)) => tasks[0].state,
-      other => panic!("{:?}", other.is_ok()),
-    }
+    pc.list_tasks(TaskSelector::Id(id)).await[0].state
   }
 
   #[tokio::test]
@@ -1654,12 +1757,12 @@ mod tests {
     let mut children = Vec::new();
     let mut tasks = Vec::new();
     for (i, (name, state, check)) in cases.into_iter().enumerate() {
-      let config = ProcessTaskConfig {
+      let config = ProcessRun {
         ready: Some(ReadyConfig {
           check,
           timeout: None,
         }),
-        ..ProcessTaskConfig::new(ProcessSpec::from_argv(vec!["true".into()]))
+        ..ProcessRun::new(ProcessSpec::from_argv(vec!["true".into()]))
       };
       // A live child, and a pipe standing in for its PTY.
       let child = std::process::Command::new("sleep")
@@ -1703,24 +1806,13 @@ mod tests {
         attempts: 1,
         last_start_secs_ago: None,
         timer_ms: None,
+        spec: None,
+        run_spec: None,
+        origin: None,
         kind: snap::TaskKind::Process(process),
       });
     }
-    let mut restored = Vec::new();
-    for saved in &tasks {
-      let snap::TaskKind::Process(process) = &saved.kind else {
-        unreachable!()
-      };
-      let path = TaskPath::new(saved.path.clone().unwrap()).unwrap();
-      let registration = process_task_from_snapshot(
-        TaskId(saved.id),
-        Some(TaskKey::default_space(path)),
-        saved,
-        process,
-      )
-      .unwrap();
-      restored.push((Some(saved), registration));
-    }
+    let restored = tasks.iter().map(|saved| (saved, resumed(saved))).collect();
     let mut kernel = Kernel::new();
     let pc = kernel.context();
     kernel.restore(tasks.len() + 1, restored).unwrap();

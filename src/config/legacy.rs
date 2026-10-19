@@ -53,6 +53,8 @@ impl From<crate::mprocs::config::Config> for Config {
       on_idle: legacy.on_all_finished.map(Hook::LegacyAction),
       system_shell: true,
       warnings: Vec::new(),
+      watched: Vec::new(),
+      agent: None,
     }
   }
 }
@@ -89,6 +91,7 @@ fn task_config(
     log: legacy.log,
     scrollback_len: Some(legacy.scrollback_len),
     mouse_scroll_speed: Some(legacy.mouse_scroll_speed),
+    source: None,
   }
 }
 

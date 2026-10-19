@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
   attach_client::{AttachEnd, client_main},
   command::Command,
-  config::task::{CmdConfig, is_script},
+  config::task::is_script,
   dekit::{rpc_client::rpc_request, server::run_server},
   js::js_vm::JsVm,
   kernel::{
@@ -17,7 +17,9 @@ use crate::{
   },
   protocol::{
     ActResult, RpcRequest, RpcState, RpcWhy, ScreenResult, TaskListResult,
+    rpc::UpgradeResult,
   },
+  reload::{ChangeKind, ReloadResult},
   runner::{
     RunnerKind, RunnerSpec, clear_default_binary, lockfile,
     read_default_binary, resolve_kernel_binary, set_default_binary,
@@ -326,12 +328,12 @@ fn running_record(
 async fn switch_runner(
   runner: &RunnerSpec,
   binary: &Path,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<UpgradeResult> {
   let request = RpcRequest::Upgrade {
     binary: binary.to_string_lossy().into_owned(),
   };
   match rpc_request(runner, request, false).await {
-    Ok(result) => Ok(result),
+    Ok(result) => Ok(serde_json::from_value(result)?),
     Err(err) => match lockfile::get_runner_state(runner)? {
       lockfile::RunnerState::Failed(error) => anyhow::bail!("{error}"),
       lockfile::RunnerState::Absent
@@ -340,13 +342,6 @@ async fn switch_runner(
       | lockfile::RunnerState::Stale(_) => Err(err),
     },
   }
-}
-
-fn result_version(result: &serde_json::Value) -> &str {
-  result
-    .get("version")
-    .and_then(|v| v.as_str())
-    .unwrap_or("?")
 }
 
 /// Switches every running runner that runs an older version of this
@@ -473,14 +468,72 @@ pub fn print_warnings(warnings: &[String]) {
   }
 }
 
+/// A reload's plan, one line for each change.
+fn print_reload(result: &ReloadResult) {
+  let ReloadResult {
+    plan,
+    applied,
+    errors,
+  } = result;
+  let taken = |apply: bool, failed: bool| match (failed, apply, applied) {
+    (true, _, _) => "failed",
+    (false, true, true) => "taken",
+    (false, true, false) => "to take",
+    (false, false, _) => "kept as is",
+  };
+  if plan.changes.is_empty() && plan.order.is_none() {
+    if plan.edited_here.is_empty() {
+      println!("The tasks match the config.");
+    } else {
+      println!("Nothing new in the config.");
+    }
+  }
+  for change in &plan.changes {
+    let mut line = format!("  {} {}", change.kind.mark(), change.path);
+    if !change.fields.is_empty() {
+      let keys: Vec<&str> =
+        change.fields.iter().map(|f| f.key.as_str()).collect();
+      line.push_str(&format!("  {}", keys.join(", ")));
+    }
+    let note = match (&change.reason, change.kind) {
+      (Some(reason), _) => Some(reason.text()),
+      (None, ChangeKind::Written) => Some("now in the config".to_string()),
+      (None, _) => None,
+    };
+    if let Some(note) = note {
+      line.push_str(&format!("  ({note})"));
+    }
+    println!("{line}  [{}]", taken(change.apply, change.failed));
+  }
+  if let Some(order) = &plan.order {
+    let taken = taken(order.apply, false);
+    println!("  ↕ the config reordered its tasks  [{taken}]");
+  }
+  if !plan.edited_here.is_empty() {
+    println!(
+      "Changed here and not in the config (kept): {}",
+      plan.edited_here.join(", ")
+    );
+  }
+  for error in errors {
+    eprintln!("Error: {error}");
+  }
+  let to_take = plan.changes.iter().any(|change| change.apply)
+    || plan.order.as_ref().is_some_and(|order| order.apply);
+  if !applied && to_take {
+    println!("`dekit reload --yes` takes these; the console picks one by one.");
+  }
+}
+
 /// A `Command::Add` from `spawn`/`run` arguments.
 fn add_command(
   sub_m: &clap::ArgMatches,
   target: Target,
 ) -> anyhow::Result<Command> {
+  // Relative to where the command is typed, not to the runner.
   let cwd = match sub_m.get_one::<String>("cwd") {
-    Some(cwd) => cwd.clone(),
-    None => std::env::current_dir()?.to_string_lossy().into_owned(),
+    Some(cwd) => std::env::current_dir()?.join(cwd),
+    None => std::env::current_dir()?,
   };
   let cmd: Vec<String> =
     sub_m.get_many::<String>("cmd").unwrap().cloned().collect();
@@ -500,23 +553,29 @@ fn add_command(
     .get_many::<String>("tag")
     .map(|v| v.cloned().collect())
     .unwrap_or_default();
-  let mut env = std::collections::BTreeMap::new();
+  let mut env = serde_yaml::Mapping::new();
   if let Some(vals) = sub_m.get_many::<String>("env") {
     for val in vals {
       let (k, v) = val
         .split_once('=')
         .ok_or_else(|| anyhow!("--env expects KEY=VALUE, got `{}`", val))?;
-      env.insert(k.to_string(), Some(v.to_string()));
+      env.insert(k.into(), v.into());
     }
+  }
+  let mut spec = crate::spec::TaskSpec::with_cmd(cmd);
+  spec.set_strings("deps", deps.iter().map(Target::to_string).collect());
+  spec.set_strings("tags", tags);
+  spec.set("cwd", Some(cwd.to_string_lossy().into_owned().into()));
+  if !env.is_empty() {
+    spec.set("env", Some(serde_yaml::Value::Mapping(env)));
   }
   Ok(Command::Add {
     target,
-    label: None,
-    cmd: CmdConfig::Cmd { cmd },
-    cwd: Some(cwd),
-    env: if env.is_empty() { None } else { Some(env) },
-    deps,
-    tags,
+    spec,
+    place: Default::default(),
+    start: true,
+    defaults: true,
+    origin: None,
   })
 }
 
@@ -790,6 +849,16 @@ pub fn cli() -> ClapCommand {
       ClapCommand::new("down")
         .about("Stop the runner, keeping the tasks for the next up")
         .arg(runner_ref_arg()),
+      ClapCommand::new("reload")
+        .about("Show what changed in the config, and with --yes take it")
+        .arg(runner_ref_arg())
+        .arg(
+          Arg::new("yes")
+            .long("yes")
+            .short('y')
+            .action(clap::ArgAction::SetTrue)
+            .help("Take the config's changes, keeping what changed here"),
+        ),
       task_args(
         ClapCommand::new("spawn").about("Add a task at a path and start it"),
       ),
@@ -971,14 +1040,15 @@ pub async fn dekit_main() -> anyhow::Result<()> {
     )) => {
       let target = arg_target(sub_m)?.expect("clap requires target");
       let (runner, target) = resolve_target(&matches, target)?;
-      let (command, spawn, done) = match verb {
-        "start" => (Command::Start { target }, true, "Started"),
-        "stop" => (Command::Stop { target }, false, "Stopped"),
-        "kill" => (Command::Kill { target }, false, "Killed"),
-        "veto" => (Command::Veto { target }, false, "Vetoed"),
-        "restart" => (Command::Restart { target }, true, "Restarted"),
-        _ => (Command::Remove { target }, false, "Removed"),
+      let (command, done) = match verb {
+        "start" => (Command::Start { target }, "Started"),
+        "stop" => (Command::Stop { target }, "Stopped"),
+        "kill" => (Command::Kill { target }, "Killed"),
+        "veto" => (Command::Veto { target }, "Vetoed"),
+        "restart" => (Command::Restart { target }, "Restarted"),
+        _ => (Command::Remove { target }, "Removed"),
       };
+      let spawn = command.starts_runner();
       let result =
         rpc_request(&runner, RpcRequest::Command(command), spawn).await?;
       print_acted(result, json, done, "No tasks matched.")?;
@@ -1009,6 +1079,17 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       let result =
         rpc_request(&runner, RpcRequest::Command(Command::Up), true).await?;
       print_acted(result, json, "Started", "Nothing to start.")?;
+    }
+    Some(("reload", sub_m)) => {
+      let runner = arg_runner(&matches, sub_m)?;
+      let apply = sub_m.get_flag("yes");
+      let result =
+        rpc_request(&runner, RpcRequest::Reload { apply }, false).await?;
+      if json {
+        println!("{result}");
+      } else {
+        print_reload(&serde_json::from_value(result)?);
+      }
     }
     Some(("down", sub_m)) => {
       let runner = arg_runner(&matches, sub_m)?;
@@ -1087,7 +1168,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         } else {
           println!(
             "Runner upgraded live to dekit {} ({}).",
-            result_version(&result),
+            result.version,
             binary.display()
           );
         }
@@ -1099,10 +1180,7 @@ pub async fn dekit_main() -> anyhow::Result<()> {
         if matches.get_flag("json") {
           println!("{}", serde_json::to_string(&result)?);
         } else {
-          println!(
-            "Runner restarted live (dekit {}).",
-            result_version(&result)
-          );
+          println!("Runner restarted live (dekit {}).", result.version);
         }
       }
       Some(("stop", sub_m)) => {
@@ -1320,7 +1398,8 @@ pub async fn dekit_main() -> anyhow::Result<()> {
       if let Some(first) = paths.first() {
         // .js
         if is_script(Path::new(first)) {
-          let src = std::fs::read_to_string(first)?;
+          let src = std::fs::read_to_string(first)
+            .map_err(|err| anyhow::anyhow!("{first}: {err}"))?;
 
           // A standalone script runs anywhere; std.dekit calls fail
           // lazily if there is no runner to act on.

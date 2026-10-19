@@ -35,17 +35,20 @@ fn ls_follows_the_config() {
     ["db", "web/api", "web/ui", "web/more", "cache", "extra"]
   );
 
-  // An edited config reorders the list at a restart. A task it lacks
-  // stays right after the one it was listed after, or first.
+  // A restart keeps the list as it is; a reload takes the config's
+  // order. A task it lacks stays where it is beside the others.
   runner.yaml(&format!(
     "tasks:\n  web/ui: {SLEEP}\n  first: {SLEEP}\n  cache: {SLEEP}\n  \
      web/api: {{cmd: [sleep, '60'], deps: [cache]}}\n"
   ));
-  let edited = [
-    "db", "web/ui", "web/more", "web/api", "first", "cache", "extra",
-  ];
   let out = runner.run(&["runner", "restart"]);
   assert!(out.status.success(), "restart: {}", stderr(&out));
+  assert_eq!(
+    listed(&runner),
+    ["db", "web/api", "web/ui", "web/more", "cache", "extra"]
+  );
+  runner.ok(&["reload", "--yes"]);
+  let edited = ["web/ui", "web/api", "web/more", "first", "cache", "extra"];
   assert_eq!(listed(&runner), edited);
 
   runner.ok(&["down"]);

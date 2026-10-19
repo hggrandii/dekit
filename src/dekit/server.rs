@@ -16,6 +16,7 @@ use tokio::{
   task::JoinSet,
 };
 
+use crate::project::Project;
 use crate::{
   command::{CommandError, CommandResult, execute},
   config::{
@@ -27,8 +28,8 @@ use crate::{
   kernel::{
     kernel::{Kernel, SaveFn},
     kernel_message::{
-      KernelCommand, KernelQuery, KernelQueryResponse, KernelSnapshot,
-      RegisterError, ScreenHandle, TaskContext, TaskInfo, TaskSelector,
+      KernelCommand, KernelSnapshot, MoveError, RegisterError, ScreenHandle,
+      TaskContext, TaskInfo, TaskSelector,
     },
     task::{TaskDef, TaskState},
     task_key::TaskSpaceId,
@@ -37,7 +38,8 @@ use crate::{
   protocol::{
     ActResult, ConnReceiver, ConnSender, CtlMsg, QuitResult, RpcError,
     RpcRequest, RpcState, RpcTaskInfo, RpcWhy, RpcWhyDep, ScreenResult,
-    TaskListResult, codes, ctl::Hello, ok_result, server_hello,
+    TaskListResult, codes, ctl::Hello, ok_result, rpc::UpgradeResult,
+    server_hello,
   },
   runner::{
     RunnerSpec, atomic_write_with,
@@ -64,7 +66,7 @@ pub struct RunnerHandle {
 /// What every served connection shares.
 pub struct ServerCtx {
   pub pc: TaskContext,
-  pub config: Arc<Config>,
+  pub project: Arc<Project>,
   pub connections: Connections,
   /// None when serving in-process (tests): no upgrade possible.
   pub runner: Option<RunnerHandle>,
@@ -75,7 +77,7 @@ impl ServerCtx {
   pub fn local(pc: TaskContext, config: Arc<Config>) -> Arc<Self> {
     Arc::new(ServerCtx {
       pc,
-      config,
+      project: Project::new(config),
       connections: Connections::default(),
       runner: None,
     })
@@ -238,6 +240,7 @@ async fn run_locked(
   config.runner = Some(runner.clone());
   let keymap = config.keymap.build();
   let config = Arc::new(config);
+  let project = Project::new(config.clone());
 
   let _logger = init_logging(&config, log_level, &working_dir)?;
 
@@ -250,7 +253,7 @@ async fn run_locked(
   #[cfg(unix)]
   crate::process::unix_processes_waiter::UnixProcessesWaiter::init()?;
   let mut kernel = Kernel::new();
-  kernel.save_on_quit(save_on_quit(runner));
+  kernel.save_on_quit(save_on_quit(runner, project.clone()));
   let pc = kernel.context();
   let socket_path = lock_guard.socket_path().to_path_buf();
   let console_id = pc.alloc_id();
@@ -262,7 +265,7 @@ async fn run_locked(
       pinned: true,
       ..TaskDef::default()
     },
-    config.clone(),
+    project.clone(),
     keymap,
   );
   if let Err(err) = kernel.register_task_registration(console) {
@@ -280,7 +283,11 @@ async fn run_locked(
 
   let bootstrap = async {
     let mut warnings = config.warnings.clone();
-    warnings.extend(register_tasks(&config, &pc, runner).await?);
+    let (restored, base) = register_tasks(&config, &pc, runner).await?;
+    warnings.extend(restored);
+    if let Some(base) = base {
+      project.set_base(base);
+    }
     if let Some(hook) = &config.on_init {
       let Hook::Command(command) = hook else {
         anyhow::bail!("dekit on_init hook is not a command")
@@ -309,7 +316,7 @@ async fn run_locked(
 
   let ctx = Arc::new(ServerCtx {
     pc,
-    config,
+    project,
     connections: Connections::default(),
     runner: Some(runner_handle(runner, lock_guard, &server_socket, log_level)),
   });
@@ -320,27 +327,11 @@ async fn run_locked(
 /// screen, with no descriptor, child, or client in it since nothing of
 /// the process survives. The next start restores the tasks idle around
 /// their screens; `up` starts the ones that were started.
-pub fn save_on_quit(runner: &RunnerSpec) -> SaveFn {
+pub fn save_on_quit(runner: &RunnerSpec, project: Arc<Project>) -> SaveFn {
   let runner = runner.clone();
   Box::new(move |kernel: KernelSnapshot| {
     let path = lockfile::saved_path(&runner).map_err(|err| err.to_string())?;
-    let mut snapshot = snap::Snapshot {
-      format: snap::FORMAT.to_string(),
-      version: snap::CURRENT_VERSION,
-      source_version: env!("CARGO_PKG_VERSION").to_string(),
-      pid: std::process::id(),
-      runner: snap::Runner {
-        kind: runner.kind.as_str().to_string(),
-        root: runner.root.to_string_lossy().into_owned(),
-      },
-      started_at: 0,
-      lock_fd: -1,
-      live_fd: -1,
-      listener_fd: -1,
-      next_task_id: kernel.next_task_id,
-      tasks: kernel.tasks,
-      connections: Vec::new(),
-    };
+    let mut snapshot = snap::Snapshot::new(&runner, kernel, project.base());
     for task in &mut snapshot.tasks {
       if let snap::TaskKind::Process(process) = &mut task.kind {
         process.instance = None;
@@ -356,38 +347,41 @@ pub fn save_on_quit(runner: &RunnerSpec) -> SaveFn {
   })
 }
 
-/// The config tasks, or the tasks saved by the last quit reconciled with
-/// the config. A saved file that cannot be read is dropped with a
-/// warning rather than keep the runner from starting.
+/// The config tasks, or the tasks the last quit saved, as it saved them,
+/// with the config entries that load had. A saved file that cannot be
+/// read is dropped with a warning rather than keep the runner from
+/// starting.
 async fn register_tasks(
   config: &Config,
   pc: &TaskContext,
   runner: &RunnerSpec,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Option<crate::spec::Base>)> {
   let path = lockfile::saved_path(runner)?;
   let bytes = match std::fs::read(&path) {
     Ok(bytes) => bytes,
     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
       register_idle_config_tasks(config, pc).await?;
-      return Ok(Vec::new());
+      return Ok((Vec::new(), None));
     }
     Err(err) => {
       anyhow::bail!("reading {}: {err}", path.display());
     }
   };
-  let warnings = match snap::decode(&bytes) {
+  let (warnings, base) = match snap::decode(&bytes) {
     Ok(snapshot) => {
       log::info!("Restoring the saved tasks from {}", path.display());
-      register_saved_tasks(config, pc, &snapshot).await?
+      let (warnings, base) =
+        register_saved_tasks(config, pc, &snapshot).await?;
+      (warnings, Some(base))
     }
     Err(err) => {
       register_idle_config_tasks(config, pc).await?;
-      vec![format!("ignoring the saved tasks: {err:#}")]
+      (vec![format!("ignoring the saved tasks: {err:#}")], None)
     }
   };
   std::fs::remove_file(&path)
     .map_err(|err| anyhow::anyhow!("removing {}: {err}", path.display()))?;
-  Ok(warnings)
+  Ok((warnings, base))
 }
 
 pub fn init_logging(
@@ -481,6 +475,10 @@ pub async fn serve(
   for connection in carried {
     tokio::spawn(connection);
   }
+  #[cfg(unix)]
+  if ctx.runner.is_some() {
+    tokio::spawn(refresh_files(ctx.clone()));
+  }
 
   kernel_handle.await?;
 
@@ -488,6 +486,34 @@ pub async fn serve(
   crate::process::unix_processes_waiter::UnixProcessesWaiter::uninit()?;
 
   Ok(())
+}
+
+/// Keeps the runner's files in the runtime dir for as long as it runs
+/// (see `lockfile::refresh`).
+#[cfg(unix)]
+async fn refresh_files(ctx: Arc<ServerCtx>) {
+  let Some(runner) = &ctx.runner else { return };
+  let mut every = tokio::time::interval(lockfile::REFRESH_EVERY);
+  every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+  // The first tick is now, right after the record was published.
+  every.tick().await;
+  loop {
+    every.tick().await;
+    let record = || {
+      let warnings = &ctx.project.config().warnings;
+      lockfile::record(&runner.paths, &runner.spec, runner.started_at, warnings)
+    };
+    match lockfile::refresh(
+      &runner.paths,
+      runner.lock_fd,
+      runner.live_fd,
+      record,
+    ) {
+      Ok(true) => log::warn!("Wrote the runner record again: it was swept."),
+      Ok(false) => (),
+      Err(err) => log::warn!("Could not refresh the runner files: {err:#}"),
+    }
+  }
 }
 
 /// Serves a registered connection: the hello exchange, then any number
@@ -625,7 +651,7 @@ pub async fn dispatch_connection(
           Ok(req) => {
             let (ctx, id) = (ctx.clone(), request.id);
             replies.spawn(async move {
-              match handle_rpc(&ctx.pc, &ctx.config, req).await {
+              match handle_rpc(&ctx.pc, &ctx.project, req).await {
                 Ok(result) => CtlMsg::ok(id, result),
                 Err(error) => CtlMsg::err(id, error),
               }
@@ -716,7 +742,10 @@ pub async fn finish(
 }
 
 pub fn upgrade_result() -> Value {
-  serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })
+  let result = UpgradeResult {
+    version: env!("CARGO_PKG_VERSION").to_string(),
+  };
+  serde_json::to_value(result).unwrap_or_default()
 }
 
 pub(crate) fn task_state(state: TaskState) -> RpcState {
@@ -749,12 +778,7 @@ async fn list(
   target: &Target,
 ) -> Result<Vec<TaskInfo>, RpcError> {
   let selector = target.selector().map_err(bad_target)?;
-  match pc.query(KernelQuery::ListTasks(selector)).await {
-    Ok(KernelQueryResponse::TaskList(tasks)) => Ok(tasks),
-    Ok(KernelQueryResponse::Explain(_)) | Err(_) => {
-      Err(RpcError::internal("unexpected query response"))
-    }
-  }
+  Ok(pc.list_tasks(selector).await)
 }
 
 /// The single match a one-task request needs.
@@ -790,9 +814,11 @@ pub async fn resolve_screen(
 
 async fn handle_rpc(
   pc: &TaskContext,
-  config: &Config,
+  project: &Arc<Project>,
   req: RpcRequest,
 ) -> Result<Value, RpcError> {
+  let config = project.config();
+  let config = config.as_ref();
   match req {
     RpcRequest::Attach { .. } | RpcRequest::Upgrade { .. } => {
       Err(RpcError::internal("handled by the connection loop"))
@@ -806,12 +832,23 @@ async fn handle_rpc(
           CommandError::Register(RegisterError::MissingDep(_)) => {
             codes::NO_MATCH
           }
+          CommandError::Register(RegisterError::DepCycle(_)) => {
+            codes::INVALID_PARAMS
+          }
+          CommandError::Move(MoveError::NotFound(_)) => codes::NO_MATCH,
+          CommandError::Move(MoveError::Taken(_) | MoveError::UnderTask(_)) => {
+            codes::PATH_TAKEN
+          }
+          CommandError::Move(
+            MoveError::IntoItself | MoveError::BadAfter(_),
+          ) => codes::INVALID_PARAMS,
           CommandError::Register(
             RegisterError::PathTaken(_) | RegisterError::PathNested(..),
           ) => codes::PATH_TAKEN,
-          CommandError::Register(RegisterError::ReservedSpace(_)) => {
-            codes::BAD_TARGET
-          }
+          CommandError::Register(
+            RegisterError::ReservedSpace(_) | RegisterError::NoDefinition,
+          ) => codes::BAD_TARGET,
+          CommandError::Register(RegisterError::Changed) => codes::CHANGED,
           CommandError::Register(RegisterError::IdTaken)
           | CommandError::KernelClosed => codes::INTERNAL,
         };
@@ -847,12 +884,7 @@ async fn handle_rpc(
 
     RpcRequest::Why { target } => {
       let selector = target.selector().map_err(bad_target)?;
-      let explains = match pc.query(KernelQuery::Explain(selector)).await {
-        Ok(KernelQueryResponse::Explain(explains)) => explains,
-        Ok(KernelQueryResponse::TaskList(_)) | Err(_) => {
-          return Err(RpcError::internal("unexpected query response"));
-        }
-      };
+      let explains = pc.explain(selector).await;
       let explain = one(explains, &target)?;
       let why = RpcWhy {
         id: explain.id,
@@ -877,6 +909,23 @@ async fn handle_rpc(
         attempts: explain.attempts,
       };
       serde_json::to_value(why).map_err(RpcError::internal)
+    }
+
+    RpcRequest::Reload { apply } => {
+      let mut plan = crate::reload::plan_reload(pc, project)
+        .await
+        .map_err(|err| RpcError::new(codes::BAD_CONFIG, format!("{err:#}")))?;
+      let errors = if apply {
+        crate::reload::apply(pc, project, &mut plan).await
+      } else {
+        Vec::new()
+      };
+      let result = crate::reload::ReloadResult {
+        plan,
+        applied: apply,
+        errors,
+      };
+      serde_json::to_value(result).map_err(RpcError::internal)
     }
 
     RpcRequest::Screen { target } => {

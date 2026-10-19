@@ -48,12 +48,15 @@ const ITALIC: u16 = 1 << 1;
 /// Any underline; the shape is in `UL_SHIFT`.
 const UNDERLINE: u16 = 1 << 2;
 const INVERSE: u16 = 1 << 3;
-const DIM: u16 = 1 << 4;
-const BLINK: u16 = 1 << 5;
-const HIDDEN: u16 = 1 << 6;
-const STRIKE: u16 = 1 << 7;
-const OVERLINE: u16 = 1 << 8;
-const UL_SHIFT: u16 = 9;
+// Above the byte the first binaries read: a snapshot with any of these
+// in use does not fit it, so such a binary refuses the snapshot rather
+// than lose them (`upgrade::snapshot`).
+const DIM: u16 = 1 << 8;
+const BLINK: u16 = 1 << 9;
+const HIDDEN: u16 = 1 << 10;
+const STRIKE: u16 = 1 << 11;
+const OVERLINE: u16 = 1 << 12;
+const UL_SHIFT: u16 = 13;
 const UL_MASK: u16 = 0b111 << UL_SHIFT;
 
 /// The bits of the legacy `mode` byte in snapshots: bold, italic,

@@ -47,11 +47,11 @@ tasks:
 - key: tasks.*.deps
   type: string[]
   default: "[]"
-  desc: Tasks that must be ready, or done for a job, before this one starts. Starting this task starts them too.
+  desc: Tasks that must be ready, or done for a job, before this one starts, each by its path. Starting this task starts them too.
 - key: tasks.*.tags
   type: string[]
   default: "[]"
-  desc: Tags for `+tag` targets (|start/targets|).
+  desc: Tags for `+tag` targets (|start/targets|). Two are the runner's to give, `autostart` from the setting below, and `dynamic`, which every task not from the config has and the config refuses.
 - key: tasks.*.ready
   type: object
   desc: When the task counts as ready, so its dependents can start (|config/tasks#ready|). Without it, the task is ready once it starts.

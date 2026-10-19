@@ -118,7 +118,7 @@ impl KeymapConfig {
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('e'), KeyMods::NONE),
-      Action::ShowRenameTask,
+      Action::ShowEditTask,
     );
     let ctrlc = Key::new(KeyCode::Char('c'), KeyMods::CONTROL);
     s.keymap_add_p(ctrlc.clone(), Action::SendKey { key: ctrlc });
@@ -128,8 +128,12 @@ impl KeymapConfig {
     );
     s.keymap_add_p(
       Key::new(KeyCode::Char('C'), KeyMods::NONE),
-      Action::DuplicateTask,
+      Action::ShowDuplicateTask,
     );
+    s.keymap_add_p(KeyCode::Char(' ').into(), Action::ShowTaskMenu);
+    s.keymap_add_p(KeyCode::Char('K').into(), Action::MoveTaskUp);
+    s.keymap_add_p(KeyCode::Char('J').into(), Action::MoveTaskDown);
+    s.keymap_add_p(KeyCode::Char('y').into(), Action::CopyTaskCommand);
     s.keymap_add_p(
       Key::new(KeyCode::Char('d'), KeyMods::NONE),
       Action::ShowRemoveTask,
@@ -300,7 +304,7 @@ fn add_keys(
 
 #[cfg(test)]
 mod tests {
-  use crate::cfg::{CfgCx, CfgDoc};
+  use crate::cfg::CfgDoc;
 
   use super::*;
 
@@ -313,14 +317,19 @@ keymap:
     <C-d>: {action: scroll-down, n: 3, unit: line}
     <C-u>: scroll-up
     <j>: null
+    <F2>: show-rename-task
 "#;
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-    let cx = CfgCx::new(std::path::PathBuf::from("."));
-    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let doc = CfgDoc::from_value(value);
     let mut config = KeymapConfig::default();
     config.merge(&doc.root().as_obj().unwrap()).unwrap();
     let key = |s: &str| KeySpec::parse(s).unwrap().key();
     assert_eq!(config.keymap_tasks.get(&key("<q>")), Some(&Action::Detach));
+    // The name the edit dialog had as the rename dialog.
+    assert_eq!(
+      config.keymap_tasks.get(&key("<F2>")),
+      Some(&Action::ShowEditTask)
+    );
     assert_eq!(
       config.keymap_tasks.get(&key("<C-d>")),
       Some(&Action::ScrollDown {

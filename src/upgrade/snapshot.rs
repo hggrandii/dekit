@@ -13,8 +13,22 @@
 //! a new version: `v2` next to `v1` plus a pure
 //! `v1 -> v2` conversion, and `decode` walks the chain to the current
 //! version. The header fields checked in `decode` never change meaning.
+//!
+//! `spec`, `run_spec`, and `config_base` hold task entries as `TaskSpec`
+//! keeps them: free mappings a reader parses as dekit.yaml would. So a
+//! key the entry parser stops taking, or reads another way, is a new
+//! version too, with a conversion for the entries older runners saved;
+//! a live upgrade refuses a saved entry it cannot read, by name. Beside
+//! each entry the task's resolved fields (`tags`, `restart`, the process
+//! `spec`, `stop`, `ready_probe`) are still written, for a reader that
+//! has no entry; a writer derives both from the same definition.
 
 use anyhow::{Context, bail};
+
+use crate::kernel::{
+  task_key::{TaskKey, TaskSpaceId},
+  task_path::TaskPath,
+};
 
 pub const FORMAT: &str = "dekit-snapshot";
 pub const CURRENT_VERSION: u32 = 1;
@@ -41,6 +55,10 @@ pub mod v1 {
     /// In list order.
     pub tasks: Vec<Task>,
     pub connections: Vec<Connection>,
+    /// The config as the runner last took it in (`crate::spec::Base`);
+    /// an older runner kept none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_base: Option<crate::spec::Base>,
   }
 
   #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -86,6 +104,18 @@ pub mod v1 {
     /// Remaining stop-grace, backoff, or ready-timeout time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer_ms: Option<u64>,
+    /// The definition as written (`crate::spec::TaskSpec`); an older
+    /// runner kept none. A reader with it builds the task from it, and
+    /// takes the resolved fields beside it only when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<crate::spec::TaskSpec>,
+    /// The definition the run under way started from, when the task was
+    /// redefined since: the run goes on as it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_spec: Option<crate::spec::TaskSpec>,
+    /// The config entry the task is written in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::spec::Source>,
     pub kind: TaskKind,
   }
 
@@ -451,9 +481,11 @@ pub mod v1 {
   pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
-    /// The style bits: bold 1, italic 2, underline 4, inverse 8, dim 16,
-    /// blink 32, hidden 64, strikethrough 128, overline 256, then the
-    /// underline shape in bits 9..12. An older binary read a byte.
+    /// The style bits: bold 1, italic 2, underline 4, inverse 8, and
+    /// above the byte an older binary read, dim 256, blink 512, hidden
+    /// 1024, strikethrough 2048, overline 4096, then the underline shape
+    /// in bits 13..15: a value that fits a byte is exactly what that
+    /// binary can show.
     pub mode: u16,
     #[serde(default, skip_serializing_if = "is_default")]
     pub ul: Color,
@@ -563,6 +595,54 @@ impl From<Restart> for crate::kernel::task::RestartMode {
       Restart::Never => RestartMode::Never,
       Restart::OnFailure => RestartMode::OnFailure,
       Restart::Always => RestartMode::Always,
+    }
+  }
+}
+
+impl Task {
+  /// Where the task was, refused when its space or path does not read.
+  pub fn key(&self) -> anyhow::Result<Option<TaskKey>> {
+    let space = if self.space.is_empty() {
+      TaskSpaceId::default_space()
+    } else {
+      TaskSpaceId::new(self.space.clone())
+        .map_err(|err| anyhow::anyhow!("task {}: {err}", self.id))?
+    };
+    let Some(path) = &self.path else {
+      return Ok(None);
+    };
+    let path = TaskPath::new(path.as_str())
+      .map_err(|err| anyhow::anyhow!("task {}: {err}", self.id))?;
+    Ok(Some(TaskKey::new(space, path)))
+  }
+}
+
+impl Snapshot {
+  /// The tasks as the kernel saved them, by this binary, for `runner`:
+  /// what a save writes. An upgrade adds what it hands over: the
+  /// descriptors and the connections.
+  pub fn new(
+    runner: &crate::runner::RunnerSpec,
+    kernel: crate::kernel::kernel_message::KernelSnapshot,
+    config_base: crate::spec::Base,
+  ) -> Snapshot {
+    Snapshot {
+      format: FORMAT.to_string(),
+      version: CURRENT_VERSION,
+      source_version: env!("CARGO_PKG_VERSION").to_string(),
+      pid: std::process::id(),
+      runner: Runner {
+        kind: runner.kind.as_str().to_string(),
+        root: runner.root.to_string_lossy().into_owned(),
+      },
+      started_at: 0,
+      lock_fd: -1,
+      live_fd: -1,
+      listener_fd: -1,
+      next_task_id: kernel.next_task_id,
+      tasks: kernel.tasks,
+      connections: Vec::new(),
+      config_base: Some(config_base),
     }
   }
 }
@@ -736,6 +816,40 @@ mod tests {
         assert!(expected.contains_key(key), "new key {key} at {path:?}");
       }
     }
+  }
+
+  /// A task's definitions, where its config entry is, and the config as
+  /// the runner last took it in, as this binary writes them: read and
+  /// written back unchanged.
+  #[test]
+  fn golden_v1_definitions_round_trip() {
+    let bytes = include_bytes!("fixtures/v1-definitions.json");
+    let snapshot = decode(bytes).unwrap();
+    let web = snapshot
+      .tasks
+      .iter()
+      .find(|task| task.path.as_deref() == Some("web"))
+      .unwrap();
+    let argv = |spec: &Option<crate::spec::TaskSpec>| {
+      spec.as_ref().and_then(crate::spec::TaskSpec::argv)
+    };
+    assert_eq!(
+      argv(&web.spec),
+      Some(vec!["npm".into(), "run".into(), "dev".into()])
+    );
+    assert_eq!(
+      argv(&web.run_spec),
+      Some(vec!["npm".into(), "start".into()])
+    );
+    assert_eq!(web.origin.as_ref().map(|o| o.key.as_str()), Some("web"));
+    let base = snapshot.config_base.as_ref().unwrap();
+    let keys: Vec<(&str, &str)> = base
+      .sources()
+      .map(|s| (s.file.as_str(), s.mount.as_str()))
+      .collect();
+    assert_eq!(keys, [("dekit.yaml", ""), ("web/tasks.yaml", "web")]);
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), fixture);
   }
 
   /// The fields added for task orchestration (ORCHESTRATION.md

@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::cfg::{CfgCx, CfgNode, CfgObj, FromCfg};
@@ -85,6 +84,9 @@ pub struct TaskConfig {
   pub log: Option<TaskLogConfig>,
   pub scrollback_len: Option<usize>,
   pub mouse_scroll_speed: Option<usize>,
+  /// Where in the config the task is written; none for a task added at
+  /// runtime.
+  pub source: Option<crate::spec::Source>,
 }
 
 impl TaskConfig {
@@ -125,6 +127,7 @@ impl TaskConfig {
       },
       scrollback_len: over.scrollback_len.or(self.scrollback_len),
       mouse_scroll_speed: over.mouse_scroll_speed.or(self.mouse_scroll_speed),
+      source: over.source.or(self.source),
     }
   }
 
@@ -240,6 +243,13 @@ pub(crate) fn task_from_cfg(
   p.cmd = Some(cmd_from_cfg(node, cx)?);
   p.deps = obj.default("deps", Vec::new(), cx)?;
   p.tags = obj.default("tags", Vec::new(), cx)?;
+  if let Some(tags) = obj.get("tags")
+    && p.tags.iter().any(|tag| tag == DYNAMIC_TAG)
+  {
+    bail!(tags.error(
+      "'dynamic' is the runner's tag: every task not from the config has it"
+    ));
+  }
   p.ready = obj.optional("ready", cx)?;
   if let Some(kind) = obj.get("type") {
     p.kind = match kind.as_str()? {
@@ -250,20 +260,19 @@ pub(crate) fn task_from_cfg(
       ))),
     };
   }
-  match p.kind {
-    TaskKind::Service => (),
-    TaskKind::Job => {
-      if let Some(ready) = obj.get("ready") {
-        bail!(ready.error(
-          "a job takes no 'ready': its dependents wait until it exits 0"
-        ));
-      }
-      if let (Some(RestartMode::Always), Some(autorestart)) =
-        (p.autorestart, obj.get("autorestart"))
-      {
-        bail!(autorestart.error("a job can't use 'autorestart: always'"));
-      }
-    }
+  if let Some(ready) = obj.get("ready")
+    && !p.kind.takes_ready()
+  {
+    bail!(
+      ready
+        .error("a job takes no 'ready': its dependents wait until it exits 0")
+    );
+  }
+  if let (Some(restart), Some(autorestart)) =
+    (p.autorestart, obj.get("autorestart"))
+    && !p.kind.takes_restart(restart)
+  {
+    bail!(autorestart.error("a job can't use 'autorestart: always'"));
   }
   Ok(p)
 }
@@ -275,11 +284,9 @@ impl FromCfg for RestartMode {
         node.error("the object form of 'autorestart' is not supported yet")
       );
     }
-    match node.raw().as_str() {
-      Some("never") => Ok(RestartMode::Never),
-      Some("on-failure") => Ok(RestartMode::OnFailure),
-      Some("always") => Ok(RestartMode::Always),
-      _ => bail!(node.error("expected never, on-failure, or always")),
+    match node.raw().as_str().and_then(RestartMode::from_name) {
+      Some(restart) => Ok(restart),
+      None => bail!(node.error("expected never, on-failure, or always")),
     }
   }
 }
@@ -333,11 +340,8 @@ fn cmd_from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<CmdConfig> {
       if !is_script(&path) {
         bail!(script.error("script must be a .js or .mjs file"));
       }
-      if !path.is_file() {
-        bail!(
-          script.error(format!("script does not exist: {}", path.display()))
-        );
-      }
+      // One that is missing fails when the task starts, as a missing
+      // program does: a definition reads the same whatever is on disk.
       Ok(CmdConfig::Script { script: path })
     }
     (None, None) => bail!(obj.error("task must define 'cmd' or 'script'")),
@@ -348,49 +352,11 @@ fn cmd_from_cfg(node: &CfgNode<'_>, cx: &CfgCx) -> Result<CmdConfig> {
 }
 
 /// What a task runs. `cmd` is always an argv; a string where one is
-/// deserialized is split into words (`split_argv`).
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(untagged, try_from = "RawCmdConfig")]
+/// read is split into words (`split_argv`).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum CmdConfig {
   Cmd { cmd: Vec<String> },
   Script { script: PathBuf },
-}
-
-#[derive(Deserialize)]
-struct RawCmdConfig {
-  #[serde(default, deserialize_with = "argv_or_string")]
-  cmd: Option<Vec<String>>,
-  #[serde(default)]
-  script: Option<PathBuf>,
-  #[serde(default)]
-  shell: Option<serde::de::IgnoredAny>,
-}
-
-impl TryFrom<RawCmdConfig> for CmdConfig {
-  type Error = String;
-
-  fn try_from(raw: RawCmdConfig) -> Result<Self, String> {
-    if raw.shell.is_some() {
-      return Err(NO_SHELL.1.to_string());
-    }
-    match (raw.cmd, raw.script) {
-      (Some(cmd), None) => Ok(CmdConfig::Cmd { cmd }),
-      (None, Some(script)) => Ok(CmdConfig::Script { script }),
-      (None, None) => Err("expected 'cmd' or 'script'".to_string()),
-      (Some(_), Some(_)) => {
-        Err("expected only one of 'cmd' or 'script'".to_string())
-      }
-    }
-  }
-}
-
-fn argv_or_string<'de, D: serde::Deserializer<'de>>(
-  de: D,
-) -> Result<Option<Vec<String>>, D::Error> {
-  Option::<Value>::deserialize(de)?
-    .map(|value| argv_from_value(&value))
-    .transpose()
-    .map_err(serde::de::Error::custom)
 }
 
 /// The spec a task runs as. `runner` is the identity script tasks
@@ -473,7 +439,7 @@ auto_restart: always
 "#;
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let doc = CfgDoc::from_value(value);
     let err = match task_from_cfg("web".into(), &doc.root(), &cx) {
       Ok(_) => panic!("expected unknown key error"),
       Err(e) => e.to_string(),
@@ -490,7 +456,7 @@ cwd: /tmp
 "#;
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let doc = CfgDoc::from_value(value);
     let err = match parse_task_settings(&doc.root().as_obj().unwrap(), &cx) {
       Ok(_) => panic!("expected unknown key error"),
       Err(e) => e.to_string(),
@@ -515,7 +481,7 @@ cwd: /tmp
     ] {
       let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
       let cx = CfgCx::new(PathBuf::from("."));
-      let doc = CfgDoc::from_value(value, &cx).unwrap();
+      let doc = CfgDoc::from_value(value);
       match parse_task_settings(&doc.root().as_obj().unwrap(), &cx) {
         Ok(_) => panic!("{yaml}: accepted"),
         Err(err) => {
@@ -529,8 +495,20 @@ cwd: /tmp
   fn parse(yaml: &str) -> Result<TaskConfig> {
     let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     let cx = CfgCx::new(PathBuf::from("."));
-    let doc = CfgDoc::from_value(value, &cx).unwrap();
+    let doc = CfgDoc::from_value(value);
     task_from_cfg("web".into(), &doc.root(), &cx)
+  }
+
+  /// The runner gives `dynamic` to its own tasks; written in the config
+  /// it would be stripped, so it is refused instead.
+  #[test]
+  fn the_dynamic_tag_is_refused() {
+    let err = match parse("cmd: x\ntags: [web, dynamic]") {
+      Ok(_) => panic!("accepted"),
+      Err(err) => err.to_string(),
+    };
+    assert!(err.contains("'dynamic' is the runner's tag"), "{err}");
+    assert_eq!(parse("cmd: x\ntags: [web]").unwrap().tags, ["web"]);
   }
 
   fn parse_err(yaml: &str) -> String {
@@ -691,54 +669,6 @@ cwd: /tmp
   }
 
   #[test]
-  fn deserialized_cmd_refuses_shell_and_names_bad_items() {
-    // Flattened next to other fields, as in `Command::Add`.
-    #[derive(Debug, Deserialize)]
-    struct Add {
-      target: String,
-      #[serde(flatten)]
-      cmd: CmdConfig,
-    }
-    let add: Add =
-      serde_yaml::from_str("{target: web, cmd: npm start}").unwrap();
-    assert_eq!(add.target, "web");
-    assert_eq!(
-      add.cmd,
-      CmdConfig::Cmd {
-        cmd: vec!["npm".into(), "start".into()]
-      }
-    );
-    for (yaml, expected) in [
-      (
-        "{target: web, shell: npm start}",
-        "'shell' is not supported",
-      ),
-      (
-        "{target: web, cmd: npm start, shell: npm start}",
-        "'shell' is not supported",
-      ),
-      (
-        "{target: web, cmd: [npm, 3000]}",
-        "cmd[1] is a number, not a string; put it in quotes",
-      ),
-      ("{target: web, cmd: 3000}", "found a number"),
-    ] {
-      match serde_yaml::from_str::<Add>(yaml) {
-        Ok(add) => panic!("{yaml}: accepted {add:?}"),
-        Err(err) => {
-          let err = err.to_string();
-          assert!(err.contains(expected), "{yaml}: {err}");
-        }
-      }
-    }
-    let err =
-      serde_json::from_str::<Add>(r#"{"target":"web","cmd":["npm",null]}"#)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("cmd[1] is null"), "{err}");
-  }
-
-  #[test]
   fn stop_merges_key_by_key_over_defaults() {
     use crate::config::stop_signal::{Sig, StopSignal};
     use std::time::Duration;
@@ -746,7 +676,7 @@ cwd: /tmp
     let settings = |yaml: &str| {
       let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
       let cx = CfgCx::new(PathBuf::from("."));
-      let doc = CfgDoc::from_value(value, &cx).unwrap();
+      let doc = CfgDoc::from_value(value);
       parse_task_settings(&doc.root().as_obj().unwrap(), &cx).unwrap()
     };
     for (defaults, task) in [

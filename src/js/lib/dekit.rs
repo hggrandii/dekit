@@ -12,11 +12,7 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for RunnerStore {
   type Changed<'to> = RunnerStore;
 }
 
-async fn run(
-  ctx: &Ctx<'_>,
-  command: Command,
-  spawn: bool,
-) -> rquickjs::Result<usize> {
+async fn run(ctx: &Ctx<'_>, command: Command) -> rquickjs::Result<usize> {
   let runner = ctx
     .userdata::<RunnerStore>()
     .ok_or_else(|| {
@@ -24,6 +20,7 @@ async fn run(
     })?
     .0
     .clone();
+  let spawn = command.starts_runner();
   let value = crate::dekit::rpc_client::rpc_request(
     &runner,
     RpcRequest::Command(command),
@@ -51,24 +48,24 @@ fn target(ctx: &Ctx<'_>, value: String) -> rquickjs::Result<Target> {
 }
 
 macro_rules! command_fn {
-  ($name:ident, $variant:ident, $spawn:expr) => {
+  ($name:ident, $variant:ident) => {
     async fn $name(ctx: Ctx<'_>, value: String) -> rquickjs::Result<usize> {
       let target = target(&ctx, value)?;
-      run(&ctx, Command::$variant { target }, $spawn).await
+      run(&ctx, Command::$variant { target }).await
     }
   };
 }
 
-command_fn!(start, Start, true);
-command_fn!(run_fresh, ForceRestart, true);
-command_fn!(stop, Stop, false);
-command_fn!(kill, Kill, false);
-command_fn!(veto, Veto, false);
-command_fn!(restart, Restart, true);
-command_fn!(remove, Remove, false);
+command_fn!(start, Start);
+command_fn!(run_fresh, ForceRestart);
+command_fn!(stop, Stop);
+command_fn!(kill, Kill);
+command_fn!(veto, Veto);
+command_fn!(restart, Restart);
+command_fn!(remove, Remove);
 
 async fn up(ctx: Ctx<'_>) -> rquickjs::Result<usize> {
-  run(&ctx, Command::Up, true).await
+  run(&ctx, Command::Up).await
 }
 
 async fn add(
@@ -81,14 +78,12 @@ async fn add(
     &ctx,
     Command::Add {
       target,
-      label: None,
-      cmd: crate::config::task::CmdConfig::Cmd { cmd },
-      cwd: None,
-      env: None,
-      deps: Vec::new(),
-      tags: Vec::new(),
+      spec: crate::spec::TaskSpec::with_cmd(cmd),
+      place: Default::default(),
+      start: true,
+      defaults: true,
+      origin: None,
     },
-    true,
   )
   .await
 }

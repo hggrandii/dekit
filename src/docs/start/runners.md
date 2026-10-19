@@ -35,9 +35,22 @@ cannot stop machine-wide tasks by accident.
 ## Stopping a runner
 
 `dekit down` stops the runner and saves its tasks and screens; the next
-start brings them back idle, and `dekit up`, or `dekit` with no command,
-starts the ones you had started. `dekit runner stop` stops it without saving, so
-the next start begins from `dekit.yaml`.
+start brings them back idle, as they were, and `dekit up`, or `dekit` with
+no command, starts the ones you had started. What changed in `dekit.yaml`
+meanwhile comes in with |cli/reload|. `dekit runner stop` stops it without
+saving, so the next start begins from `dekit.yaml`.
+
+## Changing tasks in the console
+
+The console adds, edits, duplicates, moves, and removes tasks: `<a>`,
+`<e>`, `<C>`, `<J>`/`<K>` or dragging a row, and `<d>`; `<Space>` or a
+right click opens a task's menu. These change the runner, not
+`dekit.yaml`: a config task changed here is marked `•`, and the header
+counts them. Clicking the count writes them back: dekit edits the file in
+place, keeping its comments, and what it can't edit safely it hands to a
+coding agent (`agent` in the user config, |config/user|) or copies as a
+prompt. When `dekit.yaml` changes on disk the header says so; clicking it
+opens the reload dialog.
 
 Script tasks (`script:` in `dekit.yaml`) get `DEKIT_RUNNER_ROOT` and
 `DEKIT_RUNNER_KIND` in their environment, so the script talks to the runner

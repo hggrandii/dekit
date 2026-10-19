@@ -87,6 +87,38 @@ pub struct LockFileGuard {
   started_at: u64,
 }
 
+/// The record a runner at `paths` publishes.
+pub fn record(
+  paths: &RunnerPaths,
+  runner: &RunnerSpec,
+  started_at: u64,
+  warnings: &[String],
+) -> anyhow::Result<Vec<u8>> {
+  // Canonical, so comparisons against the (canonical) selected kernel
+  // don't report a restart over a symlinked install path.
+  let binary = dunce::canonicalize(std::env::current_exe()?)?;
+  let binary = binary
+    .to_str()
+    .ok_or_else(|| anyhow::anyhow!("dekit binary path is not valid UTF-8"))?;
+  let contents = RunnerRecord {
+    schema: 1,
+    protocol: crate::protocol::ctl::PROTOCOL_VERSION,
+    kind: runner.kind.clone(),
+    owner: owner_info()?,
+    socket: paths.socket.to_string_lossy().into_owned(),
+    root: runner
+      .root
+      .to_str()
+      .expect("validated runner root")
+      .to_string(),
+    started_at,
+    version: env!("CARGO_PKG_VERSION").to_string(),
+    binary: binary.to_string(),
+    warnings: warnings.to_vec(),
+  };
+  Ok(serde_json::to_vec_pretty(&contents)?)
+}
+
 pub(crate) fn now_secs() -> u64 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
@@ -138,29 +170,7 @@ impl LockFileGuard {
     runner: &RunnerSpec,
     warnings: &[String],
   ) -> anyhow::Result<()> {
-    // Canonical, so comparisons against the (canonical) selected kernel
-    // don't report a restart over a symlinked install path.
-    let binary = dunce::canonicalize(std::env::current_exe()?)?;
-    let binary = binary
-      .to_str()
-      .ok_or_else(|| anyhow::anyhow!("dekit binary path is not valid UTF-8"))?;
-    let contents = RunnerRecord {
-      schema: 1,
-      protocol: crate::protocol::ctl::PROTOCOL_VERSION,
-      kind: runner.kind.clone(),
-      owner: owner_info()?,
-      socket: self.paths.socket.to_string_lossy().into_owned(),
-      root: runner
-        .root
-        .to_str()
-        .expect("validated runner root")
-        .to_string(),
-      started_at: self.started_at,
-      version: env!("CARGO_PKG_VERSION").to_string(),
-      binary: binary.to_string(),
-      warnings: warnings.to_vec(),
-    };
-    let bytes = serde_json::to_vec_pretty(&contents)?;
+    let bytes = record(&self.paths, runner, self.started_at, warnings)?;
     atomic_write(&self.paths.record, &bytes)?;
     let _ = std::fs::remove_file(&self.paths.error);
     Ok(())
@@ -501,6 +511,53 @@ pub fn holds(
   )
 }
 
+/// How often a running runner refreshes its files (`refresh`).
+pub const REFRESH_EVERY: std::time::Duration =
+  std::time::Duration::from_secs(60 * 60);
+
+/// Keeps a running runner's files in the runtime dir. Cleaners sweep
+/// files left untouched: macOS deletes what `$TMPDIR` has not had opened
+/// for three days, and XDG asks for a touch every six hours. Without its
+/// record a live runner can be neither listed nor reached, so `record`
+/// is written again when it is gone. A swept socket is an error: listed,
+/// the runner is reached only by its pid, which `dekit runner stop` kills.
+/// Nothing is done once the dir names other lock files: the stem may be
+/// another runner's by then. True when the record was written again.
+#[cfg(unix)]
+pub fn refresh(
+  paths: &RunnerPaths,
+  lock_fd: i32,
+  live_fd: i32,
+  record: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<bool> {
+  use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_NOW, utimensat};
+  if !holds(paths, lock_fd, live_fd)? {
+    return Ok(false);
+  }
+  let restored = !paths.record.try_exists()?;
+  if restored {
+    atomic_write(&paths.record, &record()?)?;
+  }
+  let now = Timespec {
+    tv_sec: 0,
+    tv_nsec: UTIME_NOW,
+  };
+  let times = Timestamps {
+    last_access: now,
+    last_modification: now,
+  };
+  for path in [&paths.record, &paths.lock, &paths.live, &paths.socket] {
+    let _ = utimensat(CWD, path, &times, AtFlags::empty());
+  }
+  if !paths.socket.try_exists()? {
+    anyhow::bail!(
+      "the socket is gone, so the runner cannot be reached; `dekit runner \
+       stop` still kills it"
+    );
+  }
+  Ok(restored)
+}
+
 #[cfg(unix)]
 fn path_matches_file(
   path: &Path,
@@ -669,6 +726,56 @@ mod tests {
 
     drop(guard);
     assert!(!is_runner_alive(&paths.live));
+    let _ = std::fs::remove_dir_all(runtime);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn refresh_writes_a_swept_record_again_and_touches_the_files() {
+    let (runtime, paths) = temp_paths("refresh");
+    let guard = lock_runner_paths(paths.clone()).unwrap();
+    let runner = RunnerSpec {
+      kind: RunnerKind::Project,
+      root: runtime.clone(),
+    };
+    guard.publish(&runner, &[]).unwrap();
+    let (lock_fd, live_fd) = guard.fds();
+    let record = || super::record(&paths, &runner, guard.started_at(), &[]);
+    let old = std::time::SystemTime::UNIX_EPOCH;
+    let file = std::fs::File::options().write(true).open(&paths.lock);
+    file
+      .unwrap()
+      .set_times(
+        std::fs::FileTimes::new()
+          .set_accessed(old)
+          .set_modified(old),
+      )
+      .unwrap();
+
+    std::fs::write(&paths.socket, "").unwrap();
+
+    // As a cleaner of old files leaves a long-running runner.
+    std::fs::remove_file(&paths.record).unwrap();
+    assert!(refresh(&paths, lock_fd, live_fd, record).unwrap());
+    let written = read_runner_record(&paths.record).unwrap();
+    assert_eq!(written.owner.pid, std::process::id());
+    assert!(std::fs::metadata(&paths.lock).unwrap().modified().unwrap() > old);
+    assert!(!refresh(&paths, lock_fd, live_fd, record).unwrap());
+
+    // Listed again, but not reachable: said so.
+    std::fs::remove_file(&paths.record).unwrap();
+    std::fs::remove_file(&paths.socket).unwrap();
+    assert!(refresh(&paths, lock_fd, live_fd, record).is_err());
+    assert!(paths.record.exists());
+
+    // Another runner's files under the stem are left alone.
+    std::fs::remove_file(&paths.record).unwrap();
+    std::fs::remove_file(&paths.lock).unwrap();
+    std::fs::write(&paths.lock, "").unwrap();
+    assert!(!refresh(&paths, lock_fd, live_fd, record).unwrap());
+    assert!(!paths.record.exists());
+
+    drop(guard);
     let _ = std::fs::remove_dir_all(runtime);
   }
 }

@@ -11,7 +11,10 @@ pub(crate) mod internal;
 #[cfg(windows)]
 mod windows;
 
-use crate::protocol::caps::{GraphicsCaps, TermCaps, WidthPolicy};
+use crate::protocol::caps::{
+  Feature, FeatureSet, Features, KittyCaps, KittyGraphics, TermCaps,
+  WidthPolicy,
+};
 use crate::term::modes::{KITTY_ALL_FLAGS, KITTY_TEXT};
 use crate::{
   error::ResultLogger,
@@ -718,36 +721,57 @@ fn caps_from_probe(probe: &Probe, env: &Env) -> TermCaps {
     ColorDepth::TrueColor
   };
   let apple = is("apple_terminal") || env.term_program == "Apple_Terminal";
+  // What tmux checks its `default-terminal` for before it turns italics
+  // into standout; a pane's TERM is that option.
+  let screen_term = env.term == "screen"
+    || env.term.starts_with("screen-")
+    || env.term.starts_with("screen.");
   let widths = if probe.widths.len() >= 3 {
     WidthPolicy {
-      vs16_wide: probe.widths[0] == 2,
-      flags_wide: probe.widths[1] == 2,
-      zwj_joins: probe.widths[2] == 2,
+      vs16_wide: Some(probe.widths[0] == 2),
+      flags_wide: Some(probe.widths[1] == 2),
+      zwj_joins: Some(probe.widths[2] == 2),
     }
   } else {
     WidthPolicy::default()
   };
-  let kitty_graphics = probe.graphics.then(|| GraphicsCaps {
-    placeholders: is("kitty") || is("ghostty") || is("konsole"),
-    animation: is("kitty"),
+  let sixel = probe
+    .da1
+    .as_ref()
+    .is_some_and(|params| params.iter().skip(1).any(|p| *p == 4));
+  let mut features = Features::default();
+  for (feature, on) in [
+    (Feature::Italic, !screen_term),
+    (Feature::Strikethrough, true),
+    (Feature::UnderlineStyles, modern && !apple),
+    (Feature::UnderlineColors, modern && !apple),
+    (Feature::Hyperlinks, !dumb_term && !apple),
+    (Feature::Sync, probe.sync_output == Some(true)),
+    (Feature::Focus, true),
+    (Feature::Sixel, sixel),
+  ] {
+    features.set(feature, on);
+  }
+  let graphics = probe.graphics.then(|| {
+    let mut graphics = FeatureSet::default();
+    graphics.set(
+      KittyGraphics::Placeholders,
+      is("kitty") || is("ghostty") || is("konsole"),
+    );
+    graphics.set(KittyGraphics::Animation, is("kitty"));
+    graphics
   });
   TermCaps {
     colors,
-    underline_styles: modern && !apple,
-    strikethrough: true,
-    hyperlinks: !dumb_term && !apple,
-    sync_output: probe.sync_output == Some(true),
-    kitty_keyboard: if probe.kitty_keyboard {
-      KITTY_FLAGS_PUSHED
-    } else {
-      0
+    features,
+    kitty: KittyCaps {
+      keyboard: if probe.kitty_keyboard {
+        KITTY_FLAGS_PUSHED
+      } else {
+        0
+      },
+      graphics,
     },
-    kitty_graphics,
-    sixel: probe
-      .da1
-      .as_ref()
-      .is_some_and(|params| params.iter().skip(1).any(|p| *p == 4)),
-    focus_events: true,
     widths,
   }
 }
@@ -764,7 +788,7 @@ impl Drop for TermDriver {
       }
     }
     // Images the runner placed on this screen go with it.
-    if self.caps.kitty_graphics.is_some() {
+    if self.caps.kitty.graphics.is_some() {
       emit::kitty_graphics(&mut seq, "a=d,d=A,q=2", b"");
     }
 
@@ -831,29 +855,45 @@ mod tests {
       terminal: Some("kitty(0.40.0)".to_string()),
     };
     let caps = caps_from_probe(&probe, &env("xterm-kitty", ""));
-    assert_eq!(caps.kitty_keyboard, 15);
-    assert!(caps.sync_output);
-    assert!(caps.underline_styles);
-    assert!(caps.sixel);
+    assert_eq!(
+      caps.kitty,
+      KittyCaps {
+        keyboard: 15,
+        ..TermCaps::full().kitty
+      }
+    );
+    assert_eq!(
+      caps.features,
+      TermCaps::full().features.with(Feature::Sixel)
+    );
     assert_eq!(caps.widths, WidthPolicy::agreed());
-    let graphics = caps.kitty_graphics.unwrap();
-    assert!(graphics.placeholders && graphics.animation);
 
     // A terminal that answered nothing: safe assumptions.
     let silent = Probe::default();
     let caps =
       caps_from_probe(&silent, &env("xterm-256color", "Apple_Terminal"));
-    assert_eq!(caps.kitty_keyboard, 0);
-    assert!(!caps.sync_output);
-    assert!(!caps.underline_styles);
-    assert!(!caps.hyperlinks);
-    assert!(caps.kitty_graphics.is_none());
+    assert_eq!(caps.kitty, KittyCaps::default());
+    assert_eq!(
+      caps.features,
+      [Feature::Italic, Feature::Strikethrough, Feature::Focus]
+        .into_iter()
+        .collect()
+    );
     assert_eq!(caps.widths, WidthPolicy::default());
     assert_eq!(caps.colors, ColorDepth::TrueColor);
 
     let caps = caps_from_probe(&silent, &env("linux", ""));
     assert_eq!(caps.colors, ColorDepth::Ansi16);
-    assert!(!caps.hyperlinks);
+    assert!(!caps.has(Feature::Hyperlinks));
+
+    // tmux with a `screen` default-terminal shows italics reversed.
+    let italic = |term, program| {
+      caps_from_probe(&silent, &env(term, program)).has(Feature::Italic)
+    };
+    assert!(caps.has(Feature::Italic));
+    assert!(!italic("screen-256color", "tmux"));
+    assert!(!italic("screen", ""));
+    assert!(italic("tmux-256color", "tmux"));
   }
 
   #[test]

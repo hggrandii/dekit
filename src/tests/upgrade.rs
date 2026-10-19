@@ -135,12 +135,12 @@ async fn upgrade_keeps_child_client_and_identity() {
   runner.stop();
 }
 
-/// A restart is an upgrade into the same binary that re-reads
-/// `dekit.yaml`: a running task keeps its child and takes the new command
-/// at its next start, and a task added to the config appears idle, for
-/// `up` to start.
+/// A restart is an upgrade into the same binary: every task comes back as
+/// it was, and a reload takes the edited `dekit.yaml`. A running task
+/// keeps its child and takes the new command at its next start, and a
+/// task added to the config appears idle, for `up` to start.
 #[tokio::test]
-async fn restart_reloads_config() {
+async fn restart_keeps_the_tasks_and_reload_takes_the_config() {
   let runner = TestRunner::new("rs");
   runner.yaml(
     "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo pid $$; echo one; sleep 60']\n    autostart: true\n",
@@ -164,12 +164,19 @@ async fn restart_reloads_config() {
     "{out:?}"
   );
 
-  // The running child is untouched; the added task is idle until `up`.
+  // The running child is untouched, and nothing comes from the config
+  // until a reload: then the added task is idle until `up`.
   assert_eq!(pid_of(&runner, "alpha"), pid);
   let screen = runner.ok(&["screen", "alpha"]);
   assert!(
     screen.contains("one") && !screen.contains("two"),
     "{screen}"
+  );
+  assert!(!runner.ok(&["ls"]).contains("beta"));
+  let plan = runner.ok(&["reload", "--yes"]);
+  assert!(
+    plan.contains("+ beta") && plan.contains("~ alpha"),
+    "{plan}"
   );
   let beta = task_line(&runner, "beta");
   assert!(beta.contains("idle"), "{beta}");

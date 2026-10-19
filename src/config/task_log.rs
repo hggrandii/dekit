@@ -47,6 +47,22 @@ impl TaskLogConfig {
     self.mode.unwrap_or(LogMode::Append)
   }
 
+  /// The log of a copy of the task. A file named the same for every task
+  /// stays the original's: the copy logs under its own name in the
+  /// directory, or nowhere without one.
+  pub fn for_copy(&self) -> TaskLogConfig {
+    match &self.file {
+      Some(file) if !names_each_task(&file.to_string_lossy()) => {
+        TaskLogConfig {
+          enabled: self.dir.as_ref().map_or(Some(false), |_| self.enabled),
+          file: None,
+          ..self.clone()
+        }
+      }
+      _ => self.clone(),
+    }
+  }
+
   pub fn merged(&self, child: &TaskLogConfig) -> TaskLogConfig {
     TaskLogConfig {
       enabled: child.enabled.or(self.enabled),
@@ -91,6 +107,11 @@ impl TaskLogConfig {
       (Some(_dir), Some(file)) => Some(file),
     }
   }
+}
+
+/// Whether a log file template gives each task a file of its own.
+fn names_each_task(file: &str) -> bool {
+  ["{name}", "{id}", "{pid}"].iter().any(|t| file.contains(t))
 }
 
 pub fn default_log_filename(name: &str) -> String {

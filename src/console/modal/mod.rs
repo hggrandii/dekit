@@ -1,8 +1,11 @@
-pub mod add_task;
+pub mod checklist;
 pub mod commands_menu;
-pub mod main_menu;
+pub mod config_error;
+pub mod menu;
 pub mod modal;
 pub mod quit;
+pub mod reload;
 pub mod remove_task;
-pub mod rename_task;
 pub mod runner_select;
+pub mod task_dialog;
+pub mod write_back;

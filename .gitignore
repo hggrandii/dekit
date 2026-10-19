@@ -6,6 +6,8 @@
 # Editor
 /.vscode/
 /.opencode/
+/.claude/
+*.swp
 
 # Scratch
 /dekit.yaml
@@ -15,3 +17,6 @@
 
 # Cargo
 /target
+
+# Python
+__pycache__/

@@ -55,9 +55,8 @@ pub struct TaskTree {
   /// By path. The group at "" is the root, with every task under it.
   nodes: HashMap<String, Node>,
   paths: HashMap<TaskId, Arc<TaskPath>>,
-  /// The visible paths, rebuilt when `dirty`.
+  /// The visible paths, rebuilt on every change.
   rows: Vec<Arc<TaskPath>>,
-  dirty: bool,
   list: ListState,
 }
 
@@ -67,7 +66,6 @@ impl TaskTree {
       nodes: HashMap::new(),
       paths: HashMap::new(),
       rows: Vec::new(),
-      dirty: false,
       list: ListState::new(1),
     }
   }
@@ -96,32 +94,86 @@ impl TaskTree {
         continue;
       };
       group.add(&task);
-      if group.children.contains(child) {
+      // Right after the path the earlier task is at or under, or first
+      // when that task is not under this group. A path already here moves
+      // there too: a moved task brings its groups along.
+      let beside = after
+        .as_ref()
+        .and_then(|after| under(group.path.as_str(), after.as_str()));
+      if beside == Some(child) {
         continue;
       }
-      // Right after the path the earlier task is at or under, or first
-      // when that task is not under this group.
-      let place = after
-        .as_ref()
-        .and_then(|after| under(group.path.as_str(), after.as_str()))
-        .and_then(|beside| group.children.get_index_of(beside))
-        .map_or(0, |index| index + 1);
-      let last = group.children.len();
-      group.children.insert(child.to_string());
-      group.children.move_index(last, place);
+      let beside =
+        beside.and_then(|beside| group.children.get_index_of(beside));
+      let index = match group.children.get_index_of(child) {
+        Some(index) => index,
+        None => {
+          group.children.insert(child.to_string());
+          group.children.len() - 1
+        }
+      };
+      let place = match beside {
+        Some(beside) if beside < index => beside + 1,
+        Some(beside) => beside,
+        None => 0,
+      };
+      group.children.move_index(index, place);
     }
     self.paths.insert(task.id, task.path.clone());
     let key = task.path.as_str().to_string();
     self.nodes.insert(key, Node::Task(task));
-    self.dirty = true;
+    self.rebuild();
   }
 
   pub fn remove(&mut self, id: TaskId) {
-    let Some(path) = self.paths.remove(&id) else {
+    self.take(id);
+  }
+
+  /// Lists a task at another path, or elsewhere at its own, right after
+  /// `after`. The selection stays on it when it was, else on the row it
+  /// was on, and a group the move empties and fills again stays
+  /// collapsed.
+  pub fn move_task(
+    &mut self,
+    id: TaskId,
+    path: TaskPath,
+    after: Option<TaskId>,
+  ) {
+    let selected = self.current().map(|task| task.id) == Some(id);
+    let was = self.selected_path();
+    let collapsed: Vec<String> = self
+      .paths
+      .get(&id)
+      .into_iter()
+      .flat_map(|path| above(path.as_str()))
+      .filter(|group| {
+        matches!(self.nodes.get(*group), Some(Node::Group(g)) if g.collapsed)
+      })
+      .map(str::to_string)
+      .collect();
+    let Some(mut task) = self.take(id) else {
       return;
     };
+    task.path = Arc::new(path);
+    let path = task.path.clone();
+    self.add(task, after);
+    for group in collapsed {
+      if let Some(Node::Group(group)) = self.nodes.get_mut(&group) {
+        group.collapsed = true;
+      }
+    }
+    self.rebuild();
+    match was {
+      _ if selected => self.select(&path),
+      Some(was) => self.select(&was),
+      None => (),
+    }
+  }
+
+  fn take(&mut self, id: TaskId) -> Option<TaskView> {
+    let path = self.paths.remove(&id)?;
     let Some(Node::Task(task)) = self.nodes.remove(path.as_str()) else {
-      return;
+      return None;
     };
     for above in above(path.as_str()) {
       if let Some(Node::Group(group)) = self.nodes.get_mut(above) {
@@ -141,7 +193,8 @@ impl TaskTree {
         group.children.shift_remove(child);
       }
     }
-    self.dirty = true;
+    self.rebuild();
+    Some(task)
   }
 
   pub fn set_status(&mut self, id: TaskId, status: TaskState) {
@@ -186,7 +239,7 @@ impl TaskTree {
     })
   }
 
-  /// A row as last drawn.
+  /// A row as listed now.
   pub fn row(&self, index: usize) -> Option<(&TaskPath, &Node)> {
     let path = self.rows.get(index)?;
     Some((path, self.nodes.get(path.as_str())?))
@@ -205,12 +258,10 @@ impl TaskTree {
   }
 
   pub fn next(&mut self) {
-    self.refresh();
     self.list.next();
   }
 
   pub fn prev(&mut self) {
-    self.refresh();
     self.list.prev();
   }
 
@@ -231,27 +282,19 @@ impl TaskTree {
     let Some(path) = found else {
       return;
     };
-    for above in above(path.as_str()) {
-      if let Some(Node::Group(group)) = self.nodes.get_mut(above)
-        && group.collapsed
-      {
-        group.collapsed = false;
-        self.dirty = true;
-      }
-    }
+    self.reveal(path.as_str());
     self.select(&path);
   }
 
   /// Opens the selected group, or steps into it when it is open.
   pub fn expand(&mut self) {
-    self.refresh();
     let Some(path) = self.selected_path() else {
       return;
     };
     match self.nodes.get_mut(path.as_str()) {
       Some(Node::Group(group)) if group.collapsed => {
         group.collapsed = false;
-        self.dirty = true;
+        self.rebuild();
       }
       Some(Node::Group(_)) => self.list.next(),
       Some(Node::Task(_)) | None => (),
@@ -260,14 +303,13 @@ impl TaskTree {
 
   /// Closes the selected group, or steps out to the group it is in.
   pub fn collapse(&mut self) {
-    self.refresh();
     let Some(path) = self.selected_path() else {
       return;
     };
     match self.nodes.get_mut(path.as_str()) {
       Some(Node::Group(group)) if !group.collapsed => {
         group.collapsed = true;
-        self.dirty = true;
+        self.rebuild();
       }
       Some(Node::Group(_) | Node::Task(_)) | None => {
         if let Some(parent) = path.parent() {
@@ -277,14 +319,75 @@ impl TaskTree {
     }
   }
 
-  /// Selects a row as last drawn; a group also opens or closes.
+  /// The paths listed beside `path`, under the same group, in order.
+  pub fn siblings(&self, path: &TaskPath) -> Vec<TaskPath> {
+    let parent = path.parent().unwrap_or_else(TaskPath::root);
+    match self.nodes.get(parent.as_str()) {
+      Some(Node::Group(group)) => group
+        .children
+        .iter()
+        .filter_map(|child| TaskPath::new(child.as_str()).ok())
+        .collect(),
+      Some(Node::Task(_)) | None => Vec::new(),
+    }
+  }
+
+  /// Selects the task at a path, opening the groups it is in.
+  pub fn select_path(&mut self, path: &str) {
+    self.reveal(path);
+    if let Some(path) =
+      self.paths.values().find(|p| p.as_str() == path).cloned()
+    {
+      self.select(&path);
+    }
+  }
+
+  /// Opens the collapsed groups above `path`, so its row shows.
+  fn reveal(&mut self, path: &str) {
+    let mut opened = false;
+    for above in above(path) {
+      if let Some(Node::Group(group)) = self.nodes.get_mut(above)
+        && group.collapsed
+      {
+        group.collapsed = false;
+        opened = true;
+      }
+    }
+    if opened {
+      self.rebuild();
+    }
+  }
+
+  /// Where the selected row was last drawn.
+  pub fn selected_area(&self) -> Option<Rect> {
+    self.list.row_area(self.list.selected()?)
+  }
+
+  /// The area the rows were last drawn in.
+  pub fn area(&self) -> Rect {
+    self.list.area()
+  }
+
+  /// Selects a row, leaving a group as it is.
+  pub fn select_row(&mut self, index: usize) {
+    if let Some(path) = self.rows.get(index).cloned() {
+      self.select(&path);
+    }
+  }
+
+  /// How many rows are listed now.
+  pub fn row_count(&self) -> usize {
+    self.rows.len()
+  }
+
+  /// Selects a row; a group also opens or closes.
   pub fn click(&mut self, index: usize) {
     let Some(path) = self.rows.get(index).cloned() else {
       return;
     };
     if let Some(Node::Group(group)) = self.nodes.get_mut(path.as_str()) {
       group.collapsed = !group.collapsed;
-      self.dirty = true;
+      self.rebuild();
     }
     self.select(&path);
   }
@@ -294,7 +397,6 @@ impl TaskTree {
   }
 
   pub fn rows(&mut self, area: Rect) -> impl Iterator<Item = ListRow> + use<> {
-    self.refresh();
     self.list.rows(area)
   }
 
@@ -307,19 +409,19 @@ impl TaskTree {
   }
 
   fn select(&mut self, path: &TaskPath) {
-    self.refresh();
-    if let Some(index) = self.rows.iter().position(|row| **row == *path) {
+    if let Some(index) = self.row_of(path) {
       self.list.select(index);
     }
   }
 
+  /// The row a path is listed at now, if its groups are open.
+  pub fn row_of(&self, path: &TaskPath) -> Option<usize> {
+    self.rows.iter().position(|row| **row == *path)
+  }
+
   /// Rebuilds the rows and puts the cursor back on the selected row, or on
   /// the row that took its place.
-  fn refresh(&mut self) {
-    if !self.dirty {
-      return;
-    }
-    self.dirty = false;
+  fn rebuild(&mut self) {
     let selected = self.selected_path();
     let mut rows = std::mem::take(&mut self.rows);
     rows.clear();
@@ -386,7 +488,7 @@ fn under<'a>(group: &str, path: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::kernel::kernel_message::ScreenHandle;
+  use crate::kernel::kernel_message::{Place, ScreenHandle};
   use crate::kernel::path_trie::PathTrie;
   use crate::kernel::task::ExitInfo;
 
@@ -422,9 +524,11 @@ mod tests {
     path: &str,
     after: Option<&str>,
   ) {
-    let after = after.map(|after| TaskPath::new(after).unwrap());
+    let place = after.map_or(Place::Last, |after| {
+      Place::After(TaskPath::new(after).unwrap())
+    });
     let path = TaskPath::new(path).unwrap();
-    trie.insert(&path, TaskId(id), after.as_ref()).unwrap();
+    trie.insert(&path, TaskId(id), &place).unwrap();
     tree.add(task(id, path.as_str()), trie.before(&path));
   }
 
@@ -469,11 +573,12 @@ mod tests {
     tree.add(task(6, "db_6"), Some(TaskId(1)));
     tree.add(task(7, "new/a"), Some(TaskId(4)));
     tree.add(task(8, "first"), None);
+    // The selection stays on what was selected.
     assert_eq!(
       shown(&mut tree),
       [
-        "first*",
-        "db",
+        "first",
+        "db*",
         "db_6",
         "web/",
         "  web/api",
@@ -555,6 +660,28 @@ mod tests {
     assert_eq!(shown(&mut tree), ["web/*", "  web/api", "  web/ui", "zz"]);
     tree.expand();
     assert_eq!(tree.current().map(|t| t.id), Some(TaskId(1)));
+  }
+
+  #[test]
+  fn a_collapsed_group_moved_stays_collapsed() {
+    let mut tree = tree(&["a", "tools/lint"]);
+    tree.next();
+    tree.collapse();
+    assert_eq!(shown(&mut tree), ["a", "tools/*"]);
+    tree.move_task(TaskId(2), TaskPath::new("tools/lint").unwrap(), None);
+    assert_eq!(shown(&mut tree), ["tools/*", "a"]);
+  }
+
+  /// A task moved up onto the group that held only it is listed in the
+  /// group's place.
+  #[test]
+  fn a_task_takes_the_name_of_the_group_it_empties() {
+    let mut tree = tree(&["x", "a/b", "y"]);
+    tree.next();
+    tree.collapse();
+    assert_eq!(shown(&mut tree), ["x", "a/*", "y"]);
+    tree.move_task(TaskId(2), TaskPath::new("a").unwrap(), Some(TaskId(1)));
+    assert_eq!(shown(&mut tree), ["x", "a*", "y"]);
   }
 
   #[test]

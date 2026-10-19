@@ -430,6 +430,78 @@ bitflags! {
   }
 }
 
+/// Flags that travel by name on the wire (`protocol::ctl`'s `key` and
+/// `mouse` events): dekit's names, in its order, so the encoding is its
+/// own and a name a build does not know is dropped on its own.
+pub trait NamedFlags: Copy + 'static {
+  /// Each flag with its wire name.
+  const NAMES: &'static [(Self, &'static str)];
+  fn has(self, flag: Self) -> bool;
+  fn with(self, flag: Self) -> Self;
+  fn none() -> Self;
+
+  /// The names of the flags set.
+  fn names(self) -> impl Iterator<Item = &'static str> {
+    Self::NAMES
+      .iter()
+      .filter(move |(flag, _)| self.has(*flag))
+      .map(|(_, name)| *name)
+  }
+
+  /// The flags named; a name not known here is dropped.
+  fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+    names.into_iter().fold(Self::none(), |flags, name| {
+      match Self::NAMES.iter().find(|(_, known)| *known == name) {
+        Some((flag, _)) => flags.with(*flag),
+        None => flags,
+      }
+    })
+  }
+}
+
+impl NamedFlags for KeyMods {
+  const NAMES: &'static [(KeyMods, &'static str)] = &[
+    (KeyMods::SHIFT, "shift"),
+    (KeyMods::CONTROL, "control"),
+    (KeyMods::ALT, "alt"),
+    (KeyMods::SUPER, "super"),
+    (KeyMods::HYPER, "hyper"),
+    (KeyMods::META, "meta"),
+  ];
+
+  fn has(self, flag: Self) -> bool {
+    self.contains(flag)
+  }
+
+  fn with(self, flag: Self) -> Self {
+    self | flag
+  }
+
+  fn none() -> Self {
+    KeyMods::NONE
+  }
+}
+
+impl NamedFlags for KeyEventState {
+  const NAMES: &'static [(KeyEventState, &'static str)] = &[
+    (KeyEventState::KEYPAD, "keypad"),
+    (KeyEventState::CAPS_LOCK, "caps-lock"),
+    (KeyEventState::NUM_LOCK, "num-lock"),
+  ];
+
+  fn has(self, flag: Self) -> bool {
+    self.contains(flag)
+  }
+
+  fn with(self, flag: Self) -> Self {
+    self | flag
+  }
+
+  fn none() -> Self {
+    KeyEventState::empty()
+  }
+}
+
 struct KeyParser<'a> {
   text: &'a str,
   pos: usize,

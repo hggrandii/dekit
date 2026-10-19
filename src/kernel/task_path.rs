@@ -3,9 +3,18 @@ use std::{cmp::Ordering, fmt};
 use serde::{Deserialize, Serialize};
 
 /// Ordered component by component, so a path comes right before
-/// everything under it: `a`, `a/b`, `a-b`.
+/// everything under it: `a`, `a/b`, `a-b`. Read as `new` checks it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct TaskPath(String);
+
+impl TryFrom<String> for TaskPath {
+  type Error = InvalidPath;
+
+  fn try_from(path: String) -> Result<Self, InvalidPath> {
+    TaskPath::new(path)
+  }
+}
 
 impl Ord for TaskPath {
   fn cmp(&self, other: &Self) -> Ordering {
@@ -46,6 +55,28 @@ pub fn path_name(text: &str) -> String {
     "task".to_string()
   } else {
     name
+  }
+}
+
+/// `path` is `group` itself or a path under it.
+pub fn is_at_or_under(path: &str, group: &str) -> bool {
+  path
+    .strip_prefix(group)
+    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The paths are one, or one is under the other: no two tasks can have
+/// them, since a task's path is not a group.
+pub fn overlaps(a: &str, b: &str) -> bool {
+  is_at_or_under(a, b) || is_at_or_under(b, a)
+}
+
+/// `child` under `parent`, either of which may be the root ("").
+pub fn join(parent: &str, child: &str) -> String {
+  match (parent.is_empty(), child.is_empty()) {
+    (true, _) => child.to_string(),
+    (_, true) => parent.to_string(),
+    _ => format!("{parent}/{child}"),
   }
 }
 
@@ -160,6 +191,26 @@ impl TaskPath {
   pub fn depth(&self) -> usize {
     self.components().count()
   }
+
+  /// The path with its name under `parent` instead: where it goes when
+  /// moved there.
+  pub fn with_parent(&self, parent: &TaskPath) -> TaskPath {
+    TaskPath(join(parent.as_str(), self.name()))
+  }
+
+  /// The group the path is under at `depth`, or the path itself when it
+  /// is no deeper: `a/b` for `a/b/c` at 2, the root at 0.
+  pub fn ancestor(&self, depth: usize) -> TaskPath {
+    let end = match depth {
+      0 => 0,
+      n => self
+        .0
+        .match_indices('/')
+        .nth(n - 1)
+        .map_or(self.0.len(), |m| m.0),
+    };
+    TaskPath(self.0[..end].to_string())
+  }
 }
 
 impl fmt::Display for TaskPath {
@@ -171,6 +222,16 @@ impl fmt::Display for TaskPath {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn paths_overlap_at_or_under_but_not_beside() {
+    assert!(is_at_or_under("web/api", "web"));
+    assert!(is_at_or_under("web", "web"));
+    assert!(!is_at_or_under("website", "web"));
+    assert!(!is_at_or_under("web", "web/api"));
+    assert!(overlaps("web", "web/api") && overlaps("web/api", "web"));
+    assert!(!overlaps("web/api", "web/db"));
+  }
 
   #[test]
   fn test_valid_paths() {
@@ -258,6 +319,21 @@ mod tests {
     paths.sort();
     let paths: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
     assert_eq!(paths, ["a", "a/b/c", "a/c", "a-b", "a.b", "b"]);
+  }
+
+  #[test]
+  fn ancestors_and_parents() {
+    let path = TaskPath::new("a/b/c").unwrap();
+    let at = |depth| path.ancestor(depth).to_string();
+    assert_eq!(
+      [at(0), at(1), at(2), at(3), at(9)],
+      ["", "a", "a/b", "a/b/c", "a/b/c"]
+    );
+    let moved = path.with_parent(&TaskPath::new("x").unwrap());
+    assert_eq!(moved.as_str(), "x/c");
+    assert_eq!(path.with_parent(&TaskPath::root()).as_str(), "c");
+    assert_eq!(join("", "a"), "a");
+    assert_eq!(join("a", "b"), "a/b");
   }
 
   #[test]

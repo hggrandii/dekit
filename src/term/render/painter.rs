@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use super::images::ImagePainter;
-use crate::protocol::TermCaps;
+use crate::protocol::{Feature, KittyGraphics, TermCaps};
 use crate::term::{
   cell::{Cell, TextKind},
   common::CursorStyle,
@@ -33,10 +33,9 @@ pub struct Painter {
 
 impl Painter {
   pub fn new(caps: TermCaps) -> Self {
-    let images = caps
-      .kitty_graphics
-      .as_ref()
-      .map(|graphics| ImagePainter::new(graphics.animation));
+    let images = caps.kitty.graphics.map(|graphics| {
+      ImagePainter::new(graphics.has(KittyGraphics::Animation))
+    });
     Painter {
       caps,
       images,
@@ -68,7 +67,7 @@ impl Painter {
     emit::dec_set(out, emit::DecMode::ShowCursor);
     emit::cursor_style(out, CursorStyle::default());
     emit::osc_link(out, None);
-    if caps.kitty_graphics.is_some() {
+    if caps.kitty.graphics.is_some() {
       emit::kitty_graphics(out, "a=d,d=A,q=2", b"");
     }
   }
@@ -89,7 +88,7 @@ impl Painter {
     // The sync wrapper goes around whatever gets painted; nothing, and
     // it comes off again.
     let start = out.len();
-    if self.caps.sync_output {
+    if self.caps.has(Feature::Sync) {
       emit::dec_set(out, emit::DecMode::SyncOutput);
     }
     let begun = out.len();
@@ -110,7 +109,7 @@ impl Painter {
       }
     }
     self.paint_cursor(out, frame);
-    if self.caps.sync_output {
+    if self.caps.has(Feature::Sync) {
       if out.len() == begun {
         out.truncate(start);
       } else {
@@ -227,7 +226,7 @@ impl Painter {
       emit::sgr(out, self.brush, shown);
       self.brush = shown;
     }
-    if self.caps.hyperlinks {
+    if self.caps.has(Feature::Hyperlinks) {
       let link = frame.link(&style);
       if link != self.link.as_ref() {
         emit::osc_link(out, link);
@@ -278,11 +277,11 @@ impl Painter {
         let mut chars = text.chars();
         let first = chars.next().unwrap_or(' ');
         if text.contains(unicode::ZWJ) {
-          !widths.zwj_joins
+          widths.zwj_joins != Some(true)
         } else if text.contains(unicode::VS16) {
-          !widths.vs16_wide
+          widths.vs16_wide != Some(true)
         } else if unicode::is_regional_indicator(first) {
-          !widths.flags_wide
+          widths.flags_wide != Some(true)
         } else {
           // Combining marks: a terminal may print them on their own.
           true
@@ -299,15 +298,18 @@ impl Painter {
       .fg(style.fg.downgrade(depth))
       .bg(style.bg.downgrade(depth))
       .from_attrs_bits(style.attrs_bits());
-    if self.caps.underline_styles {
+    if self.caps.has(Feature::UnderlineColors) {
       shown.ul = style.ul.downgrade(depth);
-    } else {
-      shown.ul = crate::term::Color::Default;
-      if style.underline() != Underline::None {
-        shown = shown.set_underline(Underline::Single);
-      }
     }
-    if !self.caps.strikethrough {
+    if !self.caps.has(Feature::UnderlineStyles)
+      && style.underline() != Underline::None
+    {
+      shown = shown.set_underline(Underline::Single);
+    }
+    if !self.caps.has(Feature::Italic) {
+      shown = shown.set_italic(false);
+    }
+    if !self.caps.has(Feature::Strikethrough) {
       shown = shown.set_strike(false);
     }
     shown
@@ -387,6 +389,33 @@ mod tests {
   }
 
   #[test]
+  fn italics_are_left_out_where_they_would_show_reversed() {
+    let frame = frame_of("\x1b[3;1mab");
+    let out = paint(&mut Painter::new(TermCaps::full()), &frame);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\x1b[1;3m"), "{s:?}");
+    let mut painter = Painter::new(TermCaps::full().without(Feature::Italic));
+    let out = paint(&mut painter, &frame);
+    let s = String::from_utf8_lossy(&out);
+    assert!(s.contains("\x1b[1m") && !s.contains(";3m"), "{s:?}");
+  }
+
+  #[test]
+  fn underline_colors_and_styles_are_left_out_apart() {
+    let frame = frame_of("\x1b[4:3;58:2::9:8:7mab");
+    let shown = |caps: TermCaps| {
+      String::from_utf8_lossy(&paint(&mut Painter::new(caps), &frame))
+        .into_owned()
+    };
+    let s = shown(TermCaps::full());
+    assert!(s.contains("\x1b[4:3;58:2::9:8:7m"), "{s:?}");
+    let s = shown(TermCaps::full().without(Feature::UnderlineStyles));
+    assert!(s.contains("\x1b[4;58:2::9:8:7m"), "{s:?}");
+    let s = shown(TermCaps::full().without(Feature::UnderlineColors));
+    assert!(s.contains("\x1b[4:3m") && !s.contains("58"), "{s:?}");
+  }
+
+  #[test]
   fn sync_wrapping_and_cursor() {
     let mut painter = Painter::new(TermCaps::full());
     let out = paint(&mut painter, &frame_of("abc"));
@@ -429,10 +458,7 @@ mod tests {
       grid.restore(vec![Arc::new(Row::from_cells(cells, 4))], Vec::new());
       Arc::new(Frame::of_grid(&grid))
     };
-    let mut painter = Painter::new(TermCaps {
-      sync_output: false,
-      ..TermCaps::full()
-    });
+    let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
     let continuation = Cell::new(CellText::CONTINUATION, StyleId::DEFAULT);
     paint(&mut painter, &frame(continuation));
     // Each grid has tables of its own, so cells compare by what they
@@ -449,9 +475,7 @@ mod tests {
   fn colors_downgrade_and_links() {
     let caps = TermCaps {
       colors: ColorDepth::Ansi256,
-      hyperlinks: true,
-      sync_output: false,
-      ..TermCaps::full()
+      ..TermCaps::full().without(Feature::Sync)
     };
     let mut painter = Painter::new(caps);
     let out = paint(
@@ -466,11 +490,7 @@ mod tests {
 
   #[test]
   fn uncertain_widths_force_addressing() {
-    let caps = TermCaps {
-      sync_output: false,
-      ..TermCaps::default()
-    };
-    let mut painter = Painter::new(caps);
+    let mut painter = Painter::new(TermCaps::default());
     let out = paint(&mut painter, &frame_of("\u{2764}\u{FE0F}ab"));
     let s = String::from_utf8_lossy(&out);
     // After the emoji the next cell is addressed explicitly.
@@ -497,10 +517,7 @@ mod tests {
       },
       0,
     );
-    let mut painter = Painter::new(TermCaps {
-      sync_output: false,
-      ..TermCaps::full()
-    });
+    let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
     let same = |a: &Screen, b: &Screen| {
       let (fa, fb) = (a.frame(), b.frame());
       for row in 0..fa.size.height {
@@ -563,10 +580,7 @@ mod tests {
       offset_y: 0,
       z: 0,
     });
-    let mut painter = Painter::new(TermCaps {
-      sync_output: false,
-      ..TermCaps::full()
-    });
+    let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
     let out = paint(&mut painter, &Arc::new(Frame::of_grid(&grid)));
     let s = String::from_utf8_lossy(&out);
     assert_eq!(s.matches("a=t,").count(), 1);
@@ -600,10 +614,7 @@ mod tests {
     );
     grid.cursor_pos = Some(Pos { row: 0, col: 2 });
     let frame = Arc::new(Frame::of_grid(&grid));
-    let mut painter = Painter::new(TermCaps {
-      sync_output: false,
-      ..TermCaps::full()
-    });
+    let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
     let out = paint(&mut painter, &frame);
     let s = String::from_utf8_lossy(&out);
     assert!(s.starts_with("\x1b[31m\x1b[1;1Hhi"), "{s:?}");

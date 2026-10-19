@@ -115,7 +115,7 @@ impl AppEvent {
       AppEvent::ForceRestartProc => Action::ForceRestartTask,
       AppEvent::ForceRestartAll => Action::ForceRestartAll,
       AppEvent::ShowAddProc => Action::ShowAddTask,
-      AppEvent::ShowRenameProc => Action::ShowRenameTask,
+      AppEvent::ShowRenameProc => Action::ShowEditTask,
       AppEvent::AddProc { cmd, name } => Action::AddTask { cmd, name },
       AppEvent::DuplicateProc => Action::DuplicateTask,
       AppEvent::ShowRemoveProc => Action::ShowRemoveTask,

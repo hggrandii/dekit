@@ -13,8 +13,11 @@ mod logging;
 pub mod mprocs;
 mod parse_shell;
 mod process;
+mod project;
 pub mod protocol;
+mod reload;
 pub mod runner;
+mod spec;
 pub mod target;
 mod task;
 pub mod term;
@@ -22,3 +25,4 @@ mod term_driver;
 #[cfg(test)]
 mod test_util;
 mod upgrade;
+mod write_back;

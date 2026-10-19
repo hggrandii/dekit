@@ -13,21 +13,31 @@ use crate::upgrade::snapshot as snap;
 
 use super::{
   kernel_message::{
-    DepExplain, KernelCommand, KernelMessage, KernelQuery, KernelQueryResponse,
-    RegisterError, SpaceSelector, TaskExplain, TaskInfo, TaskRegistration,
-    TaskSelector, task_name,
+    DepExplain, DuplicateRequest, KernelCommand, KernelMessage, KernelQuery,
+    MoveError, MoveTask, Place, RegisterError, SpaceSelector, TaskDescription,
+    TaskExplain, TaskInfo, TaskRegistration, TaskSelector, TaskUpdate,
+    task_name,
   },
   namespace::Namespace,
   path_trie::PathConflict,
   sub_trie::SubMode,
   task::{
-    Effects, ExitInfo, INIT_TASK_ID, ReadyMode, STOP_TIMEOUT, Task, TaskCmd,
-    TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind, TaskNotification,
-    TaskNotify, TaskState,
+    Effects, ExitInfo, INIT_TASK_ID, NextRun, ReadyMode, Run, STOP_TIMEOUT,
+    Task, TaskCmd, TaskDef, TaskEffect, TaskHandle, TaskId, TaskKind,
+    TaskNotification, TaskNotify, TaskState,
   },
   task_key::{TaskKey, TaskSpaceId},
   task_path::TaskPath,
 };
+
+use crate::config::task::DYNAMIC_TAG;
+use crate::spec::TaskSpec;
+
+/// A definition as the kernel keeps it: its deps are the task's edges.
+fn without_deps(mut spec: TaskSpec) -> TaskSpec {
+  spec.set_deps(Vec::new());
+  spec
+}
 
 /// How long a hard-killed task may take to report stopped before the
 /// kernel gives up waiting.
@@ -115,8 +125,8 @@ struct Graph {
   /// them one at a time, each against settled state.
   pending_effects: VecDeque<(TaskId, TaskEffect)>,
   active_watches: Vec<ActiveWatch>,
-  /// Set whenever a task is added, removed or changes state; watches only
-  /// need re-checking then.
+  /// Set whenever a task is added, removed, moved, retagged or changes
+  /// state; watches only need re-checking then.
   state_changed: bool,
   frozen: Option<Frozen>,
   /// Freezes begun so far; numbers them.
@@ -185,30 +195,14 @@ impl Graph {
     // Deps must exist: refusing here keeps every edge endpoint a
     // registered task, and a new task has no dependents yet, so no edge
     // added here can close a cycle.
-    let mut deps: Vec<TaskId> = Vec::new();
-    for selector in &def.deps {
-      let ids = self.matching_ids(selector);
-      if ids.is_empty() {
-        return Err(RegisterError::MissingDep(selector.clone()));
-      }
-      for id in ids {
-        if !deps.contains(&id) {
-          deps.push(id);
-        }
-      }
-    }
+    let deps = self.resolve_deps(&def.deps)?;
     // A taken path refuses the whole registration, checked before the
     // factory runs so a refused task spawns nothing.
     let space = def.space.clone();
-    let after = def
-      .after
-      .and_then(|id| self.tasks.get(&id))
-      .filter(|task| task.space == space)
-      .and_then(|task| task.path.clone());
     let path = match def.path {
       Some(p) => {
         let key = TaskKey::new(space.clone(), p.clone());
-        match self.ns.insert(&key, task_id, after.as_ref()) {
+        match self.ns.insert(&key, task_id, &def.place) {
           Ok(()) => Some(p),
           Err(PathConflict::Taken(_)) => {
             return Err(RegisterError::PathTaken(key));
@@ -226,7 +220,6 @@ impl Graph {
     let task = factory(ctx);
     let label = def.label.clone();
     let vt = def.vt.clone();
-    let tags = def.tags.clone();
     let mut handle = TaskHandle {
       task,
       state: TaskState::Idle,
@@ -244,13 +237,20 @@ impl Graph {
       saved_pin: def.saved_pin,
       kind: def.kind,
       ready: def.ready,
-      restart: def.restart,
       stop_timeout: def.stop_timeout,
+      next: def.next.map(|mut next| {
+        next.spec = next.spec.map(without_deps);
+        next
+      }),
+      restart: def.restart,
       space: space.clone(),
       path: path.clone(),
       label: def.label,
       vt: def.vt,
-      tags: def.tags,
+      tags: Vec::new(),
+      spec: def.spec.map(without_deps),
+      origin: def.origin,
+      make_copy: def.make_copy,
     };
     if let Some(saved) = saved {
       let state = match saved.state {
@@ -332,9 +332,7 @@ impl Graph {
       self.schedule_state_timeout(task_id, delay);
     }
 
-    for tag in tags {
-      self.tags.entry(tag).or_default().insert(task_id);
-    }
+    self.set_tags(task_id, def.tags);
 
     for dep_id in deps {
       self.add_edge(task_id, dep_id);
@@ -582,20 +580,7 @@ impl Graph {
   /// earlier stop or crash. Done jobs stay done, except `task_id` itself
   /// when `rerun_done` (a start that targets it).
   fn demand(&mut self, task_id: TaskId, rerun_done: bool) {
-    let mut closure = vec![task_id];
-    let mut seen: HashSet<TaskId> = HashSet::from([task_id]);
-    let mut i = 0;
-    while i < closure.len() {
-      if let Some(deps) = self.edges.get(&closure[i]) {
-        for dep in deps {
-          if seen.insert(*dep) {
-            closure.push(*dep);
-          }
-        }
-      }
-      i += 1;
-    }
-    for id in closure {
+    for id in self.closure(task_id) {
       let Some(task) = self.tasks.get_mut(&id) else {
         continue;
       };
@@ -1060,13 +1045,24 @@ impl Graph {
 
   fn start_task(&mut self, task_id: TaskId) {
     let now = self.now;
-    self
-      .tasks
-      .get_mut(&task_id)
-      .expect("driven id live")
-      .last_start = Some(now);
+    let task = self.tasks.get_mut(&task_id).expect("driven id live");
+    task.last_start = Some(now);
+    // A run starts from the definition as it is now.
+    let changed = match task.next.take() {
+      Some(next) => task.adopt(*next),
+      None => false,
+    };
+    let run = task.spec.clone().map(|spec| {
+      Box::new(Run {
+        spec,
+        path: task.path.clone(),
+      })
+    });
+    if changed {
+      self.notify_changed(task_id);
+    }
     self.set_state(task_id, TaskState::Starting);
-    self.send_cmd(task_id, TaskCmd::Start);
+    self.send_cmd(task_id, TaskCmd::Start(run));
   }
 
   /// `start_failed`: the stop lands as a failed exit (see `land_stop`).
@@ -1098,13 +1094,10 @@ impl Graph {
   fn send_cmd(&mut self, task_id: TaskId, cmd: TaskCmd) {
     #[cfg(test)]
     match &cmd {
-      TaskCmd::Start => self.sent.push((task_id, SentCmd::Start)),
+      TaskCmd::Start(_) => self.sent.push((task_id, SentCmd::Start)),
       TaskCmd::Stop => self.sent.push((task_id, SentCmd::Stop)),
       TaskCmd::Kill => self.sent.push((task_id, SentCmd::Kill)),
-      TaskCmd::Duplicate(_)
-      | TaskCmd::Msg(_)
-      | TaskCmd::Freeze(_)
-      | TaskCmd::Thaw => (),
+      TaskCmd::Msg(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
     }
     let mut fx = Effects::new();
     if let Some(task) = self.tasks.get_mut(&task_id) {
@@ -1360,18 +1353,10 @@ impl Graph {
       handle.task.handle_cmd(TaskCmd::Kill, &mut fx);
     }
     if let Some(path) = &handle.path {
-      self
-        .ns
-        .remove(&TaskKey::new(handle.space.clone(), path.clone()));
+      let key = TaskKey::new(handle.space.clone(), path.clone());
+      self.ns.remove(&key);
     }
-    for tag in &handle.tags {
-      if let Some(set) = self.tags.get_mut(tag) {
-        set.remove(&task_id);
-        if set.is_empty() {
-          self.tags.remove(tag);
-        }
-      }
-    }
+    self.unindex_tags(task_id, &handle.tags);
 
     let was_wanted = handle.wanted;
     let was_active = handle.state.is_active();
@@ -1418,15 +1403,325 @@ impl Graph {
     if task.label == label {
       return;
     }
-    task.label = label.clone();
-    let space = task.space.clone();
-    let path = task.path.clone();
-    self.notify_subscribers(
-      task_id,
-      space,
-      path,
-      TaskNotify::LabelChanged(label),
-    );
+    let next = task.next.as_mut().and_then(|next| next.spec.as_mut());
+    for spec in task.spec.iter_mut().chain(next) {
+      spec.set_label(label.as_deref());
+    }
+    task.label = label;
+    self.notify_changed(task_id);
+  }
+
+  /// Tells the subscribers what the task is called now, and what it is.
+  fn notify_changed(&mut self, task_id: TaskId) {
+    let Some(task) = self.tasks.get(&task_id) else {
+      return;
+    };
+    let (space, path) = (task.space.clone(), task.path.clone());
+    let notify = TaskNotify::Changed {
+      label: task.label.clone(),
+      kind: task.kind,
+    };
+    self.notify_subscribers(task_id, space, path, notify);
+  }
+
+  /// Whether `from` needs `to`, directly or through other tasks.
+  fn requires(&self, from: TaskId, to: TaskId) -> bool {
+    self.closure(from).contains(&to)
+  }
+
+  /// The task and every task it needs, each once, nearest first.
+  fn closure(&self, task_id: TaskId) -> Vec<TaskId> {
+    let mut closure = vec![task_id];
+    let mut seen: HashSet<TaskId> = HashSet::from([task_id]);
+    let mut i = 0;
+    while i < closure.len() {
+      for dep in self.edges.get(&closure[i]).into_iter().flatten() {
+        if seen.insert(*dep) {
+          closure.push(*dep);
+        }
+      }
+      i += 1;
+    }
+    closure
+  }
+
+  /// The tasks the selectors match, each once, refused when one matches
+  /// nothing.
+  fn resolve_deps(
+    &self,
+    selectors: &[TaskSelector],
+  ) -> Result<Vec<TaskId>, RegisterError> {
+    let mut deps = Vec::new();
+    for selector in selectors {
+      let ids = self.matching_ids(selector);
+      if ids.is_empty() {
+        return Err(RegisterError::MissingDep(selector.clone()));
+      }
+      for id in ids {
+        if !deps.contains(&id) {
+          deps.push(id);
+        }
+      }
+    }
+    Ok(deps)
+  }
+
+  /// The deps a task would have, refused also when one needs the task.
+  fn resolve_new_deps(
+    &self,
+    task_id: TaskId,
+    selectors: &[TaskSelector],
+  ) -> Result<Vec<TaskId>, RegisterError> {
+    let deps = self.resolve_deps(selectors)?;
+    if let Some(&dep) = deps.iter().find(|&&dep| self.requires(dep, task_id)) {
+      let task = &self.tasks[&dep];
+      return Err(RegisterError::DepCycle(task_name(
+        dep,
+        &task.space,
+        task.path.as_ref(),
+      )));
+    }
+    Ok(deps)
+  }
+
+  /// Redefines a task, its deps resolved by `resolve_new_deps`.
+  fn update_task(
+    &mut self,
+    task_id: TaskId,
+    deps: Vec<TaskId>,
+    update: &TaskUpdate,
+  ) {
+    let Some(task) = self.tasks.get_mut(&task_id) else {
+      return;
+    };
+    // A run, under way or ended, goes on as it started: the new
+    // definition is the next one's.
+    let next = NextRun {
+      spec: update.next.spec.clone().map(without_deps),
+      ..update.next.clone()
+    };
+    if task.state == TaskState::Idle {
+      task.adopt(next);
+      task.next = None;
+    } else {
+      task.next = Some(Box::new(next));
+    }
+    // What happens around its runs follows at once.
+    task.restart = update.restart;
+    task.label = update.label.clone();
+    self.set_tags(task_id, update.tags.clone());
+    let old: Vec<TaskId> = self
+      .edges
+      .get(&task_id)
+      .into_iter()
+      .flatten()
+      .copied()
+      .filter(|dep| !deps.contains(dep))
+      .collect();
+    for dep in old {
+      self.remove_edge(task_id, dep);
+    }
+    for dep in deps {
+      self.add_edge(task_id, dep);
+    }
+    self.notify_changed(task_id);
+    self.enqueue(task_id);
+    if update.restart_running && self.tasks[&task_id].state.is_active() {
+      self.cmd_restart(task_id);
+    }
+  }
+
+  fn set_origin(
+    &mut self,
+    task_id: TaskId,
+    origin: Option<crate::spec::Source>,
+  ) {
+    let Some(task) = self.tasks.get_mut(&task_id) else {
+      return;
+    };
+    if task.origin == origin {
+      return;
+    }
+    task.origin = origin;
+    let tags = task.tags.clone();
+    self.set_tags(task_id, tags);
+    self.notify_changed(task_id);
+  }
+
+  /// Gives a task its tags, with `dynamic` when it is the runner's own:
+  /// a definition the config does not have.
+  fn set_tags(&mut self, task_id: TaskId, mut tags: Vec<String>) {
+    let Some(task) = self.tasks.get_mut(&task_id) else {
+      return;
+    };
+    tags.retain(|tag| tag != DYNAMIC_TAG);
+    if task.def_spec().is_some() && task.origin.is_none() {
+      tags.push(DYNAMIC_TAG.to_string());
+    }
+    let old = std::mem::replace(&mut task.tags, tags.clone());
+    self.state_changed |= old != tags;
+    self.unindex_tags(task_id, &old);
+    self.index_tags(task_id, &tags);
+  }
+
+  /// Puts a task under its tags in the tag index.
+  fn index_tags(&mut self, task_id: TaskId, tags: &[String]) {
+    for tag in tags {
+      self.tags.entry(tag.clone()).or_default().insert(task_id);
+    }
+  }
+
+  /// Takes a task out from under its tags in the tag index.
+  fn unindex_tags(&mut self, task_id: TaskId, tags: &[String]) {
+    for tag in tags {
+      if let Some(set) = self.tags.get_mut(tag) {
+        set.remove(&task_id);
+        if set.is_empty() {
+          self.tags.remove(tag);
+        }
+      }
+    }
+  }
+
+  /// Moves the tasks at or under a path, and tells each one's subscribers:
+  /// `Moved` to those who see it before and after, `Removed` and `Added`
+  /// to those who see it on one side only.
+  fn move_tasks(&mut self, req: &MoveTask) -> Result<usize, MoveError> {
+    let moved = self
+      .ns
+      .move_node(&req.space, &req.from, &req.to, &req.place)?;
+    self.state_changed |= !moved.is_empty();
+    for m in &moved {
+      if let Some(task) = self.tasks.get_mut(&m.id) {
+        task.path = Some(m.to.clone());
+      }
+    }
+    for m in &moved {
+      let mut before = HashSet::new();
+      self.ns.collect(
+        &TaskKey::new(req.space.clone(), m.from.clone()),
+        &mut before,
+      );
+      let mut now = HashSet::new();
+      self
+        .ns
+        .collect(&TaskKey::new(req.space.clone(), m.to.clone()), &mut now);
+      let after = self
+        .ns
+        .before(&TaskKey::new(req.space.clone(), m.to.clone()));
+      let Some(task) = self.tasks.get(&m.id) else {
+        continue;
+      };
+      let added = TaskNotify::Added {
+        path: Some(m.to.clone()),
+        label: task.label.clone(),
+        after,
+        kind: task.kind,
+        state: task.state,
+        vt: task.vt.clone(),
+      };
+      let gone: HashSet<TaskId> = before.difference(&now).copied().collect();
+      let new: HashSet<TaskId> = now.difference(&before).copied().collect();
+      let kept: HashSet<TaskId> = now.intersection(&before).copied().collect();
+      self.deliver(m.id, TaskNotify::Removed, gone);
+      self.deliver(m.id, added, new);
+      self.deliver(
+        m.id,
+        TaskNotify::Moved {
+          path: Some(m.to.clone()),
+          after,
+        },
+        kept,
+      );
+    }
+    Ok(moved.len())
+  }
+
+  fn alloc_id(&self) -> TaskId {
+    TaskId(
+      self
+        .next_task_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+  }
+
+  /// Registers a copy of a task made from a definition: the copy has its
+  /// definition and deps, and is the runner's own.
+  fn duplicate(
+    &mut self,
+    task_id: TaskId,
+    req: &DuplicateRequest,
+  ) -> Result<(), RegisterError> {
+    let task = &self.tasks[&task_id];
+    let (Some(make_copy), Some(spec)) =
+      (task.make_copy.clone(), task.def_spec())
+    else {
+      return Err(RegisterError::NoDefinition);
+    };
+    let mut spec = spec.clone();
+    spec.set_label(req.label.as_deref());
+    let new_id = self.alloc_id();
+    let key = match (&req.path, &task.path) {
+      (Some(path), _) => Some(TaskKey::new(task.space.clone(), path.clone())),
+      (None, Some(path)) => TaskPath::new(format!("{}_{}", path, new_id.0))
+        .ok()
+        .map(|path| TaskKey::new(task.space.clone(), path)),
+      (None, None) => TaskPath::new(new_id.0.to_string())
+        .ok()
+        .map(TaskKey::default_space),
+    };
+    let mut deps: Vec<TaskId> = self
+      .edges
+      .get(&task_id)
+      .into_iter()
+      .flatten()
+      .copied()
+      .collect();
+    deps.sort_unstable();
+    let mut copy = make_copy(new_id, key, spec).map_err(|err| {
+      log::warn!("Can't copy task {}: {err:#}", task_id.0);
+      RegisterError::NoDefinition
+    })?;
+    copy.def.deps = deps.into_iter().map(TaskSelector::Id).collect();
+    copy.def.place = task.path.clone().map_or(Place::Last, Place::After);
+    copy.def.pinned = req.start;
+    self.register_task_with_id(new_id, copy.def, copy.factory, None)
+  }
+
+  /// The definition a task's next run starts from, with its deps: the
+  /// tasks its edges lead to, by key.
+  fn def_spec(&self, task_id: TaskId) -> Option<TaskSpec> {
+    let task = self.tasks.get(&task_id)?;
+    let mut spec = task.def_spec()?.clone();
+    let deps = self
+      .edges
+      .get(&task_id)
+      .into_iter()
+      .flatten()
+      .filter_map(|dep| {
+        let dep = self.tasks.get(dep)?;
+        Some(TaskKey::new(dep.space.clone(), dep.path.clone()?).to_string())
+      })
+      .collect();
+    spec.set_deps(deps);
+    Some(spec)
+  }
+
+  fn describe(&self, task_id: TaskId) -> Option<TaskDescription> {
+    let task = self.tasks.get(&task_id)?;
+    Some(TaskDescription {
+      info: TaskInfo {
+        id: task_id,
+        space: task.space.clone(),
+        path: task.path.clone(),
+        label: task.label.clone(),
+        state: task.state,
+        vt: task.vt.clone(),
+      },
+      kind: task.kind,
+      spec: self.def_spec(task_id),
+      origin: task.origin.clone(),
+    })
   }
 
   // ---- Reads ----
@@ -1804,6 +2099,10 @@ impl Graph {
         timer_ms: task.deadline.map(|deadline| {
           deadline.saturating_duration_since(self.now).as_millis() as u64
         }),
+        spec: task.def_spec().cloned(),
+        // The run under way when it started from an older definition.
+        run_spec: task.next.is_some().then(|| task.spec.clone()).flatten(),
+        origin: task.origin.clone(),
         kind,
       });
     }
@@ -1951,12 +2250,7 @@ impl Kernel {
     def: TaskDef,
     factory: impl FnOnce(TaskContext) -> Box<dyn Task> + 'static,
   ) -> TaskId {
-    let task_id = TaskId(
-      self
-        .graph
-        .next_task_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    );
+    let task_id = self.graph.alloc_id();
     let _ =
       self
         .graph
@@ -1986,7 +2280,7 @@ impl Kernel {
   pub fn restore(
     &mut self,
     next_task_id: usize,
-    tasks: Vec<(Option<&snap::Task>, TaskRegistration)>,
+    tasks: Vec<(&snap::Task, TaskRegistration)>,
   ) -> anyhow::Result<()> {
     self
       .graph
@@ -2012,6 +2306,10 @@ impl Kernel {
         }
       }
     }
+    let tasks = tasks
+      .into_iter()
+      .map(|(saved, registration)| (Some(saved), registration))
+      .collect();
     let results = self.graph.register_tasks(tasks);
     for (id, result) in ids.into_iter().zip(results) {
       result
@@ -2114,6 +2412,9 @@ impl Kernel {
       | KernelCommand::Remove(..)
       | KernelCommand::SetLabel(..)
       | KernelCommand::Duplicate(..)
+      | KernelCommand::Update(..)
+      | KernelCommand::SetOrigin(..)
+      | KernelCommand::Move(..)
       | KernelCommand::TaskMsg(..)
       | KernelCommand::SubscribePath(..)
       | KernelCommand::UnsubscribePath(..)
@@ -2311,23 +2612,72 @@ impl Kernel {
           let _ = ack.send(ids.len());
         }
       }
-      KernelCommand::Duplicate(selector, label, ack) => {
+      KernelCommand::Duplicate(selector, req, reply) => {
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
+        let result = ids
+          .iter()
+          .try_for_each(|id| self.graph.duplicate(*id, &req))
+          .map(|()| ids.len());
+        let _ = reply.send(result);
+      }
+      KernelCommand::Update(selector, update, reply) => {
+        let ids = self.graph.mutable_matching_ids(msg.from, &selector);
+        // Checked and resolved for every match before any changes, so a
+        // refusal changes nothing. The new edges all lead to the same
+        // deps, so none of them closes a cycle the checks did not see.
+        let resolved: Result<Vec<_>, _> =
+          if update.was.is_some() && ids.is_empty() {
+            // Moved or gone: not the task it was made from either.
+            Err(RegisterError::Changed)
+          } else {
+            ids
+              .iter()
+              .map(|id| {
+                // A task with no definition is not one a spec makes.
+                let Some(spec) = self.graph.def_spec(*id) else {
+                  return Err(RegisterError::NoDefinition);
+                };
+                if let Some(was) = &update.was
+                  && !spec.changed_keys(was).is_empty()
+                {
+                  return Err(RegisterError::Changed);
+                }
+                Ok((*id, self.graph.resolve_new_deps(*id, &update.deps)?))
+              })
+              .collect()
+          };
+        let result = resolved.map(|resolved| {
+          let count = resolved.len();
+          for (id, deps) in resolved {
+            self.graph.update_task(id, deps, &update);
+          }
+          count
+        });
+        let _ = reply.send(result);
+      }
+      KernelCommand::SetOrigin(selector, origin, ack) => {
         let ids = self.graph.mutable_matching_ids(msg.from, &selector);
         for id in &ids {
-          self.graph.send_cmd(*id, TaskCmd::Duplicate(label.clone()));
+          self.graph.set_origin(*id, origin.clone());
         }
         if let Some(ack) = ack {
           let _ = ack.send(ids.len());
         }
+      }
+      KernelCommand::Move(req, reply) => {
+        let result = if self.graph.can_register(msg.from, &req.space) {
+          self.graph.move_tasks(&req)
+        } else {
+          Err(MoveError::NotFound(req.from.clone()))
+        };
+        let _ = reply.send(result);
       }
 
       KernelCommand::TaskMsg(task_id, m) => {
         self.graph.send_cmd(task_id, TaskCmd::Msg(m));
       }
 
-      KernelCommand::Query(query, response_tx) => {
-        let _ = response_tx.send(self.handle_query(query));
-      }
+      KernelCommand::Query(query) => self.handle_query(query),
 
       KernelCommand::TaskStarted => self.graph.on_task_started(msg.from),
       KernelCommand::TaskReady => self.graph.on_task_ready(msg.from),
@@ -2380,19 +2730,29 @@ impl Kernel {
     false
   }
 
-  fn handle_query(&self, query: KernelQuery) -> KernelQueryResponse {
+  fn handle_query(&self, query: KernelQuery) {
     match query {
-      KernelQuery::ListTasks(selector) => {
-        KernelQueryResponse::TaskList(self.graph.list_tasks(&selector))
+      KernelQuery::ListTasks(selector, reply) => {
+        let _ = reply.send(self.graph.list_tasks(&selector));
       }
-      KernelQuery::Explain(selector) => KernelQueryResponse::Explain(
-        self
+      KernelQuery::Explain(selector, reply) => {
+        let explains = self
           .graph
           .matching_ids(&selector)
           .into_iter()
           .filter_map(|id| self.graph.explain(id))
-          .collect(),
-      ),
+          .collect();
+        let _ = reply.send(explains);
+      }
+      KernelQuery::Describe(selector, reply) => {
+        let mut ids = self.graph.matching_ids(&selector);
+        ids.sort_by_cached_key(|id| self.graph.list_key(*id));
+        let described = ids
+          .into_iter()
+          .filter_map(|id| self.graph.describe(id))
+          .collect();
+        let _ = reply.send(described);
+      }
     }
   }
 }

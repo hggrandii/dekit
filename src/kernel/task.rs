@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::kernel_message::{ScreenHandle, TaskSelector};
+use super::kernel_message::{MakeCopy, Place, ScreenHandle, TaskSelector};
 use super::task_key::TaskSpaceId;
 use super::task_path::TaskPath;
+use crate::spec::{Source, TaskSpec};
 
 #[derive(
   Clone,
@@ -64,11 +65,10 @@ impl Effects {
 }
 
 pub enum TaskCmd {
-  Start,
+  /// Start a run; for a task made from a definition, of that definition.
+  Start(Option<Box<Run>>),
   Stop,
   Kill,
-  /// Register a copy of this task, if the task kind supports it.
-  Duplicate(Option<String>),
   Msg(Box<dyn Any + Send>),
   /// Stop all I/O and answer with `KernelCommand::TaskFrozen`, echoing
   /// this freeze's number, with the task's state. No other command
@@ -83,13 +83,31 @@ impl TaskCmd {
   }
 }
 
+/// What a run of a task made from a definition starts from: the
+/// definition as it is now, and where the task is listed, which names its
+/// log.
+#[derive(Clone, Debug)]
+pub struct Run {
+  pub spec: TaskSpec,
+  pub path: Option<TaskPath>,
+}
+
+/// What a task's next run starts from, when its definition changed while
+/// a run was under way: a run goes on as it started.
+#[derive(Clone, Debug)]
+pub struct NextRun {
+  pub kind: TaskKind,
+  pub ready: ReadyMode,
+  pub stop_timeout: Duration,
+  pub spec: Option<TaskSpec>,
+}
+
 impl fmt::Debug for TaskCmd {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      TaskCmd::Start => write!(f, "Start"),
+      TaskCmd::Start(_) => write!(f, "Start"),
       TaskCmd::Stop => write!(f, "Stop"),
       TaskCmd::Kill => write!(f, "Kill"),
-      TaskCmd::Duplicate(label) => write!(f, "Duplicate({:?})", label),
       TaskCmd::Msg(_) => write!(f, "Msg(...)"),
       TaskCmd::Freeze(number) => write!(f, "Freeze({number})"),
       TaskCmd::Thaw => write!(f, "Thaw"),
@@ -189,6 +207,18 @@ pub enum TaskKind {
   Job,
 }
 
+impl TaskKind {
+  /// A job is ready when it is done: it takes no ready check.
+  pub fn takes_ready(self) -> bool {
+    self == TaskKind::Service
+  }
+
+  /// A job always restarted would never be done.
+  pub fn takes_restart(self, restart: RestartMode) -> bool {
+    self == TaskKind::Service || restart != RestartMode::Always
+  }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadyMode {
   /// Ready as soon as the task reports started.
@@ -214,6 +244,29 @@ pub enum RestartMode {
   Always,
 }
 
+impl RestartMode {
+  pub const ALL: [RestartMode; 3] = [
+    RestartMode::Never,
+    RestartMode::OnFailure,
+    RestartMode::Always,
+  ];
+
+  /// As the config writes it.
+  pub fn name(self) -> &'static str {
+    match self {
+      RestartMode::Never => "never",
+      RestartMode::OnFailure => "on-failure",
+      RestartMode::Always => "always",
+    }
+  }
+
+  pub fn from_name(name: &str) -> Option<RestartMode> {
+    RestartMode::ALL
+      .into_iter()
+      .find(|mode| mode.name() == name)
+  }
+}
+
 pub struct TaskNotification {
   pub from: TaskId,
   pub notify: TaskNotify,
@@ -232,7 +285,17 @@ pub enum TaskNotify {
   },
   StateChanged(TaskState),
   Removed,
-  LabelChanged(Option<String>),
+  /// The label or the kind changed: renamed, or redefined.
+  Changed {
+    label: Option<String>,
+    kind: TaskKind,
+  },
+  /// Listed elsewhere, at this path, right after `after`. A move of
+  /// several tasks notifies them in their new list order.
+  Moved {
+    path: Option<TaskPath>,
+    after: Option<TaskId>,
+  },
 }
 
 impl fmt::Debug for TaskNotify {
@@ -245,8 +308,11 @@ impl fmt::Debug for TaskNotify {
       }
       TaskNotify::StateChanged(state) => write!(f, "StateChanged({:?})", state),
       TaskNotify::Removed => write!(f, "Removed"),
-      TaskNotify::LabelChanged(label) => {
-        write!(f, "LabelChanged({:?})", label)
+      TaskNotify::Changed { label, kind } => {
+        write!(f, "Changed({:?}, {:?})", label, kind)
+      }
+      TaskNotify::Moved { path, after } => {
+        write!(f, "Moved({:?}, {:?})", path, after)
       }
     }
   }
@@ -280,12 +346,9 @@ pub struct TargetTask;
 impl Task for TargetTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => fx.started(),
+      TaskCmd::Start(_) => fx.started(),
       TaskCmd::Stop | TaskCmd::Kill => fx.stopped(ExitInfo::code(0)),
-      TaskCmd::Duplicate(_)
-      | TaskCmd::Msg(_)
-      | TaskCmd::Freeze(_)
-      | TaskCmd::Thaw => (),
+      TaskCmd::Msg(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
     }
   }
 }
@@ -328,19 +391,49 @@ pub struct TaskHandle {
   /// on an unpinned task; any verb that pins or unpins it clears it.
   pub saved_pin: bool,
 
+  /// What its current or last run is, how it gets ready, and how long
+  /// its stop may take.
   pub kind: TaskKind,
   pub ready: ReadyMode,
-  pub restart: RestartMode,
   pub stop_timeout: Duration,
+  /// What the next run starts from, when it is not what the last one did.
+  pub next: Option<Box<NextRun>>,
+  pub restart: RestartMode,
 
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
   pub vt: Option<ScreenHandle>,
   pub tags: Vec<String>,
+  /// The definition as written that its current or last run started
+  /// from, without its deps: they are the task's edges.
+  pub spec: Option<TaskSpec>,
+  /// The config entry it is written in; none for the runner's own.
+  pub origin: Option<Source>,
+  /// Makes a copy of it from its definition.
+  pub make_copy: Option<MakeCopy>,
 }
 
 impl TaskHandle {
+  /// Runs start from `next` from now on. Returns whether its kind
+  /// changed.
+  pub fn adopt(&mut self, next: NextRun) -> bool {
+    let changed = self.kind != next.kind;
+    self.kind = next.kind;
+    self.ready = next.ready;
+    self.stop_timeout = next.stop_timeout;
+    self.spec = next.spec;
+    changed
+  }
+
+  /// The definition as written that its next run starts from.
+  pub fn def_spec(&self) -> Option<&TaskSpec> {
+    match &self.next {
+      Some(next) => next.spec.as_ref(),
+      None => self.spec.as_ref(),
+    }
+  }
+
   /// Whether this task currently satisfies its dependents.
   pub fn is_satisfied(&self) -> bool {
     match self.kind {
@@ -394,11 +487,19 @@ pub struct TaskDef {
   pub space: TaskSpaceId,
   pub path: Option<TaskPath>,
   pub label: Option<String>,
-  /// Listed right after this task when their paths have the same parent
-  /// in one space; otherwise last under its parent.
-  pub after: Option<TaskId>,
+  /// Where it is listed beside the tasks at its path's parent: an
+  /// `After` path elsewhere, or `Keep`, is last.
+  pub place: Place,
   pub vt: Option<ScreenHandle>,
   pub tags: Vec<String>,
+  /// The definition as written: the kernel keeps it but for its deps.
+  pub spec: Option<TaskSpec>,
+  pub origin: Option<Source>,
+  /// What the next run starts from, for a task restored with a run that
+  /// started from an older definition (`kind`, `ready`, `stop_timeout`
+  /// and `spec` are that run's then).
+  pub next: Option<Box<NextRun>>,
+  pub make_copy: Option<MakeCopy>,
 }
 
 impl Default for TaskDef {
@@ -414,9 +515,13 @@ impl Default for TaskDef {
       space: TaskSpaceId::default_space(),
       path: None,
       label: None,
-      after: None,
+      place: Place::Last,
       vt: None,
       tags: Vec::new(),
+      spec: None,
+      origin: None,
+      next: None,
+      make_copy: None,
     }
   }
 }

@@ -1,23 +1,45 @@
+use crate::command::Command;
 use crate::console::{action::Action, keymap::Keymap, theme::Theme};
 use crate::term::{Grid, grid::Rect, key::Key, mouse::MouseEvent};
 
-#[derive(Clone)]
 pub enum ModalResult {
   Keep,
   Close,
   /// Close the modal, then run the action.
   Run(Action),
-  /// Close the modal and detach the attachment that pressed the key.
-  Detach,
+  /// Keep the modal open, run the commands one after another, and tell
+  /// it how that went (`Modal::issued`).
+  Issue(Vec<Command>),
+  /// Close the modal and carry the reload out as chosen.
+  ApplyReload(Box<crate::reload::Plan>),
+  /// Close the modal and write the changes back.
+  WriteBack(Box<crate::write_back::WritePlan>, crate::write_back::How),
+}
+
+/// Commands a modal issued, one of which failed.
+pub struct IssueError {
+  /// How many went in before it.
+  pub done: usize,
+  pub message: String,
 }
 
 pub trait Modal: Send {
   fn handle_key(&mut self, key: &Key) -> ModalResult;
 
-  /// Mouse input while the modal is open. A click outside the modal is
-  /// handled by the app, which closes it. Ignored unless the modal says
-  /// otherwise.
+  /// Mouse input inside the modal while it is open. Ignored unless the
+  /// modal says otherwise.
   fn handle_mouse(&mut self, _mouse: &MouseEvent) -> ModalResult {
+    ModalResult::Keep
+  }
+
+  /// A press outside the modal: closes it unless it says otherwise.
+  fn click_outside(&mut self) -> ModalResult {
+    ModalResult::Close
+  }
+
+  /// Text pasted while the modal is open. Ignored unless the modal says
+  /// otherwise.
+  fn handle_paste(&mut self, _text: &str) -> ModalResult {
     ModalResult::Keep
   }
 
@@ -31,6 +53,14 @@ pub trait Modal: Send {
   }
 
   fn render(&mut self, grid: &mut Grid, keymap: &Keymap, theme: &Theme);
+
+  /// How the commands it issued went; closes it unless one failed.
+  fn issued(&mut self, result: Result<(), IssueError>) -> ModalResult {
+    match result {
+      Ok(()) => ModalResult::Close,
+      Err(_) => ModalResult::Keep,
+    }
+  }
 
   fn area(&self, frame: Rect) -> Rect {
     let (w, h) = self.size(frame);

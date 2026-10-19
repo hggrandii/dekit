@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 
 use super::*;
-use crate::protocol::TermCaps;
+use crate::protocol::{Feature, TermCaps};
 use crate::term::{
   Painter,
   image::{Format, SrcRect, placeholder},
@@ -273,10 +273,7 @@ fn replacing_a_placeholder_image_frees_the_old_one() {
   assert_eq!(second.placements.len(), 1);
   assert_ne!(second.placements[0].key, old_key);
   // The painter deletes the old one on the client.
-  let mut painter = Painter::new(TermCaps {
-    sync_output: false,
-    ..TermCaps::full()
-  });
+  let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
   let mut out = Vec::new();
   painter.paint(&mut out, &Arc::new(first));
   out.clear();
@@ -365,10 +362,7 @@ fn sixel_images_go_with_their_cells() {
   assert!(after.placements.is_empty());
   assert_eq!(s.images().len(), 0);
   // The client is told to drop it.
-  let mut painter = Painter::new(TermCaps {
-    sync_output: false,
-    ..TermCaps::full()
-  });
+  let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
   let mut out = Vec::new();
   painter.paint(&mut out, &Arc::new(first));
   assert!(String::from_utf8_lossy(&out).contains("a=p,"));
@@ -409,10 +403,7 @@ fn painter_sends_images_once_and_tracks_placements() {
     &mut s,
     format!("\x1b[2;1H\x1b_Ga=T,f=24,s=2,v=1,i=1,q=2;{data}\x1b\\").as_bytes(),
   );
-  let mut painter = Painter::new(TermCaps {
-    sync_output: false,
-    ..TermCaps::full()
-  });
+  let mut painter = Painter::new(TermCaps::full().without(Feature::Sync));
   let mut out = Vec::new();
   painter.paint(&mut out, &Arc::new(s.frame()));
   let text = String::from_utf8_lossy(&out);

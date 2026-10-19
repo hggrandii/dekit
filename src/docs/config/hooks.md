@@ -39,14 +39,18 @@ written as on the command line: a path, a glob, or a `+tag`
   desc: Stop the tasks and start them again; stopped tasks start.
 - cmd: "{command: force-restart, target}"
   desc: Like restart, but with a hard kill instead of a normal stop.
-- cmd: "{command: add, target, cmd | script, label, cwd, env, deps, tags}"
-  desc: Add a task at the path `target` and start it.
+- cmd: "{command: add, target, spec, place, start}"
+  desc: "Add a task at the path `target` and, unless `start` is false, start it. `spec` is a task entry as in |config/tasks|, with `defaults` under it but for `autorestart`. `place` lists it: `first`, `last`, or `{after: <path>}`; last unless it says."
+- cmd: "{command: update, target, spec, restart}"
+  desc: "Redefine the task at `target` in place; `spec` is its whole entry. It runs the new definition from its next start, or now with `restart: true` if it is running."
+- cmd: "{command: move, target, to, place}"
+  desc: "Move a task or a group to the path `to`, or within the list; `place` is keep, first, last, or `{after: <path>}`."
 - cmd: "{command: remove, target}"
   desc: Remove the tasks, killing running ones.
 - cmd: "{command: rename, target, name}"
   desc: Change the tasks' label.
-- cmd: "{command: duplicate, target, name}"
-  desc: Copy a task under a new name.
+- cmd: "{command: duplicate, target, name, path, start}"
+  desc: "Copy each matching task, with its deps and tags, right after it and next to its path; with `path`, the target is one task and the copy goes there."
 - cmd: "{command: down}"
   desc: Save the tasks for the next `up` and stop the runner, as |cli/down| does.
 - cmd: "{command: quit}"

@@ -29,7 +29,7 @@ Pass `--json` for machine-readable output.
 ## Running things
 
 - `dekit run <path> -- <cmd>` runs a one-off in the foreground and exits with the command's status (128 plus the signal number when a signal ended it). The task is removed when it exits.
-- `dekit spawn <path> -- <cmd>` starts a long-running task. `dekit rm +dynamic` removes every task added from the command line.
+- `dekit spawn <path> -- <cmd>` starts a long-running task. `dekit rm +dynamic` removes every task not from `dekit.yaml`, these among them.
 
 Other commands exit with 0 on success and 1 on an error, such as no
 project, a bad target, or a request the runner refused; the message goes to

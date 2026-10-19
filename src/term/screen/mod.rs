@@ -183,8 +183,12 @@ impl Screen {
   /// at the current size. The owner's settings (palette, cell size, line
   /// tap) stay.
   pub fn reset(&mut self) {
+    self.reset_with(self.grid.scrollback_len());
+  }
+
+  /// `reset`, keeping `scrollback_len` lines of history from now on.
+  pub fn reset_with(&mut self, scrollback_len: usize) {
     let size = self.grid.size();
-    let scrollback_len = self.grid.scrollback_len();
     let fresh = Screen::new(size, scrollback_len);
     *self = Screen {
       palette: self.palette.clone(),
@@ -385,6 +389,11 @@ impl Screen {
   /// it terminal output.
   pub fn set_hide_cursor(&mut self, hide: bool) {
     self.modes.hide_cursor = hide;
+  }
+
+  /// The cursor's shape, as `DECSCUSR` would set it; for the same tasks.
+  pub fn set_cursor_style(&mut self, style: CursorStyle) {
+    self.cursor_style = style;
   }
 
   pub fn application_cursor(&self) -> bool {

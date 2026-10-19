@@ -128,7 +128,7 @@ mod unix {
     };
 
     // The snapshot, checked by the target before anything is switched.
-    let snapshot = snapshot_of(runner, kernel, connections);
+    let snapshot = snapshot_of(runner, kernel, connections, ctx.project.base());
     let path = &runner.paths.snapshot;
     let fds = snap::fds(&snapshot);
     let err = switch(binary, runner, &snapshot, path, &fds).await;
@@ -143,23 +143,15 @@ mod unix {
     runner: &RunnerHandle,
     kernel: KernelSnapshot,
     connections: Vec<snap::Connection>,
+    config_base: crate::spec::Base,
   ) -> snap::Snapshot {
     snap::Snapshot {
-      format: snap::FORMAT.to_string(),
-      version: snap::CURRENT_VERSION,
-      source_version: env!("CARGO_PKG_VERSION").to_string(),
-      pid: std::process::id(),
-      runner: snap::Runner {
-        kind: runner.spec.kind.as_str().to_string(),
-        root: runner.spec.root.to_string_lossy().into_owned(),
-      },
       started_at: runner.started_at,
       lock_fd: runner.lock_fd,
       live_fd: runner.live_fd,
       listener_fd: runner.listener_fd,
-      next_task_id: kernel.next_task_id,
-      tasks: kernel.tasks,
       connections,
+      ..snap::Snapshot::new(&runner.spec, kernel, config_base)
     }
   }
 

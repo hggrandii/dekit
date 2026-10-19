@@ -44,6 +44,20 @@ keymap:
   desc: Show the hint line while a task is zoomed.
 :::
 
+## Agent
+
+The console can hand a write-back the file editor can't do safely to a
+coding agent: it runs the agent as a task, with a prompt that lists the
+changes as its last argument, and once the task ends, checks that the
+config reads back as asked (|start/runners|).
+
+:::fields kind=config
+- key: agent.cmd
+  type: "string | string[]"
+  default: "[claude] when it is installed"
+  desc: The agent's command; the prompt is added after it.
+:::
+
 ## Keymap
 
 `keymap` has three groups: `tasks` when the task list has focus, `term`
@@ -70,7 +84,13 @@ Default bindings in `tasks`:
 - cmd: <r>, <R>
   desc: restart-task, force-restart-task
 - cmd: <a>, <C>, <d>, <e>
-  desc: show-add-task, duplicate-task, show-remove-task, show-rename-task
+  desc: show-add-task, show-duplicate-task, show-remove-task, show-edit-task
+- cmd: <Space>
+  desc: show-task-menu, also on a right click
+- cmd: <K>, <J>
+  desc: move-task-up, move-task-down, beside the tasks of its group
+- cmd: <y>
+  desc: copy-task-command
 - cmd: <p>
   desc: show-commands-menu
 - cmd: <P>
@@ -94,7 +114,9 @@ Default bindings in `tasks`:
 In `term_copy`: `<Esc>` copy-mode-leave, `<v>` copy-mode-end, `<c>`
 copy-mode-copy, `<h>` `<j>` `<k>` `<l>` or the arrows copy-mode-move, and
 the same scroll keys. Other actions: focus-tasks, focus-term, restart-all,
-force-restart-all, veto-task, close-current-modal, show-main-menu (the
+force-restart-all, veto-task, close-current-modal, duplicate-task (a
+copy without the dialog), show-reload, show-write-back, save-to-config,
+show-main-menu (the
 menu under the `dekit` badge, also by clicking it), detach, quit (stops
 the runner without saving, like |cli/runner/stop|),
 `{action: show-runner-select, tab: open}` to open a project from any

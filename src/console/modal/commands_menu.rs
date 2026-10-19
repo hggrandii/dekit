@@ -1,27 +1,23 @@
-use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::{Action, RunnerTab, ScrollUnit};
 use crate::console::{
   keymap::{Keymap, KeymapGroup},
   theme::Theme,
-  widgets::{
-    list::ListState,
-    text_input::{render_filter_row, to_input_request},
-  },
+  widgets::filter_list::{FilterInput, FilterList},
 };
 use crate::term::{
   CursorStyle, Grid,
   grid::Rect,
   key::{Key, KeyCode, KeyMods},
+  mouse::MouseEvent,
   style::Style,
 };
 
 use super::modal::{Modal, ModalResult};
 
 pub struct CommandsMenuModal {
-  input: Input,
-  list: ListState,
+  filter: FilterList,
   items: Vec<MenuItem>,
 }
 
@@ -33,38 +29,59 @@ struct MenuItem {
 
 impl CommandsMenuModal {
   pub fn new() -> Self {
-    let items = menu_items("");
-    let mut list = ListState::new(0);
-    list.reset(items.len());
-    CommandsMenuModal {
-      input: Input::default(),
-      list,
-      items,
+    let mut menu = CommandsMenuModal {
+      filter: FilterList::default(),
+      items: menu_items(),
+    };
+    menu.refilter();
+    menu
+  }
+
+  fn refilter(&mut self) {
+    let search = self.filter.value().to_lowercase();
+    let shown = (0..self.items.len())
+      .filter(|&i| self.items[i].matches(&search))
+      .collect();
+    self.filter.show(shown);
+  }
+
+  fn run(&self, item: Option<usize>) -> ModalResult {
+    match item.and_then(|i| self.items.get(i)) {
+      Some(item) => ModalResult::Run(item.action.clone()),
+      None => ModalResult::Close,
     }
+  }
+
+  fn took(&mut self, input: FilterInput) -> ModalResult {
+    match input {
+      FilterInput::Edited => self.refilter(),
+      FilterInput::Picked(item) => return self.run(Some(item)),
+      FilterInput::Moved | FilterInput::Ignored => (),
+    }
+    ModalResult::Keep
   }
 }
 
 impl Modal for CommandsMenuModal {
   fn handle_key(&mut self, key: &Key) -> ModalResult {
     match (key.code, key.mods) {
-      (KeyCode::Enter, KeyMods::NONE) => {
-        let item = self.list.selected().and_then(|i| self.items.get(i));
-        return match item {
-          Some(item) => ModalResult::Run(item.action.clone()),
-          None => ModalResult::Close,
-        };
+      (KeyCode::Enter, KeyMods::NONE) => self.run(self.filter.selected()),
+      (KeyCode::Esc, KeyMods::NONE) => ModalResult::Close,
+      _ => {
+        let input = self.filter.handle_key(key);
+        self.took(input)
       }
-      (KeyCode::Esc, KeyMods::NONE) => return ModalResult::Close,
-      _ => (),
     }
-    if !self.list.handle_key(key)
-      && let Some(req) = to_input_request(key)
-      && self.input.handle(req).is_some_and(|change| change.value)
-    {
-      self.items = menu_items(&self.input.value().to_lowercase());
-      self.list.reset(self.items.len());
-    }
-    ModalResult::Keep
+  }
+
+  fn handle_mouse(&mut self, mouse: &MouseEvent) -> ModalResult {
+    let input = self.filter.handle_mouse(mouse);
+    self.took(input)
+  }
+
+  fn handle_paste(&mut self, text: &str) -> ModalResult {
+    let input = self.filter.handle_paste(text);
+    self.took(input)
   }
 
   fn size(&self, _frame: Rect) -> (u16, u16) {
@@ -82,30 +99,19 @@ impl Modal for CommandsMenuModal {
     let list_area = inner;
     block.separator(sep_row.y);
 
-    let counter = self.list.selected().map(|i| (i, self.items.len()));
-    grid.cursor_pos = Some(render_filter_row(
-      grid,
-      input_row,
-      "/ ",
-      &self.input,
-      counter,
-      &style,
-    ));
+    grid.cursor_pos =
+      Some(self.filter.render_input(grid, input_row, "/ ", &style));
     grid.cursor_style = CursorStyle::BlinkingBar;
 
-    let search = self.input.value().to_lowercase();
-    for row in self.list.rows(list_area) {
-      let item = &self.items[row.index];
-      let style = theme.block.modal_row(style, row.selected);
-      if row.selected {
-        grid.fill_area(row.area, ' ', style.text);
-        grid.draw_text(row.area, "\u{258e}", style.key);
-      }
-
+    let search = self.filter.value().to_lowercase();
+    for (item, area, style) in
+      self.filter.rows(grid, list_area, style, &theme.block)
+    {
+      let item = &self.items[item];
       // The description gets what the key leaves. The action's name is
       // not shown: actions with fields would share it. It still matches
       // the search.
-      let mut rest = row.area.inner((0, 1, 0, 2));
+      let mut rest = area.inner((0, 1, 0, 2));
       if let Some(key) = keymap.key(KeymapGroup::Tasks, &item.action) {
         let key = key.to_string();
         grid.draw_text(rest.take_right(key.width() as u16), &key, style.key);
@@ -148,7 +154,13 @@ fn draw_highlighted(
   draw(&mut area, &text[last..], base);
 }
 
-fn menu_items(search: &str) -> Vec<MenuItem> {
+impl MenuItem {
+  fn matches(&self, search: &str) -> bool {
+    self.name.contains(search) || self.desc.to_lowercase().contains(search)
+  }
+}
+
+fn menu_items() -> Vec<MenuItem> {
   let actions = [
     Action::Detach,
     Action::Quit,
@@ -177,9 +189,16 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
     Action::ForceRestartTask,
     Action::ForceRestartAll,
     Action::ShowAddTask,
-    Action::ShowRenameTask,
+    Action::ShowEditTask,
+    Action::ShowDuplicateTask,
     Action::ShowRemoveTask,
-    Action::CloseCurrentModal,
+    Action::ShowTaskMenu,
+    Action::MoveTaskUp,
+    Action::MoveTaskDown,
+    Action::CopyTaskCommand,
+    Action::ShowReload,
+    Action::ShowWriteBack,
+    Action::SaveToConfig,
     Action::ScrollDown {
       n: 1,
       unit: ScrollUnit::HalfScreen,
@@ -200,9 +219,6 @@ fn menu_items(search: &str) -> Vec<MenuItem> {
       desc: action.desc(),
       action,
     })
-    .filter(|item| {
-      item.name.contains(search) || item.desc.to_lowercase().contains(search)
-    })
     .collect()
 }
 
@@ -214,7 +230,7 @@ mod tests {
   /// one.
   #[test]
   fn descriptions_are_unique() {
-    let items = menu_items("");
+    let items = menu_items();
     let mut descs: Vec<&str> = items.iter().map(|i| i.desc.as_str()).collect();
     descs.sort_unstable();
     let before = descs.len();
@@ -224,9 +240,15 @@ mod tests {
 
   #[test]
   fn the_search_matches_the_name_too() {
-    let items = menu_items("show-runner");
+    let found = |search: &str| -> Vec<MenuItem> {
+      menu_items()
+        .into_iter()
+        .filter(|i| i.matches(search))
+        .collect()
+    };
+    let items = found("show-runner");
     assert_eq!(items.len(), 2, "both runner-select spellings");
     assert!(items.iter().all(|i| i.name == "show-runner-select"));
-    assert!(menu_items("open project").len() == 1);
+    assert!(found("open project").len() == 1);
   }
 }

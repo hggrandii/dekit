@@ -71,7 +71,8 @@ fn down_then_up_restores_the_tasks() {
     serde_json::from_str(&runner.ok(&["--json", "down"])).unwrap();
   assert_eq!(again["stopped"], false, "{again}");
 
-  // Edited while the runner was stopped: the new command runs.
+  // Edited while the runner was stopped: the tasks come back as they
+  // were saved, and a reload takes the edit.
   runner.yaml(
     "tasks:\n  alpha:\n    cmd: [sh, -c, 'echo after; sleep 60']\n    autostart: true\n  \
      beta:\n    cmd: [sh, -c, 'echo beta; sleep 60']\n  \
@@ -101,6 +102,12 @@ fn down_then_up_restores_the_tasks() {
   wait_until("alpha ready again", || {
     task_line(&runner, "alpha").contains("ready")
   });
+  let plan = runner.ok(&["reload"]);
+  assert!(plan.contains("~ alpha  cmd"), "{plan}");
+  assert!(!runner.ok(&["screen", "alpha"]).contains("after"));
+  runner.ok(&["reload", "--yes"]);
+  assert!(runner.ok(&["reload"]).contains("match the config"));
+  runner.ok(&["restart", "alpha"]);
   wait_until("alpha new output", || {
     runner.ok(&["screen", "alpha"]).contains("after")
   });

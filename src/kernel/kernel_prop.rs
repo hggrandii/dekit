@@ -68,11 +68,11 @@ struct ScriptedTask {
 impl Task for ScriptedTask {
   fn handle_cmd(&mut self, cmd: TaskCmd, fx: &mut Effects) {
     match cmd {
-      TaskCmd::Start => self.script.on_start.apply(fx),
+      TaskCmd::Start(_) => self.script.on_start.apply(fx),
       TaskCmd::Stop => self.script.on_stop.apply(fx),
       TaskCmd::Kill => self.script.on_kill.apply(fx),
       // Never frozen: the harness drives no upgrades.
-      TaskCmd::Duplicate(_) | TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
+      TaskCmd::Freeze(_) | TaskCmd::Thaw => (),
       TaskCmd::Msg(_) => self.script.on_msg.apply(fx),
     }
   }
@@ -401,9 +401,9 @@ impl Run {
       space: TaskSpaceId::default_space(),
       path: Some(TaskPath::new(format!("t{}", i + 1)).unwrap()),
       label: None,
-      after: None,
       vt: None,
       tags: vec![tag_name(i).to_string()],
+      ..TaskDef::default()
     };
     let script = task.script;
     // Predicted outcome: refused on a duplicate id or a missing dep.

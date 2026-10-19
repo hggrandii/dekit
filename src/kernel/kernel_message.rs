@@ -4,14 +4,19 @@ use std::{
   sync::{Arc, atomic::AtomicUsize},
 };
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub use crate::term::ScreenHandle;
 
 use super::sub_trie::SubMode;
-use super::task::{ExitInfo, Task, TaskCmd, TaskDef, TaskId, TaskState};
+use super::task::{
+  ExitInfo, NextRun, RestartMode, Task, TaskCmd, TaskDef, TaskId, TaskKind,
+  TaskState,
+};
 use super::task_key::{TaskKey, TaskSpaceId};
 use super::task_path::TaskPath;
+use crate::spec::{Source, TaskSpec};
 use crate::upgrade::snapshot::TaskKind as TaskKindSnapshot;
 
 pub struct KernelMessage {
@@ -60,6 +65,14 @@ impl TaskRegistration {
 
 pub type Ack = Option<tokio::sync::oneshot::Sender<usize>>;
 
+/// Makes a copy of a task from its definition as written, at a new id
+/// and key.
+pub type MakeCopy = Arc<
+  dyn Fn(TaskId, Option<TaskKey>, TaskSpec) -> anyhow::Result<TaskRegistration>
+    + Send
+    + Sync,
+>;
+
 pub enum KernelCommand {
   Quit,
   /// Quits without saving, dropping a save a quit has begun.
@@ -104,15 +117,35 @@ pub enum KernelCommand {
   /// Total: removes matching tasks in any state, killing running ones.
   Remove(TaskSelector, Ack),
   SetLabel(TaskSelector, Option<String>, Ack),
-  /// Asks each matching task to register a copy of itself.
-  Duplicate(TaskSelector, Option<String>, Ack),
+  /// Registers a copy of each matching task made from a definition;
+  /// replies with how many, or why one could not be.
+  Duplicate(
+    TaskSelector,
+    DuplicateRequest,
+    tokio::sync::oneshot::Sender<Result<usize, RegisterError>>,
+  ),
+  /// Redefines each matching task in place: it keeps its id, screen, and
+  /// place in the list. A running task runs the new definition from its
+  /// next start. Refused, with nothing changed, when a dep matches no
+  /// task or would close a cycle; answers with the count otherwise.
+  Update(
+    TaskSelector,
+    Box<TaskUpdate>,
+    tokio::sync::oneshot::Sender<Result<usize, RegisterError>>,
+  ),
+  /// Sets the config entry each matching task is written in; `None`
+  /// makes it the runner's own.
+  SetOrigin(TaskSelector, Option<Source>, Ack),
+  /// Moves a task, or a group with every task under it, to another path
+  /// or place in the list, in one dispatch.
+  Move(
+    MoveTask,
+    tokio::sync::oneshot::Sender<Result<usize, MoveError>>,
+  ),
 
   TaskMsg(TaskId, Box<dyn Any + Send>),
 
-  Query(
-    KernelQuery,
-    tokio::sync::oneshot::Sender<KernelQueryResponse>,
-  ),
+  Query(KernelQuery),
 
   SubscribePath(TaskKey, SubMode),
   UnsubscribePath(TaskKey, SubMode),
@@ -144,6 +177,93 @@ pub enum KernelCommand {
   /// at a time, ahead of anything newer.
   Thaw,
 }
+
+/// Where a duplicate goes: `path` in the original's space, or next to
+/// the original's path, and whether it starts at once.
+#[derive(Clone, Debug)]
+pub struct DuplicateRequest {
+  pub label: Option<String>,
+  pub path: Option<TaskPath>,
+  pub start: bool,
+}
+
+/// A task's new definition, and what the kernel makes of it.
+pub struct TaskUpdate {
+  pub next: NextRun,
+  pub restart: RestartMode,
+  pub deps: Vec<TaskSelector>,
+  pub tags: Vec<String>,
+  pub label: Option<String>,
+  /// Refused when the task's definition is no longer this one.
+  pub was: Option<TaskSpec>,
+  /// Restart it if it is running, so the new definition applies now.
+  pub restart_running: bool,
+}
+
+/// `from` is a task's path or a group's; `place` is where it is listed
+/// among the names under `to`'s parent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MoveTask {
+  pub space: TaskSpaceId,
+  pub from: TaskPath,
+  pub to: TaskPath,
+  pub place: Place,
+}
+
+/// Where a moved task or group is listed among the names beside it. On
+/// the wire: `keep`, `first`, `last`, or `{after: path}`.
+#[derive(
+  Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Place {
+  /// Where it is now when it stays beside the same names, or the group
+  /// it makes is, else last.
+  #[default]
+  Keep,
+  First,
+  Last,
+  /// Right after this path, which is beside the destination.
+  After(TaskPath),
+}
+
+impl Place {
+  pub fn is_keep(&self) -> bool {
+    *self == Place::Keep
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MoveError {
+  /// No task is at or under the path.
+  NotFound(TaskPath),
+  /// A task or group is there already.
+  Taken(TaskPath),
+  /// A task is above the path: tasks are leaves.
+  UnderTask(TaskPath),
+  /// A group can't go under itself.
+  IntoItself,
+  /// `after` is not beside the destination.
+  BadAfter(TaskPath),
+}
+
+impl fmt::Display for MoveError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      MoveError::NotFound(path) => write!(f, "no task at or under '{path}'"),
+      MoveError::Taken(path) => write!(f, "'{path}' is taken"),
+      MoveError::UnderTask(path) => {
+        write!(f, "'{path}' is a task; a task can't have tasks under it")
+      }
+      MoveError::IntoItself => f.write_str("a group can't go under itself"),
+      MoveError::BadAfter(path) => {
+        write!(f, "'{path}' is not beside the destination")
+      }
+    }
+  }
+}
+
+impl std::error::Error for MoveError {}
 
 /// The kernel's part of an upgrade snapshot.
 #[derive(Debug)]
@@ -210,6 +330,13 @@ pub enum RegisterError {
   PathNested(TaskKey, TaskKey),
   /// A dep selector matched no task.
   MissingDep(TaskSelector),
+  /// The dep needs the task, directly or through others.
+  DepCycle(String),
+  /// The task is gone, or its definition is not the one the new one was
+  /// made from.
+  Changed,
+  /// The task is not one made from a definition, to replace or copy.
+  NoDefinition,
 }
 
 impl fmt::Display for RegisterError {
@@ -237,21 +364,39 @@ impl fmt::Display for RegisterError {
       RegisterError::MissingDep(selector) => {
         write!(f, "dep '{}' matches no task", selector)
       }
+      RegisterError::DepCycle(dep) => {
+        write!(f, "'{}' depends on this task, so it can't be a dep", dep)
+      }
+      RegisterError::Changed => f.write_str("the task changed meanwhile"),
+      RegisterError::NoDefinition => {
+        f.write_str("the task is not one made from a definition")
+      }
     }
   }
 }
 
 impl std::error::Error for RegisterError {}
 
+/// A question to the kernel, and where its answer goes.
 pub enum KernelQuery {
-  ListTasks(TaskSelector),
-  /// Explain why matching tasks are (not) running.
-  Explain(TaskSelector),
+  /// The matching tasks, in list order.
+  ListTasks(TaskSelector, Reply<Vec<TaskInfo>>),
+  /// Why matching tasks are (not) running.
+  Explain(TaskSelector, Reply<Vec<TaskExplain>>),
+  /// Matching tasks with their definitions, in list order.
+  Describe(TaskSelector, Reply<Vec<TaskDescription>>),
 }
 
-pub enum KernelQueryResponse {
-  TaskList(Vec<TaskInfo>),
-  Explain(Vec<TaskExplain>),
+pub type Reply<T> = tokio::sync::oneshot::Sender<T>;
+
+/// A task and its definition as it is now: the spec's label is the
+/// task's, and a dep it names by path follows that task's moves.
+#[derive(Clone, Debug)]
+pub struct TaskDescription {
+  pub info: TaskInfo,
+  pub kind: TaskKind,
+  pub spec: Option<TaskSpec>,
+  pub origin: Option<Source>,
 }
 
 #[derive(Clone, Debug)]
@@ -357,41 +502,22 @@ impl TaskContext {
     )
   }
 
+  #[cfg(test)]
   pub fn register(
     &self,
     def: TaskDef,
     factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
   ) -> TaskId {
     let task_id = self.alloc_id();
-    self.register_with_id(task_id, def, factory)
-  }
-
-  pub fn register_with_id(
-    &self,
-    task_id: TaskId,
-    def: TaskDef,
-    factory: Box<dyn FnOnce(TaskContext) -> Box<dyn Task> + Send>,
-  ) -> TaskId {
-    let _ = self.register_task(TaskRegistration {
+    drop(self.register_task(TaskRegistration {
       task_id,
       def,
       factory,
-    });
+    }));
     task_id
   }
 
-  pub fn spawn_async<F, Fut>(&self, def: TaskDef, f: F) -> TaskId
-  where
-    F: FnOnce(TaskContext, tokio::sync::mpsc::UnboundedReceiver<TaskCmd>) -> Fut
-      + Send
-      + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-  {
-    let task_id = self.alloc_id();
-    let _ = self.spawn_async_with_id(task_id, def, f);
-    task_id
-  }
-
+  #[cfg(test)]
   pub fn spawn_async_with_id<F, Fut>(
     &self,
     task_id: TaskId,
@@ -443,13 +569,40 @@ impl TaskContext {
     self.send(KernelCommand::UnsubscribePath(key, mode));
   }
 
-  pub fn query(
+  /// Asks now, in order with what was sent before; the answer is empty
+  /// once the kernel is gone.
+  fn ask<T: Default + Send + 'static>(
     &self,
-    query: KernelQuery,
-  ) -> tokio::sync::oneshot::Receiver<KernelQueryResponse> {
+    query: impl FnOnce(Reply<T>) -> KernelQuery,
+  ) -> impl std::future::Future<Output = T> + Send + 'static {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    self.send(KernelCommand::Query(query, tx));
-    rx
+    self.send(KernelCommand::Query(query(tx)));
+    async move { rx.await.unwrap_or_default() }
+  }
+
+  /// The tasks a selector matches, in list order.
+  pub fn list_tasks(
+    &self,
+    selector: TaskSelector,
+  ) -> impl std::future::Future<Output = Vec<TaskInfo>> + Send + 'static {
+    self.ask(|reply| KernelQuery::ListTasks(selector, reply))
+  }
+
+  /// Why the tasks a selector matches are (not) running.
+  pub fn explain(
+    &self,
+    selector: TaskSelector,
+  ) -> impl std::future::Future<Output = Vec<TaskExplain>> + Send + 'static {
+    self.ask(|reply| KernelQuery::Explain(selector, reply))
+  }
+
+  /// The tasks a selector matches with their definitions, in list order.
+  pub fn describe(
+    &self,
+    selector: TaskSelector,
+  ) -> impl std::future::Future<Output = Vec<TaskDescription>> + Send + 'static
+  {
+    self.ask(|reply| KernelQuery::Describe(selector, reply))
   }
 
   pub fn get_task_sender(&self, target_id: TaskId) -> TaskSender {

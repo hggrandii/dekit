@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
 use crate::console::action::{Action, RunnerTab};
@@ -8,10 +7,8 @@ use crate::console::{
   keymap::Keymap,
   theme::Theme,
   ui_header::runner_name,
-  widgets::{
-    list::ListState,
-    text_input::{render_filter_row, to_input_request},
-  },
+  widgets::filter_list::{FilterInput, FilterList},
+  widgets::{is_dir, split_path},
 };
 use crate::runner::{
   RunnerKind, RunnerSpec, home_dir,
@@ -27,6 +24,9 @@ use crate::term::{
 };
 
 use super::modal::{Modal, ModalResult};
+use crate::console::widgets::border::{
+  draw_hints, draw_on_border, top_hints_row,
+};
 
 /// The runners this machine knows, in three tabs: `switch` lists the
 /// running ones, `recent` the projects opened before, and `open` walks
@@ -179,11 +179,8 @@ fn age(now: u64, then: u64) -> String {
 
 /// A list of runners, narrowed by what is typed.
 struct Picker {
-  input: Input,
-  list: ListState,
+  filter: FilterList,
   items: Vec<RunnerItem>,
-  /// Indices into `items` that match the filter, in list order.
-  shown: Vec<usize>,
   /// What an empty list says.
   empty: &'static str,
   /// When the records could not be read.
@@ -197,20 +194,18 @@ impl Picker {
     error: Option<String>,
   ) -> Self {
     let mut picker = Picker {
-      input: Input::default(),
-      list: ListState::new(0),
+      filter: FilterList::default(),
       items,
-      shown: Vec::new(),
       empty,
       error,
     };
-    picker.filter();
+    picker.refilter();
     picker
   }
 
-  fn filter(&mut self) {
-    let search = self.input.value().to_lowercase();
-    self.shown = (0..self.items.len())
+  fn refilter(&mut self) {
+    let search = self.filter.value().to_lowercase();
+    let shown = (0..self.items.len())
       .filter(|&i| {
         let item = &self.items[i];
         search.is_empty()
@@ -218,41 +213,47 @@ impl Picker {
           || item.root.to_lowercase().contains(&search)
       })
       .collect();
-    self.list.reset(self.shown.len());
+    self.filter.show(shown);
   }
 
-  fn pick(&self, shown_index: usize) -> ModalResult {
-    match self.shown.get(shown_index).map(|&i| &self.items[i]) {
-      Some(item) if item.current => ModalResult::Close,
-      Some(item) => ModalResult::Run(Action::SwitchRunner {
+  fn pick(&self, item: usize) -> ModalResult {
+    match &self.items[item] {
+      item if item.current => ModalResult::Close,
+      item => ModalResult::Run(Action::SwitchRunner {
         kind: item.kind.as_str().to_string(),
         root: item.root.clone(),
       }),
-      None => ModalResult::Close,
     }
+  }
+
+  fn took(&mut self, input: FilterInput) -> ModalResult {
+    match input {
+      FilterInput::Edited => self.refilter(),
+      FilterInput::Picked(item) => return self.pick(item),
+      FilterInput::Moved | FilterInput::Ignored => (),
+    }
+    ModalResult::Keep
   }
 
   fn handle_key(&mut self, key: &Key) -> ModalResult {
     if key.code == KeyCode::Enter && key.mods == KeyMods::NONE {
       return self
-        .list
+        .filter
         .selected()
-        .map_or(ModalResult::Keep, |i| self.pick(i));
+        .map_or(ModalResult::Keep, |item| self.pick(item));
     }
-    if !self.list.handle_key(key)
-      && let Some(req) = to_input_request(key)
-      && self.input.handle(req).is_some_and(|change| change.value)
-    {
-      self.filter();
-    }
-    ModalResult::Keep
+    let input = self.filter.handle_key(key);
+    self.took(input)
   }
 
   fn handle_mouse(&mut self, mouse: &MouseEvent) -> ModalResult {
-    self
-      .list
-      .handle_mouse(mouse)
-      .map_or(ModalResult::Keep, |i| self.pick(i))
+    let input = self.filter.handle_mouse(mouse);
+    self.took(input)
+  }
+
+  fn handle_paste(&mut self, text: &str) -> ModalResult {
+    let input = self.filter.handle_paste(text);
+    self.took(input)
   }
 
   fn render(
@@ -263,15 +264,8 @@ impl Picker {
     theme: &Theme,
   ) {
     let style = theme.block.modal();
-    let counter = self.list.selected().map(|i| (i, self.shown.len()));
-    grid.cursor_pos = Some(render_filter_row(
-      grid,
-      input_row,
-      "/ ",
-      &self.input,
-      counter,
-      &style,
-    ));
+    grid.cursor_pos =
+      Some(self.filter.render_input(grid, input_row, "/ ", &style));
 
     if let Some(error) = &self.error {
       grid.draw_text(
@@ -286,16 +280,12 @@ impl Picker {
       return;
     }
 
-    for row in self.list.rows(list_area) {
-      let item = &self.items[self.shown[row.index]];
-      let style = theme.block.modal_row(style, row.selected);
-      if row.selected {
-        grid.fill_area(row.area, ' ', style.text);
-        grid.draw_text(row.area, "\u{258e}", style.key);
-      }
-
+    for (item, area, style) in
+      self.filter.rows(grid, list_area, style, &theme.block)
+    {
+      let item = &self.items[item];
       // "● name   /path/to/root   v0.10.1", the root taking what is left.
-      let mut rest = row.area.inner((0, 1, 0, 2));
+      let mut rest = area.inner((0, 1, 0, 2));
       let (mark, mark_attrs) = if item.current {
         ("●", style.key)
       } else if item.running {
@@ -339,15 +329,13 @@ struct DirEntry {
 /// The `open` tab: a path, and the directories under it to complete
 /// from.
 struct OpenPage {
-  input: Input,
-  list: ListState,
+  /// The path, over the entries that start with the name being typed.
+  filter: FilterList,
   /// The directory `entries` were read from; read again only when the
   /// path leaves it.
   listed: Option<PathBuf>,
   /// Every directory in `listed`, sorted by name.
   entries: Vec<DirEntry>,
-  /// Indices into `entries` that start with the name being typed.
-  shown: Vec<usize>,
   /// The selection was moved by hand since the path last changed, so
   /// Enter means the selected entry rather than the path as typed.
   picked: bool,
@@ -363,11 +351,9 @@ struct OpenPage {
 impl OpenPage {
   fn new(current: Option<&RunnerSpec>, found: &[lockfile::RunnerInfo]) -> Self {
     let mut page = OpenPage {
-      input: Input::default(),
-      list: ListState::new(0),
+      filter: FilterList::default(),
       listed: None,
       entries: Vec::new(),
-      shown: Vec::new(),
       picked: false,
       error: None,
       current: current.map(|runner| {
@@ -389,7 +375,9 @@ impl OpenPage {
       .map(Path::to_path_buf)
       .or_else(|| page.home.clone())
       .map_or_else(|| "/".to_string(), |dir| page.display(&dir));
-    page.input = Input::new(format!("{}/", start.trim_end_matches('/')));
+    page
+      .filter
+      .set_value(format!("{}/", start.trim_end_matches('/')));
     page.reload();
     page
   }
@@ -440,7 +428,7 @@ impl OpenPage {
   /// Keeps the directories whose names start with the typed path's last
   /// part, reading the directory it is in when that changed.
   fn reload(&mut self) {
-    let value = self.input.value().to_string();
+    let value = self.filter.value().to_string();
     let (typed_dir, partial) = split_path(&value);
     let dir = self.resolve(typed_dir);
     self.picked = false;
@@ -460,14 +448,14 @@ impl OpenPage {
     }
     let partial = partial.to_lowercase();
     let hidden = partial.starts_with('.');
-    self.shown = (0..self.entries.len())
+    let shown = (0..self.entries.len())
       .filter(|&i| {
         let name = &self.entries[i].name;
         (hidden || !name.starts_with('.'))
           && name.to_lowercase().starts_with(&partial)
       })
       .collect();
-    self.list.reset(self.shown.len());
+    self.filter.show(shown);
   }
 
   /// The directories in `dir`, by name.
@@ -478,12 +466,7 @@ impl OpenPage {
       dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut entries = Vec::new();
     for entry in read.filter_map(Result::ok) {
-      let is_dir = match entry.file_type() {
-        Ok(kind) if kind.is_dir() => true,
-        Ok(kind) if kind.is_symlink() => entry.path().is_dir(),
-        _ => false,
-      };
-      if !is_dir {
+      if !is_dir(&entry) {
         continue;
       }
       let name = entry.file_name().to_string_lossy().into_owned();
@@ -502,8 +485,7 @@ impl OpenPage {
   }
 
   fn selected_name(&self) -> Option<&str> {
-    let i = self.list.selected()?;
-    Some(&self.entries[self.shown[i]].name)
+    Some(&self.entries[self.filter.selected()?].name)
   }
 
   /// Puts the selected entry into the path and steps into it.
@@ -511,15 +493,16 @@ impl OpenPage {
     let Some(name) = self.selected_name() else {
       return;
     };
-    let (typed_dir, _) = split_path(self.input.value());
-    self.input = Input::new(format!("{typed_dir}{name}/"));
+    let (typed_dir, _) = split_path(self.filter.value());
+    let value = format!("{typed_dir}{name}/");
+    self.filter.set_value(value);
     self.reload();
   }
 
   /// Switches to the runner of the path: the selected entry when it was
   /// chosen by hand, else the path as typed, else the entry it starts.
   fn open(&mut self) -> ModalResult {
-    let value = self.input.value().to_string();
+    let value = self.filter.value().to_string();
     let (typed_dir, partial) = split_path(&value);
     let dir = self.resolve(typed_dir);
     let selected = self.selected_name().map(|name| dir.join(name));
@@ -555,33 +538,41 @@ impl OpenPage {
     })
   }
 
-  fn handle_key(&mut self, key: &Key) -> ModalResult {
-    match (key.code, key.mods) {
-      (KeyCode::Enter, KeyMods::NONE) => return self.open(),
-      (KeyCode::Tab, KeyMods::NONE) => self.complete(),
-      _ => {
-        if self.list.handle_key(key) {
-          self.picked = true;
-        } else if let Some(req) = to_input_request(key)
-          && self.input.handle(req).is_some_and(|change| change.value)
-        {
-          self.reload();
-        }
-      }
+  /// A click steps into the directory; Enter opens it. A row moved to,
+  /// by key or by the pointer, counts as picked, so Enter opens what is
+  /// highlighted.
+  fn took(&mut self, input: FilterInput) -> ModalResult {
+    match input {
+      FilterInput::Moved => self.picked = true,
+      FilterInput::Edited => self.reload(),
+      FilterInput::Picked(_) => self.complete(),
+      FilterInput::Ignored => (),
     }
     ModalResult::Keep
   }
 
-  /// A click steps into the directory; Enter opens it. A row the
-  /// pointer lit counts as picked, so Enter opens what is highlighted.
-  fn handle_mouse(&mut self, mouse: &MouseEvent) -> ModalResult {
-    let before = self.list.selected();
-    if self.list.handle_mouse(mouse).is_some() {
-      self.complete();
-    } else if self.list.selected() != before {
-      self.picked = true;
+  fn handle_key(&mut self, key: &Key) -> ModalResult {
+    match (key.code, key.mods) {
+      (KeyCode::Enter, KeyMods::NONE) => self.open(),
+      (KeyCode::Tab, KeyMods::NONE) => {
+        self.complete();
+        ModalResult::Keep
+      }
+      _ => {
+        let input = self.filter.handle_key(key);
+        self.took(input)
+      }
     }
-    ModalResult::Keep
+  }
+
+  fn handle_mouse(&mut self, mouse: &MouseEvent) -> ModalResult {
+    let input = self.filter.handle_mouse(mouse);
+    self.took(input)
+  }
+
+  fn handle_paste(&mut self, text: &str) -> ModalResult {
+    let input = self.filter.handle_paste(text);
+    self.took(input)
   }
 
   fn render(
@@ -592,25 +583,14 @@ impl OpenPage {
     theme: &Theme,
   ) {
     let style = theme.block.modal();
-    let counter = self.list.selected().map(|i| (i, self.shown.len()));
-    grid.cursor_pos = Some(render_filter_row(
-      grid,
-      input_row,
-      "> ",
-      &self.input,
-      counter,
-      &style,
-    ));
+    grid.cursor_pos =
+      Some(self.filter.render_input(grid, input_row, "> ", &style));
 
     if let Some(error) = &self.error {
-      let failed = Style {
-        fg: theme.tasks.failed.into(),
-        ..style.text
-      };
-      grid.draw_text(list_area.inner((0, 1)), error, failed);
+      grid.draw_text(list_area.inner((0, 1)), error, style.error);
       return;
     }
-    if self.shown.is_empty() {
+    if self.filter.shown().is_empty() {
       grid.draw_text(
         list_area.inner((0, 1)),
         "No directories here.",
@@ -619,16 +599,12 @@ impl OpenPage {
       return;
     }
 
-    for row in self.list.rows(list_area) {
-      let entry = &self.entries[self.shown[row.index]];
-      let style = theme.block.modal_row(style, row.selected);
-      if row.selected {
-        grid.fill_area(row.area, ' ', style.text);
-        grid.draw_text(row.area, "\u{258e}", style.key);
-      }
-
+    for (entry, area, style) in
+      self.filter.rows(grid, list_area, style, &theme.block)
+    {
+      let entry = &self.entries[entry];
       // "● name/   dekit.yaml"
-      let mut rest = row.area.inner((0, 1, 0, 2));
+      let mut rest = area.inner((0, 1, 0, 2));
       let mark = rest.take_left(2);
       if entry.running {
         grid.draw_text(mark, "●", style.dim.fg(theme.tasks.up.into()));
@@ -648,35 +624,6 @@ impl OpenPage {
 
 /// The directory part, up to and including the last `/`, and the name
 /// being typed after it.
-fn split_path(value: &str) -> (&str, &str) {
-  match value.rfind('/') {
-    Some(i) => (&value[..=i], &value[i + 1..]),
-    None => ("", value),
-  }
-}
-
-/// Draws `pieces` at the right end of a border row with a blank cell on
-/// each side, and returns where each piece went.
-fn draw_on_border(
-  grid: &mut Grid,
-  row: &mut Rect,
-  pieces: &[(&str, Style)],
-  blank: Style,
-) -> Vec<Rect> {
-  let width = pieces.iter().map(|(text, _)| text.width()).sum::<usize>() + 2;
-  let mut strip = row.take_right((width as u16).min(row.width));
-  grid.fill_area(strip, ' ', blank);
-  strip.take_left(1);
-  pieces
-    .iter()
-    .map(|(text, attrs)| {
-      let cells = strip.take_left(text.width() as u16);
-      grid.draw_text(cells, text, *attrs);
-      cells
-    })
-    .collect()
-}
-
 impl Modal for RunnerSelectModal {
   fn handle_key(&mut self, key: &Key) -> ModalResult {
     match (key.code, key.mods) {
@@ -690,6 +637,14 @@ impl Modal for RunnerSelectModal {
         RunnerTab::Recent => self.recent.handle_key(key),
         RunnerTab::Open => self.open.handle_key(key),
       },
+    }
+  }
+
+  fn handle_paste(&mut self, text: &str) -> ModalResult {
+    match self.tab {
+      RunnerTab::Switch => self.switch.handle_paste(text),
+      RunnerTab::Recent => self.recent.handle_paste(text),
+      RunnerTab::Open => self.open.handle_paste(text),
     }
   }
 
@@ -754,13 +709,7 @@ impl Modal for RunnerSelectModal {
       };
       pieces.push((tab.label(), attrs));
     }
-    let mut top = Rect {
-      x: area.x + 1,
-      y: area.y,
-      width: area.width.saturating_sub(2),
-      height: 1,
-    };
-    top.take_right(1);
+    let mut top = top_hints_row(area);
     let cells = draw_on_border(grid, &mut top, &pieces, style.border);
     for (hit, cells) in
       self.tab_hits.iter_mut().zip(cells.into_iter().step_by(2))
@@ -769,18 +718,11 @@ impl Modal for RunnerSelectModal {
     }
 
     // Key hints at the right end of the bottom border.
-    let mut hints = vec![("<C-t>", style.key), (" next tab", style.dim)];
-    if self.tab == RunnerTab::Open {
-      hints.splice(0..0, [("<Tab>", style.key), (" complete  ", style.dim)]);
-    }
-    let mut bottom = Rect {
-      x: area.x + 1,
-      y: area.bottom().saturating_sub(1),
-      width: area.width.saturating_sub(2),
-      height: 1,
+    let hints: &[_] = match self.tab {
+      RunnerTab::Open => &[("<Tab>", "complete"), ("<C-t>", "next tab")],
+      _ => &[("<C-t>", "next tab")],
     };
-    bottom.take_right(1);
-    draw_on_border(grid, &mut bottom, &hints, style.border);
+    draw_hints(grid, area, hints, &style);
 
     grid.cursor_style = CursorStyle::BlinkingBar;
     match self.tab {
@@ -815,7 +757,8 @@ mod tests {
 
   fn names(page: &OpenPage) -> Vec<&str> {
     page
-      .shown
+      .filter
+      .shown()
       .iter()
       .map(|&i| page.entries[i].name.as_str())
       .collect()
@@ -849,7 +792,11 @@ mod tests {
     std::fs::write(temp.0.join("afile"), "").unwrap();
 
     let mut page = page(&root);
-    assert!(page.input.value().ends_with('/'), "{}", page.input.value());
+    assert!(
+      page.filter.value().ends_with('/'),
+      "{}",
+      page.filter.value()
+    );
     assert_eq!(names(&page), ["alpha", "alpine", "beta", "proj"]);
     assert_eq!(page.entries[1].marker, "dekit.yaml");
     assert_eq!(page.entries[3].marker, "git");
@@ -865,15 +812,15 @@ mod tests {
     assert!(page.picked);
     page.handle_key(&key(KeyCode::Tab, KeyMods::NONE));
     assert!(
-      page.input.value().ends_with("/alpine/"),
+      page.filter.value().ends_with("/alpine/"),
       "{}",
-      page.input.value()
+      page.filter.value()
     );
     assert!(!page.picked);
     assert_eq!(names(&page), Vec::<&str>::new());
 
     // Hidden dirs show up once a dot is typed.
-    page.input = Input::new(format!("{}/.", temp.0.display()));
+    page.filter.set_value(format!("{}/.", temp.0.display()));
     page.reload();
     assert_eq!(names(&page), [".hidden"]);
   }
@@ -906,7 +853,7 @@ mod tests {
     }
 
     // A partial name opens the first match; the current runner closes.
-    page.input = Input::new(format!("{}/alp", temp.0.display()));
+    page.filter.set_value(format!("{}/alp", temp.0.display()));
     page.reload();
     match page.open() {
       ModalResult::Run(Action::SwitchRunner { root, .. }) => {
@@ -914,11 +861,11 @@ mod tests {
       }
       _ => panic!("expected a switch"),
     }
-    page.input = Input::new(format!("{}/proj", temp.0.display()));
+    page.filter.set_value(format!("{}/proj", temp.0.display()));
     page.reload();
     assert!(matches!(page.open(), ModalResult::Close));
 
-    page.input = Input::new(format!("{}/nope", temp.0.display()));
+    page.filter.set_value(format!("{}/nope", temp.0.display()));
     page.reload();
     assert!(matches!(page.open(), ModalResult::Keep));
     assert!(
@@ -938,7 +885,7 @@ mod tests {
     }
     let mut page = page(&temp.0.join("proj"));
     let area = Rect::new(0, 0, 40, 5);
-    page.list.rows(area).count();
+    page.filter.list.rows(area).count();
     let hover = MouseEvent {
       kind: MouseEventKind::Moved,
       x: 3,

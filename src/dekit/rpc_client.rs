@@ -28,8 +28,9 @@ pub async fn rpc_request(
         if response.id != 1 {
           continue;
         }
+        // The error keeps its code: callers can downcast to it.
         match response.error {
-          Some(error) => bail!("{error}"),
+          Some(error) => return Err(error.into()),
           None => return Ok(response.result.unwrap_or(Value::Null)),
         }
       }

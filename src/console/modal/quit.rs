@@ -3,7 +3,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::console::action::{Action, RunnerTab};
 use crate::console::keymap::Keymap;
 use crate::console::theme::Theme;
-use crate::console::widgets::list::ListState;
+use crate::console::widgets::list::{ListState, paint_row};
 use crate::term::{
   Grid,
   grid::Rect,
@@ -22,7 +22,7 @@ struct Item {
   key: char,
   label: &'static str,
   note: &'static str,
-  result: ModalResult,
+  action: Action,
 }
 
 const ITEMS: [Item; 4] = [
@@ -30,27 +30,27 @@ const ITEMS: [Item; 4] = [
     key: 'x',
     label: "Quit",
     note: "stop everything, don't save",
-    result: ModalResult::Run(Action::Quit),
+    action: Action::Quit,
   },
   Item {
     key: 's',
     label: "Save and quit",
     note: "stop everything, back on the next start",
-    result: ModalResult::Run(Action::Down),
+    action: Action::Down,
   },
   Item {
     key: 'd',
     label: "Detach",
     note: "leave everything running",
-    result: ModalResult::Detach,
+    action: Action::Detach,
   },
   Item {
     key: 'r',
     label: "Switch project",
     note: "go to another runner",
-    result: ModalResult::Run(Action::ShowRunnerSelect {
+    action: Action::ShowRunnerSelect {
       tab: RunnerTab::Switch,
-    }),
+    },
   },
 ];
 
@@ -67,9 +67,9 @@ impl Default for QuitModal {
 }
 
 fn pick(index: usize) -> ModalResult {
-  ITEMS
-    .get(index)
-    .map_or(ModalResult::Close, |item| item.result.clone())
+  ITEMS.get(index).map_or(ModalResult::Close, |item| {
+    ModalResult::Run(item.action.clone())
+  })
 }
 
 impl Modal for QuitModal {
@@ -81,16 +81,13 @@ impl Modal for QuitModal {
       (KeyCode::Esc | KeyCode::Char('q'), KeyMods::NONE) => {
         return ModalResult::Close;
       }
-      (KeyCode::Char('k'), KeyMods::NONE) => self.list.prev(),
-      (KeyCode::Char('j'), KeyMods::NONE) => self.list.next(),
+      _ if self.list.handle_vi_key(key) => (),
       (KeyCode::Char(c), KeyMods::NONE) => {
-        if let Some(item) = ITEMS.iter().find(|item| item.key == c) {
-          return item.result.clone();
+        if let Some(index) = ITEMS.iter().position(|item| item.key == c) {
+          return pick(index);
         }
       }
-      _ => {
-        self.list.handle_key(key);
-      }
+      _ => (),
     }
     ModalResult::Keep
   }
@@ -121,10 +118,7 @@ impl Modal for QuitModal {
     let inner = style.draw(grid, area).title(" Quit ", style.title).inner();
     for row in self.list.rows(inner) {
       let item = &ITEMS[row.index];
-      let style = theme.block.modal_row(style, row.selected);
-      if row.selected {
-        grid.fill_area(row.area, ' ', style.text);
-      }
+      let style = paint_row(grid, row.area, row.selected, style, &theme.block);
       let mut rest = row.area.inner((0, PAD));
       grid.draw_text(
         rest.take_left(1),
@@ -168,7 +162,7 @@ mod tests {
     ));
     assert!(matches!(
       modal.handle_key(&key(KeyCode::Char('d'))),
-      ModalResult::Detach
+      ModalResult::Run(Action::Detach)
     ));
     assert!(matches!(
       modal.handle_key(&key(KeyCode::Char('r'))),
@@ -189,7 +183,7 @@ mod tests {
     modal.handle_key(&Key::new(KeyCode::Char('n'), KeyMods::CONTROL));
     assert!(matches!(
       modal.handle_key(&key(KeyCode::Enter)),
-      ModalResult::Detach
+      ModalResult::Run(Action::Detach)
     ));
   }
 

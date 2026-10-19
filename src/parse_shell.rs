@@ -150,8 +150,8 @@ fn code(c: char) -> String {
 }
 
 /// The argv that runs `line` through the system shell: `/bin/sh -c`, or
-/// PowerShell on Windows. Only for mprocs.yaml (`dekit mprocs`) and for
-/// stop lines saved by older binaries.
+/// PowerShell on Windows. Only for lines typed with `system_shell` on,
+/// mprocs.yaml (`dekit mprocs`), and stop lines saved by older binaries.
 #[cfg(windows)]
 pub fn system_argv(line: &str) -> Vec<String> {
   // Prefer PowerShell 7, but fall back to Windows PowerShell if not installed.
@@ -166,6 +166,15 @@ pub fn system_argv(line: &str) -> Vec<String> {
 #[cfg(not(windows))]
 pub fn system_argv(line: &str) -> Vec<String> {
   vec!["/bin/sh".into(), "-c".into(), line.into()]
+}
+
+/// The argv a command line typed in the console runs as: through the
+/// system shell when the user config says so, else split as `cmd` is.
+pub fn typed_argv(line: &str, system_shell: bool) -> Result<Vec<String>> {
+  match system_shell {
+    true => Ok(system_argv(line)),
+    false => split_argv(line),
+  }
 }
 
 #[cfg(test)]
